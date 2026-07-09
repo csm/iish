@@ -103,16 +103,17 @@ systemctl = "deny"
 uname = "allow"
 ```
 
-`subprocess`, `overwrite`, `network`, `run-created`, and `[commands]` are
-live: they change what policy.rs's evaluator does today, including a
-new **subprocess tier** for any external binary iish has no native
-implementation for (`cp`, `tar`, `apt-get`, `sudo <cmd>` pre-broker,
-…) — the literal, already-parsed argv is exec'd directly, never through
-a shell, once allowed or confirmed. Shells and shell builtins (`cd`,
-`export`, `source`, `.`) stay hard-denied regardless of config — see the
-"Core principle" above. `env-file-append` and `elevate` parse
-successfully (so this file round-trips) but aren't consulted until
-milestone 6 (env-file grammar) and 4b (sudo broker) exist.
+`subprocess`, `overwrite`, `network`, `run-created`, `env-file-append`,
+and `[commands]` are live: they change what policy.rs's evaluator does
+today, including a **subprocess tier** for any external binary iish has
+no native implementation for (`cp`, `tar`, `apt-get`, `sudo <cmd>`
+pre-broker, …) — the literal, already-parsed argv is exec'd directly,
+never through a shell, once allowed or confirmed — and the restricted
+`>>` env-file append grammar (milestone 6). Shells and shell builtins
+(`cd`, `export`, `source`, `.`) stay hard-denied regardless of config —
+see the "Core principle" above. `elevate` parses successfully (so this
+file round-trips) but isn't consulted until the sudo broker (milestone
+4b) exists.
 
 CLI: `iish --allow sudo --deny curl --subprocess=deny --overwrite=allow
 --network=deny --config path.toml --no-config --dry-run …`, plus
@@ -153,13 +154,16 @@ src/
                the documented schema.
   exec.rs      Native implementations of allowed operations. The policy
                compiles each allowed statement into a closed `Action`
-               enum (Print, MkDir, Remove, Chmod, Fetch, Subprocess,
-               Noop); exec runs actions in Rust — echo/printf
-               rendering, dir creation, ledger-checked rm/chmod, GET
-               fetches via an in-process HTTP client (ureq), and
-               direct fork/exec (never a shell) of the subprocess
-               tier's literal argv — and records created paths in the
-               ledger. Env-file appends land in milestone 6.
+               enum (Print, MkDir, Remove, Chmod, Fetch, AppendFile,
+               Sha256Sum, Sha256Check, Subprocess, Noop); exec runs
+               actions in Rust — echo/printf rendering, dir creation,
+               ledger-checked rm/chmod, GET fetches via an in-process,
+               timeout- and redirect-bounded HTTP client (ureq) that
+               refuses to downgrade an https:// fetch to plaintext on
+               redirect, restricted-grammar rc-file appends, native
+               SHA-256 compute/verify, and direct fork/exec (never a
+               shell) of the subprocess tier's literal argv — and
+               records created paths in the ledger.
   prompt.rs    /dev/tty confirmation for `ask` verdicts (stdin carries
                the script); `--yes`/`--no` resolve asks without a tty
   broker.rs    (planned) privileged worker: `sudo iish --broker`,
@@ -211,8 +215,15 @@ doubles as the integration-test corpus later.
    Built-in default for that tier flipped from a hard deny to `ask`,
    matching PLAN's "unlisted subprocesses ⇒ ask". Shells and shell
    builtins remain hard-denied, not configurable. *(done)*
-6. **Harden** — redirects, env-file append grammar, GET-only HTTP
-   client, checksum verification.
+6. ~~**Harden**~~ — a restricted `>>` redirect grammar for `echo`/`printf`
+   onto recognized rc/profile files (`export VAR=...`, `PATH=...`,
+   `source`/`.` of a created file — PLAN's env-file append row, governed
+   by `env-file-append`); GET-only HTTP client hardening (fixed
+   timeouts, a bounded redirect count, `https_only` so a redirect can't
+   downgrade an `https://` fetch to plaintext); and native
+   `sha256sum`/`sha256sum -c` checksum verification, restricted like
+   `rm`/`chmod` to paths this run created. All other redirect shapes
+   remain denied. *(done)*
 7. **Corpus as test suite** — iish should run the majority of the
    corpus to completion (with expected asks).
 8. **Sandboxing investigation** — Landlock/seccomp/Seatbelt for second

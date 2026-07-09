@@ -9,9 +9,11 @@
 //! re-interprets shell syntax.
 
 use crate::state::Session;
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// A vetted operation, compiled by the policy from a statement it
 /// allowed (or will allow once the user confirms).
@@ -33,6 +35,16 @@ pub enum Action {
     Chmod { mode: Mode, paths: Vec<PathBuf> },
     /// `curl` / `wget`: an HTTP(S) GET performed in-process.
     Fetch { url: String, output: FetchOutput },
+    /// `echo`/`printf ... >> rcfile`: append text to a recognized shell
+    /// rc/profile file (milestone 6's env-file append grammar, vetted by
+    /// policy.rs before this action is ever built).
+    AppendFile { path: PathBuf, text: String },
+    /// `sha256sum FILE...`: print `<hex>  <path>` for each, restricted to
+    /// paths this run created.
+    Sha256Sum { paths: Vec<PathBuf> },
+    /// `sha256sum -c FILE`: verify each `<hex>  <path>` entry (parsed
+    /// from a checksums file this run created) against the file on disk.
+    Sha256Check { entries: Vec<(String, PathBuf)> },
     /// A command iish has no native implementation for, compiled by
     /// the "subprocess" policy tier (milestone 5, see policy.rs): the
     /// literal, already-parsed argv, exec'd directly — never through a
@@ -80,6 +92,9 @@ pub fn execute(action: &Action, session: &mut Session) -> Result<(), String> {
             .try_for_each(|path| remove(path, *recursive, *force, session)),
         Action::Chmod { mode, paths } => paths.iter().try_for_each(|path| chmod(path, *mode)),
         Action::Fetch { url, output } => fetch(url, output, session),
+        Action::AppendFile { path, text } => append_file(path, text, session),
+        Action::Sha256Sum { paths } => paths.iter().try_for_each(|path| print_sha256(path)),
+        Action::Sha256Check { entries } => verify_sha256(entries),
         Action::Subprocess { name, args } => run_subprocess(name, args),
     }
 }
@@ -98,6 +113,7 @@ pub fn record_would_create(action: &Action, session: &mut Session) {
             output: FetchOutput::File(path),
             ..
         } => session.record_created(path),
+        Action::AppendFile { path, .. } => session.record_created(path),
         _ => {}
     }
 }
@@ -171,8 +187,21 @@ fn chmod(path: &Path, mode: Mode) -> Result<(), String> {
         .map_err(|e| format!("chmod: `{}`: {e}", path.display()))
 }
 
+/// GET-only fetch, hardened (milestone 6): fixed, generous timeouts so a
+/// slow or hanging server can't stall the run forever, a bounded number
+/// of redirects, and — when the requested URL is `https://` —
+/// `https_only` so a redirect can't silently downgrade the transfer to
+/// plaintext `http://`. Installers' own `--connect-timeout`/`--max-time`
+/// flags are accepted by the policy layer but not consulted here: iish's
+/// client, not the script, decides these.
 fn fetch(url: &str, output: &FetchOutput, session: &mut Session) -> Result<(), String> {
-    let agent = ureq::AgentBuilder::new().try_proxy_from_env(true).build();
+    let agent = ureq::AgentBuilder::new()
+        .try_proxy_from_env(true)
+        .https_only(url.starts_with("https://"))
+        .redirects(5)
+        .timeout_connect(Duration::from_secs(10))
+        .timeout(Duration::from_secs(300))
+        .build();
     let response = agent
         .get(url)
         .call()
@@ -199,6 +228,70 @@ fn fetch(url: &str, output: &FetchOutput, session: &mut Session) -> Result<(), S
         }
     }
     Ok(())
+}
+
+/// Append already-vetted text (the env-file grammar was checked in
+/// policy.rs) to `path`, creating it if it doesn't exist yet.
+fn append_file(path: &Path, text: &str, session: &mut Session) -> Result<(), String> {
+    let existed = path.exists();
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| format!("append: `{}`: {e}", path.display()))?;
+    file.write_all(text.as_bytes())
+        .map_err(|e| format!("append: `{}`: {e}", path.display()))?;
+    if !existed {
+        session.record_created(path);
+    }
+    Ok(())
+}
+
+fn sha256_hex(path: &Path) -> Result<String, String> {
+    let mut file =
+        fs::File::open(path).map_err(|e| format!("sha256sum: `{}`: {e}", path.display()))?;
+    let mut hasher = Sha256::new();
+    io::copy(&mut file, &mut hasher)
+        .map_err(|e| format!("sha256sum: `{}`: {e}", path.display()))?;
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
+}
+
+fn print_sha256(path: &Path) -> Result<(), String> {
+    let hex = sha256_hex(path)?;
+    writeln!(io::stdout(), "{hex}  {}", path.display())
+        .map_err(|e| format!("sha256sum: writing to stdout: {e}"))
+}
+
+/// `sha256sum -c`: print `<path>: OK`/`FAILED` per entry, like the real
+/// tool, and fail the statement (aborting the run) if anything mismatched.
+fn verify_sha256(entries: &[(String, PathBuf)]) -> Result<(), String> {
+    let mut failed = 0usize;
+    for (expected, path) in entries {
+        let status = match sha256_hex(path) {
+            Ok(actual) if actual.eq_ignore_ascii_case(expected) => "OK",
+            Ok(_) => {
+                failed += 1;
+                "FAILED"
+            }
+            Err(_) => {
+                failed += 1;
+                "FAILED open or read"
+            }
+        };
+        writeln!(io::stdout(), "{}: {status}", path.display())
+            .map_err(|e| format!("sha256sum: writing to stdout: {e}"))?;
+    }
+    if failed > 0 {
+        Err(format!(
+            "sha256sum: {failed} computed checksum(s) did NOT match"
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 /// Exec `name` with `args` directly (no shell in between: `Command`

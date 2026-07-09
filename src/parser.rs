@@ -68,7 +68,18 @@ fn push_literal_piece(piece: &WordPiece, out: &mut String, unquoted: bool) -> Re
             Ok(())
         }
         WordPiece::AnsiCQuotedText(_) => Err("ANSI-C quoting ($'...') is not supported yet".into()),
-        WordPiece::TildeExpansion(_) => Err("tilde expansion is not supported yet".into()),
+        WordPiece::TildeExpansion(brush_parser::word::TildeExpr::Home) => {
+            match std::env::var("HOME") {
+                Ok(home) => {
+                    out.push_str(&home);
+                    Ok(())
+                }
+                Err(_) => Err("cannot expand `~`: $HOME is not set".into()),
+            }
+        }
+        WordPiece::TildeExpansion(_) => {
+            Err("tilde expansion is only supported for `~` (the home directory)".into())
+        }
         WordPiece::ParameterExpansion(_) => Err("variable expansion is not supported yet".into()),
         WordPiece::CommandSubstitution(_) | WordPiece::BackquotedCommandSubstitution(_) => {
             Err("command substitution is not supported yet".into())
@@ -137,6 +148,28 @@ mod tests {
     #[test]
     fn rejects_unterminated_quotes() {
         assert!(parse("echo 'unterminated").is_err());
+    }
+
+    #[test]
+    fn tilde_expands_to_home() {
+        let home = std::env::var("HOME").expect("test environment should have $HOME set");
+        assert_eq!(
+            simple_words("echo ~/.bashrc"),
+            vec!["echo".to_string(), format!("{home}/.bashrc")]
+        );
+    }
+
+    #[test]
+    fn tilde_user_expansion_is_not_supported() {
+        let program = parse("echo ~someuser/x").unwrap();
+        let ast::Command::Simple(cmd) = &program.complete_commands[0].0[0].0.first.seq[0] else {
+            panic!("expected simple command");
+        };
+        let word = &cmd.suffix.as_ref().unwrap().0[0];
+        let ast::CommandPrefixOrSuffixItem::Word(w) = word else {
+            panic!("expected word");
+        };
+        assert!(literal_word(w).is_err());
     }
 
     #[test]
