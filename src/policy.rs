@@ -13,7 +13,7 @@
 
 use crate::config::{Config, NetworkPolicy, Verb};
 use crate::exec::{Action, FetchOutput, Mode};
-use crate::parser::{ast, literal_word};
+use crate::parser::{ast, case_pattern_word, literal_word};
 use crate::state::{self, Session};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -38,6 +38,19 @@ pub enum Verdict {
     /// ledger changes an earlier one in the same group made.
     Group {
         statements: Vec<ast::CompoundListItem>,
+    },
+    /// `if`/`elif`/`else`/`fi`: unlike `Group`, which branch (if any)
+    /// runs depends on the actual exit status of `condition` — which may
+    /// itself run a subprocess with real side effects — so this can't be
+    /// resolved to a fixed statement list here. The runner evaluates
+    /// `condition` statement by statement against the live session
+    /// exactly like a top-level list, checks the last one's exit status,
+    /// and only then recurses into `then_branch` or the matching `elses`
+    /// clause.
+    If {
+        condition: Vec<ast::CompoundListItem>,
+        then_branch: Vec<ast::CompoundListItem>,
+        elses: Option<Vec<ast::ElseClause>>,
     },
 }
 
@@ -170,6 +183,8 @@ fn evaluate_command(cmd: &ast::Command, session: &Session, config: &Config) -> V
                 ast::CompoundCommand::BraceGroup(group) => Verdict::Group {
                     statements: group.list.0.clone(),
                 },
+                ast::CompoundCommand::IfClause(if_clause) => evaluate_if(if_clause),
+                ast::CompoundCommand::CaseClause(case_clause) => evaluate_case(case_clause),
                 other => deny(format!("{} are not implemented yet", compound_kind(other))),
             }
         }
@@ -204,6 +219,83 @@ fn evaluate_function_definition(def: &ast::FunctionDefinition) -> Verdict {
             body: group.list.clone(),
         },
     )
+}
+
+/// `if condition; then ...; elif ...; else ...; fi`: just repackages the
+/// AST's own condition/then/elses lists into `Verdict::If`. Nothing here
+/// runs or is even checked for safety yet — the runner (main.rs) walks
+/// `condition` first, statement by statement against the live session,
+/// before it knows which branch (if any) to evaluate next.
+fn evaluate_if(if_clause: &ast::IfClauseCommand) -> Verdict {
+    Verdict::If {
+        condition: if_clause.condition.0.clone(),
+        then_branch: if_clause.then.0.clone(),
+        elses: if_clause.elses.clone(),
+    }
+}
+
+/// `case value in pat1) ...;; pat2|pat3) ...;; esac`: unlike `if`,
+/// matching a `case` value against its patterns has no side effects, so
+/// (like `mkdir`'s "does this path exist?" check) it can be resolved
+/// right here: render `value` as a literal word, walk the arms in order,
+/// and once one matches, hand its body back as an ordinary `Verdict::Group`
+/// — the runner doesn't need to know it came from a `case` at all. No
+/// arm matching falls through to a no-op, matching real `case`'s exit
+/// status of 0 when nothing matches.
+fn evaluate_case(case: &ast::CaseClauseCommand) -> Verdict {
+    let value = match literal_word(&case.value) {
+        Ok(v) => v,
+        Err(reason) => return deny(reason),
+    };
+    // Every arm must use a plain `;;`: `;&`/`;;&` fall through to a
+    // sibling arm's body (possibly skipping or re-running its pattern
+    // check), which would require running more than the one matched arm
+    // — checked up front, across every arm, so which arm ends up
+    // matching can't silently change what "this construct is fully
+    // understood" means.
+    if case
+        .cases
+        .iter()
+        .any(|item| !matches!(item.post_action, ast::CaseItemPostAction::ExitCase))
+    {
+        return deny("`;&`/`;;&` case fallthrough is not implemented yet");
+    }
+    for item in &case.cases {
+        for pattern_word in &item.patterns {
+            let pattern = match case_pattern_word(pattern_word) {
+                Ok(p) => p,
+                Err(reason) => return deny(reason),
+            };
+            if glob_match(&pattern, &value) {
+                let statements = item.cmd.as_ref().map(|c| c.0.clone()).unwrap_or_default();
+                return Verdict::Group { statements };
+            }
+        }
+    }
+    allow("no case pattern matched; case is a no-op", Action::Noop)
+}
+
+/// Minimal glob matching for `case` patterns: `*` matches any run of
+/// characters (including none), `?` matches exactly one, `\x` matches
+/// the literal character `x` (how policy.rs represents a pattern
+/// character that came from quoted or escaped source text, so it isn't
+/// treated as a wildcard even though it looks like one), and any other
+/// character matches itself. No bracket-expression (`[...]`) support:
+/// installers' case patterns in practice only ever reach for `*`/`?`
+/// (`Linux*`, `x86_64`, a bare `*` default, ...).
+fn glob_match(pattern: &str, text: &str) -> bool {
+    fn matches(p: &[char], t: &[char]) -> bool {
+        match p.first() {
+            None => t.is_empty(),
+            Some('*') => (0..=t.len()).any(|i| matches(&p[1..], &t[i..])),
+            Some('?') => !t.is_empty() && matches(&p[1..], &t[1..]),
+            Some('\\') if p.len() > 1 => !t.is_empty() && p[1] == t[0] && matches(&p[2..], &t[1..]),
+            Some(c) => !t.is_empty() && *c == t[0] && matches(&p[1..], &t[1..]),
+        }
+    }
+    let pattern_chars: Vec<char> = pattern.chars().collect();
+    let text_chars: Vec<char> = text.chars().collect();
+    matches(&pattern_chars, &text_chars)
 }
 
 fn compound_kind(compound: &ast::CompoundCommand) -> &'static str {
@@ -326,6 +418,8 @@ fn evaluate_argv(name: &str, args: &[String], session: &Session, config: &Config
         "wget" => evaluate_wget(args, session, config),
         "sha256sum" => evaluate_sha256sum(args, session),
         "set" => evaluate_set(args),
+        "test" => evaluate_test(args),
+        "[" => evaluate_bracket(args),
 
         // A shell is exactly what iish exists to replace; no config
         // knob may reopen this escape hatch (see PLAN.md's "no pass
@@ -1043,6 +1137,130 @@ fn evaluate_set(args: &[String]) -> Verdict {
     )
 }
 
+/// `test EXPR`: side-effect-free (beyond reading the filesystem to
+/// answer `-f`/`-d`/... questions), so — like `mkdir`'s "does this exist
+/// already" check — its truth value is computed right now rather than
+/// deferred to execution, and always allowed: nothing here mutates
+/// anything.
+fn evaluate_test(args: &[String]) -> Verdict {
+    match eval_test_expr(args) {
+        Ok(result) => allow(
+            "evaluates a `test`/`[` expression only; no side effects",
+            Action::Test { result },
+        ),
+        Err(reason) => deny(reason),
+    }
+}
+
+/// `[ EXPR ]`: identical to `test EXPR`, but the trailing `]` is part of
+/// the command's own syntax (bash rejects `[` without one) rather than
+/// part of the expression.
+fn evaluate_bracket(args: &[String]) -> Verdict {
+    match args.split_last() {
+        Some((last, rest)) if last == "]" => evaluate_test(rest),
+        _ => deny("`[` without a matching `]`"),
+    }
+}
+
+/// The subset of POSIX `test` installers actually use: 0/1-argument
+/// string-truthiness forms, one leading `!` negation, a unary operator
+/// (`-z`/`-n`/a filesystem question) applied to one operand, or a binary
+/// operator (string or numeric comparison) between two. No `-a`/`-o`
+/// combinators or parenthesized subexpressions — bash's own `test`
+/// deprecates the former and installers essentially never need either.
+fn eval_test_expr(args: &[String]) -> Result<bool, String> {
+    if let Some((first, rest)) = args.split_first() {
+        if first == "!" {
+            return eval_test_expr(rest).map(|result| !result);
+        }
+    }
+    match args {
+        [] => Ok(false),
+        [s] => Ok(!s.is_empty()),
+        [op, arg] => eval_test_unary(op, arg),
+        [lhs, op, rhs] => eval_test_binary(lhs, op, rhs),
+        _ => Err(format!(
+            "test expression `{}` is not supported (too many arguments)",
+            args.join(" ")
+        )),
+    }
+}
+
+/// `-r`/`-w`/`-x` approximate real access-checking (which needs the
+/// process's effective uid/gid against the path's owner/group, not
+/// exposed by `std::fs` without an extra dependency) by checking whether
+/// *any* of the owner/group/other permission bits is set — exact for the
+/// common installer case of checking a path this run just created (so
+/// it's always owned by the current user), looser than real `test` for
+/// a path owned by someone else.
+fn eval_test_unary(op: &str, arg: &str) -> Result<bool, String> {
+    use std::os::unix::fs::PermissionsExt;
+    let path = Path::new(arg);
+    match op {
+        "-z" => Ok(arg.is_empty()),
+        "-n" => Ok(!arg.is_empty()),
+        "-e" => Ok(path.exists()),
+        "-f" => Ok(path.is_file()),
+        "-d" => Ok(path.is_dir()),
+        "-L" | "-h" => Ok(fs::symlink_metadata(path)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)),
+        "-s" => Ok(fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false)),
+        "-x" => Ok(fs::metadata(path)
+            .map(|m| m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)),
+        "-r" => Ok(fs::metadata(path)
+            .map(|m| m.permissions().mode() & 0o444 != 0)
+            .unwrap_or(false)),
+        "-w" => Ok(fs::metadata(path)
+            .map(|m| m.permissions().mode() & 0o222 != 0)
+            .unwrap_or(false)),
+        "-t" => eval_test_isatty(arg),
+        _ => Err(format!("test operator `{op}` is not supported")),
+    }
+}
+
+/// `-t FD`: is file descriptor `FD` a terminal? Installers use this
+/// (almost always `-t 1`) to decide whether to print color/progress
+/// output. Only the three standard descriptors are meaningful here —
+/// iish has no others open on the script's behalf.
+fn eval_test_isatty(fd: &str) -> Result<bool, String> {
+    use std::io::IsTerminal;
+    match fd {
+        "0" => Ok(std::io::stdin().is_terminal()),
+        "1" => Ok(std::io::stdout().is_terminal()),
+        "2" => Ok(std::io::stderr().is_terminal()),
+        _ => Err(format!(
+            "test -t {fd}: only file descriptors 0/1/2 are supported"
+        )),
+    }
+}
+
+fn eval_test_binary(lhs: &str, op: &str, rhs: &str) -> Result<bool, String> {
+    match op {
+        "=" | "==" => Ok(lhs == rhs),
+        "!=" => Ok(lhs != rhs),
+        "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge" => {
+            let l: i64 = lhs
+                .parse()
+                .map_err(|_| format!("test: `{lhs}` is not an integer"))?;
+            let r: i64 = rhs
+                .parse()
+                .map_err(|_| format!("test: `{rhs}` is not an integer"))?;
+            Ok(match op {
+                "-eq" => l == r,
+                "-ne" => l != r,
+                "-lt" => l < r,
+                "-le" => l <= r,
+                "-gt" => l > r,
+                "-ge" => l >= r,
+                _ => unreachable!(),
+            })
+        }
+        _ => Err(format!("test operator `{op}` is not supported")),
+    }
+}
+
 /// curl: only plain GET shapes are permitted, and iish performs the
 /// fetch itself with its own HTTP client rather than invoking the real
 /// binary. Every flag must be on the allowlist below; anything else —
@@ -1684,11 +1902,129 @@ mod tests {
     }
 
     #[test]
-    fn denies_control_flow_with_specific_reason() {
+    fn if_clause_produces_an_if_verdict() {
         match verdict("if true; then echo hi; fi") {
-            Deny { reason } => assert!(reason.contains("if statements")),
+            Verdict::If {
+                condition,
+                then_branch,
+                elses,
+            } => {
+                assert_eq!(condition.len(), 1);
+                assert_eq!(then_branch.len(), 1);
+                assert!(elses.is_none());
+            }
+            other => panic!("expected an if verdict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn if_elif_else_produces_an_if_verdict_with_elses() {
+        match verdict("if true; then echo a; elif false; then echo b; else echo c; fi") {
+            Verdict::If { elses, .. } => {
+                let elses = elses.expect("expected elif/else clauses");
+                assert_eq!(elses.len(), 2);
+                assert!(
+                    elses[0].condition.is_some(),
+                    "elif should carry a condition"
+                );
+                assert!(
+                    elses[1].condition.is_none(),
+                    "else should carry no condition"
+                );
+            }
+            other => panic!("expected an if verdict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remaining_control_flow_is_still_denied_with_specific_reasons() {
+        match verdict("for f in a b; do echo $f; done") {
+            Deny { reason } => assert!(reason.contains("for-loops"), "{reason}"),
             other => panic!("expected deny, got {other:?}"),
         }
+        match verdict("while true; do echo hi; done") {
+            Deny { reason } => assert!(reason.contains("while-loops"), "{reason}"),
+            other => panic!("expected deny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_builtin_evaluates_string_and_file_checks() {
+        assert!(matches!(
+            verdict("test -n hello"),
+            Allow {
+                action: Action::Test { result: true },
+                ..
+            }
+        ));
+        assert!(matches!(
+            verdict("[ -z '' ]"),
+            Allow {
+                action: Action::Test { result: true },
+                ..
+            }
+        ));
+        assert!(matches!(
+            verdict("[ foo = bar ]"),
+            Allow {
+                action: Action::Test { result: false },
+                ..
+            }
+        ));
+        assert!(matches!(
+            verdict("[ 2 -lt 3 ]"),
+            Allow {
+                action: Action::Test { result: true },
+                ..
+            }
+        ));
+        assert!(matches!(
+            verdict("test -d /definitely-not-a-real-directory-iish"),
+            Allow {
+                action: Action::Test { result: false },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn bracket_test_requires_a_matching_close_bracket() {
+        assert!(matches!(verdict("[ foo = bar"), Deny { .. }));
+    }
+
+    #[test]
+    fn case_dispatches_to_the_matching_arm() {
+        match verdict("case linux in linux) echo matched;; *) echo default;; esac") {
+            Group { statements } => assert_eq!(statements.len(), 1),
+            other => panic!("expected a group verdict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn case_glob_pattern_matches() {
+        match verdict("case Linux-x86_64 in Linux*) echo matched;; esac") {
+            Group { statements } => assert_eq!(statements.len(), 1),
+            other => panic!("expected a group verdict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn case_falls_through_to_a_noop_when_nothing_matches() {
+        assert!(matches!(
+            verdict("case linux in darwin) echo no;; esac"),
+            Allow {
+                action: Action::Noop,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn case_fallthrough_post_action_is_not_implemented() {
+        assert!(matches!(
+            verdict("case linux in linux) echo a;& darwin) echo b;; esac"),
+            Deny { .. }
+        ));
     }
 
     #[test]

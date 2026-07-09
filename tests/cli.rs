@@ -583,3 +583,116 @@ fn self_recursive_function_is_refused_instead_of_overflowing_the_stack() {
     assert!(!out.status.success());
     assert!(stderr(&out).contains("deep"), "stderr: {}", stderr(&out));
 }
+
+#[test]
+fn if_true_runs_the_then_branch_not_the_else() {
+    let out = iish("if true; then echo yes; else echo no; fi\n", &[]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "yes\n");
+}
+
+#[test]
+fn if_false_runs_the_else_branch() {
+    // `false` has no native implementation, so it would need the
+    // subprocess-tier's `ask` policy (no tty in tests); `[ 1 -eq 2 ]` is
+    // a false condition iish evaluates natively instead.
+    let out = iish("if [ 1 -eq 2 ]; then echo yes; else echo no; fi\n", &[]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "no\n");
+}
+
+#[test]
+fn elif_chain_picks_the_first_true_clause() {
+    let out = iish(
+        "if [ 1 -eq 2 ]; then echo a; elif true; then echo b; else echo c; fi\n",
+        &[],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "b\n");
+}
+
+#[test]
+fn if_with_no_matching_branch_and_no_else_runs_nothing() {
+    let out = iish("if [ 1 -eq 2 ]; then echo yes; fi\necho after\n", &[]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "after\n");
+}
+
+#[test]
+fn bracket_test_condition_checks_the_real_filesystem() {
+    let base = scratch("if-bracket");
+    fs::create_dir_all(&base).unwrap();
+    let script = format!(
+        "if [ -d {0} ]; then echo is-a-dir; else echo not-a-dir; fi\n",
+        base.display()
+    );
+    let out = iish(&script, &[]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "is-a-dir\n");
+    fs::remove_dir_all(&base).unwrap();
+}
+
+#[test]
+fn condition_side_effects_are_visible_to_later_statements() {
+    let base = scratch("if-condition-mkdir");
+    let script = format!(
+        "if mkdir -p {0}; then echo made; fi\nrm -r {0}\n",
+        base.display()
+    );
+    let out = iish(&script, &[]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(
+        stdout(&out),
+        "made\n",
+        "mkdir in the condition should have actually run, and the later rm should see it"
+    );
+    assert!(!base.exists());
+}
+
+#[test]
+fn a_denial_inside_an_if_condition_aborts_the_whole_run() {
+    let out = iish("if sudo rm -rf /; then echo yes; fi\necho after\n", &[]);
+    assert!(!out.status.success());
+    assert_eq!(
+        stdout(&out),
+        "",
+        "the condition's denial should abort before any branch or later statement runs"
+    );
+}
+
+#[test]
+fn a_nonzero_subprocess_in_a_condition_does_not_abort_the_run() {
+    let out = iish(
+        "if false; then echo yes; fi\necho still-running\n",
+        &["--allow", "false"],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "still-running\n");
+}
+
+#[test]
+fn case_dispatches_to_the_matching_arm_and_runs_it() {
+    let out = iish(
+        "case linux in linux) echo is-linux;; *) echo other;; esac\n",
+        &[],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "is-linux\n");
+}
+
+#[test]
+fn case_glob_pattern_dispatches_to_the_matching_arm() {
+    let out = iish(
+        "case linux-x86_64 in linux*) echo matched-prefix;; *) echo default;; esac\n",
+        &[],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "matched-prefix\n");
+}
+
+#[test]
+fn case_with_no_matching_arm_is_a_noop() {
+    let out = iish("case linux in darwin) echo yes;; esac\necho after\n", &[]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "after\n");
+}

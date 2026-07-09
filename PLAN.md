@@ -33,8 +33,9 @@ no "pass through to bash" escape hatch.
 | chmod / chown | `chmod` allowed on files the script created; `chown` ⇒ ask |
 | `cp` | Native, same rule as write/create above: new destination allowed, overwrite governed by `overwrite` — not the subprocess tier |
 | Function definitions (`name() { ... }`) and calls, brace groups (`{ ...; }`), `set -e`/`-u`/`-x`/`-o <option>` | Allowed — a definition just registers the body (nothing runs until called); a call or brace group recurses into its statements against the live session; `set`'s flags are no-ops (iish's execution model already fails fast) |
+| `if`/`elif`/`else`/`fi`, `case`/`esac`, `test`/`[ ]` | Allowed — the condition (or case value) is evaluated for real, with real side effects, before picking a branch; whatever's inside a chosen branch is then checked statement by statement like anything else. Only as safe as the branch it runs |
 | sudo | Not a command — an **execution context**. See "Privilege: the sudo broker" below |
-| Shells (`sh`/`bash`/`zsh`/`dash`/`ksh`), shell builtins (`cd`, `export`, `source`, `.`), pipelines, control flow (`if`/`for`/`while`/`case`), command lists (`&&`/`||`), `eval` | Denied — no config knob reopens these; see "Core principle" |
+| Shells (`sh`/`bash`/`zsh`/`dash`/`ksh`), shell builtins (`cd`, `export`, `source`, `.`), pipelines, remaining control flow (`for`/`while`/`until`), command lists (`&&`/`||`), `eval` | Denied — no config knob reopens these; see "Core principle" |
 | Everything else — external binaries iish has no native implementation for (`tar`, `apt-get`, `systemctl`, `sudo <cmd>` pre-broker, …) | **ask** by default (the "subprocess" tier); allow/ask/deny, globally or per command, in config — see "Configuration" |
 
 Policy verbs are **allow / ask / deny**. `ask` is load-bearing: the
@@ -145,18 +146,29 @@ src/
                literal string when it needs no expansion.
   policy.rs    The evaluator: walks `parser::ast` node by node and
                produces a Verdict { Allow, Prompt(reason), Deny(reason),
-               Group(statements) } per top-level statement. `Group` is a
-               brace group or a call to a function defined earlier in
-               the run (state.rs's `Session` now also carries a function
-               table) — not a single compiled `Action`, since its nested
+               Group(statements), If(condition, then, elses) } per
+               top-level statement. `Group` is a brace group, a call to a
+               function defined earlier in the run (state.rs's `Session`
+               now also carries a function table), or a matched `case`
+               arm — not a single compiled `Action`, since its nested
                statements must be evaluated one at a time against the
                live session, exactly like top-level statements; the
                runner (main.rs) recurses for it, depth-limited to guard
-               against unbounded self-recursion. Anything still not
-               implemented (pipelines, control flow, most redirects,
-               most expansions, command lists, ...) is denied here —
-               the Unsupported→deny posture lives in the evaluator, not
-               the parser.
+               against unbounded self-recursion. `If` is `Group`'s
+               counterpart for `if`/`elif`/`else`/`fi`: since which
+               branch (if any) runs depends on the condition's actual —
+               possibly side-effecting — exit status, the runner
+               executes `condition` itself (exempted from iish's usual
+               abort-on-any-failure posture, matching bash's own
+               exemption for a compound command's condition) before
+               recursing into whichever branch it selects. `test`/`[ ]`
+               is evaluated natively too, with no side effects, so a
+               `case` value or a condition made only of literal text and
+               test expressions can resolve completely. Anything still
+               not implemented (pipelines, `for`/`while`/`until`, most
+               redirects, most expansions, command lists, ...) is denied
+               here — the Unsupported→deny posture lives in the
+               evaluator, not the parser.
   config.rs    Layered policy (milestone 5): builtin `Config::default()`
                ← config file (TOML via serde) ← CLI overrides. Exposes
                `Verb` (allow/ask/deny) and `NetworkPolicy` per PLAN's
@@ -167,7 +179,7 @@ src/
                compiles each allowed statement into a closed `Action`
                enum (Print, MkDir, Remove, Chmod, Copy, Fetch,
                AppendFile, Sha256Sum, Sha256Check, Subprocess,
-               DefineFunction, Noop); exec runs actions in Rust —
+               DefineFunction, Test, Noop); exec runs actions in Rust —
                echo/printf rendering, dir creation, ledger-checked
                rm/chmod, native `cp` (governed by `overwrite`, like
                `curl -o`/`wget -O`), GET fetches via an in-process,
@@ -175,9 +187,14 @@ src/
                refuses to downgrade an https:// fetch to plaintext on
                redirect, restricted-grammar rc-file appends, native
                SHA-256 compute/verify, direct fork/exec (never a shell)
-               of the subprocess tier's literal argv, and registering a
-               function body for a later call — and records created
-               paths (and defined functions) in the ledger.
+               of the subprocess tier's literal argv, registering a
+               function body for a later call, and reporting a `test`/
+               `[ ]` expression's already-computed result — and records
+               created paths (and defined functions) in the ledger. A
+               second entry point, `execute_returning_status`, reports a
+               `Subprocess`/`Test` outcome as a `bool` instead of an
+               `Err`, for main.rs's `if`/`while`/`until` condition
+               evaluation.
   prompt.rs    /dev/tty confirmation for `ask` verdicts (stdin carries
                the script); `--yes`/`--no` resolve asks without a tty
   broker.rs    (planned) privileged worker: `sudo iish --broker`,
@@ -246,12 +263,19 @@ doubles as the integration-test corpus later.
    `errexit`/`nounset` were always on) are implemented; `cp` is native
    too (PLAN's filesystem-mutation tier: create-only, overwrite governed
    by `overwrite`, no config knob needed to reach it — unlike the
-   subprocess tier). The evaluator still denies control flow
-   (`if`/`for`/`while`/`case`), most expansions, and command lists
+   subprocess tier). `if`/`elif`/`else`/`fi` and `case`/`esac` are
+   implemented now too, along with a native `test`/`[` (the common unary
+   and binary operators, including `-t` for tty checks, plus `!`
+   negation) — enough for a condition or case value made only of literal
+   text and test expressions, though most real installers' conditions
+   still deny on an expansion (`$VAR`, command substitution, ...) or a
+   command list (`&&`/`||`) somewhere inside them. The evaluator still
+   denies `for`/`while`/`until`, most expansions, and command lists
    (`&&`/`||`), so none of the 17 real corpus scripts run to completion
    yet, but several now progress past their own function/`set`/brace-group
-   setup and into real control flow or a real function call before
-   stopping — see the updated pins in `scripts/verify-installers.sh`.
+   setup and into a real `if`/`case`, and further still (a real `||`
+   inside that condition, or the statement after it) before stopping —
+   see the updated pins in `scripts/verify-installers.sh`.
    `scripts/verify-installers.sh` (Docker-isolated,
    network-disabled, runnable in CI or by hand — see
    `.github/workflows/installer-verify.yml`) runs a curated,
@@ -271,7 +295,7 @@ doubles as the integration-test corpus later.
    refuses to operate through one for every native filesystem action
    (`mkdir`, `rm`, `chmod`, fetch-to-file, env-file append,
    `sha256sum`, and now `cp`). *(in progress — harness in place,
-   functions/brace-groups/`set`/native `cp` landed, corpus still
-   0/17 to completion)*
+   functions/brace-groups/`set`/native `cp`/`if`/`case`/`test` landed,
+   corpus still 0/17 to completion)*
 8. **Sandboxing investigation** — Landlock/seccomp/Seatbelt for second
    stages (post-first-iteration).

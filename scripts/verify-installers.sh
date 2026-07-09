@@ -163,12 +163,18 @@ set_corpus_expectation() {
             verify_cmd=(zoxide --version)
             ;;
         pnpm)
-            expected_reason="if statements are not implemented yet"
+            # `if`/`test`/`[` (including `-t`) are all implemented now;
+            # this trips on the next unimplemented construct, a bare
+            # `VAR=value` prefix, from well inside pnpm's own tty-color
+            # setup (past a real `if [ -t 1 ]` check).
+            expected_reason="bare variable assignment (\`VAR=value\`) is not implemented yet"
             verify_cmd=(pnpm --version)
             ;;
         nvm)
-            # Reached from inside a brace group actually running now.
-            expected_reason="if statements are not implemented yet"
+            # Reached from inside a brace group actually running now,
+            # into the very first `if` -- `if`/`[` are implemented, but
+            # this condition's `||` is the next unimplemented construct.
+            expected_reason="command lists joined by \`&&\`/\`||\` are not implemented yet"
             verify_cmd=(bash -lc 'source "$HOME/.nvm/nvm.sh" 2>/dev/null; command -v nvm')
             ;;
         starship)
@@ -184,7 +190,10 @@ set_corpus_expectation() {
             verify_cmd=(atuin --version)
             ;;
         deno)
-            expected_reason="if statements are not implemented yet"
+            # `if`/`test`/`[` (including `!` negation) are implemented
+            # now; this trips on the condition's `&&`, the next
+            # unimplemented construct.
+            expected_reason="command lists joined by \`&&\`/\`||\` are not implemented yet"
             verify_cmd=(deno --version)
             ;;
         *)

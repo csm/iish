@@ -38,6 +38,22 @@ pub fn literal_word(word: &ast::Word) -> Result<String, String> {
     Ok(out)
 }
 
+/// True if `s` contains a character that would undergo bash pathname
+/// expansion left un-quoted: `*`/`?` always, and `[` only when it's
+/// actually the opening half of a bracket expression (paired with a
+/// later `]`) — a lone `[` (the `[` test command; a filename that just
+/// happens to contain one) glob-expands to itself, so it isn't rejected
+/// as "globbing" here.
+fn contains_glob_metachar(s: &str) -> bool {
+    if s.contains(['*', '?']) {
+        return true;
+    }
+    match s.find('[') {
+        Some(open) => s[open + 1..].contains(']'),
+        None => false,
+    }
+}
+
 /// Append one word piece's literal text to `out`, or fail with the reason
 /// it can't be rendered without expansion. `unquoted` is true for pieces
 /// that sit directly in the word (where bash would still glob-expand
@@ -46,7 +62,7 @@ pub fn literal_word(word: &ast::Word) -> Result<String, String> {
 fn push_literal_piece(piece: &WordPiece, out: &mut String, unquoted: bool) -> Result<(), String> {
     match piece {
         WordPiece::Text(s) => {
-            if unquoted && s.contains(['*', '?', '[']) {
+            if unquoted && contains_glob_metachar(s) {
                 return Err("globbing is not supported yet".into());
             }
             out.push_str(s);
@@ -88,6 +104,87 @@ fn push_literal_piece(piece: &WordPiece, out: &mut String, unquoted: bool) -> Re
             Err("arithmetic expansion is not supported yet".into())
         }
     }
+}
+
+/// Render a shell [`ast::Word`] as a `case` pattern: like [`literal_word`],
+/// expansion of any kind is rejected, but unquoted `*`/`?` are kept as
+/// glob wildcards instead of being rejected outright — that's exactly
+/// what makes them meaningful in a `case` pattern (`Linux*)`, `x86_64|
+/// amd64)`, a bare `*)` default, ...). A `*`/`?`/`\` that came from a
+/// quoted or escaped part of the word is escaped with a leading `\` in
+/// the result so policy.rs's matcher treats it as the literal character
+/// bash would, not a wildcard.
+pub fn case_pattern_word(word: &ast::Word) -> Result<String, String> {
+    let pieces = brush_parser::word::parse(&word.value, &options())
+        .map_err(|e| format!("could not parse word `{}`: {e}", word.value))?;
+    let mut out = String::new();
+    for piece in &pieces {
+        push_pattern_piece(&piece.piece, &mut out, true)?;
+    }
+    Ok(out)
+}
+
+fn push_pattern_piece(piece: &WordPiece, out: &mut String, unquoted: bool) -> Result<(), String> {
+    match piece {
+        WordPiece::Text(s) => {
+            if unquoted {
+                // Glob metacharacters keep their special meaning here.
+                out.push_str(s);
+            } else {
+                for c in s.chars() {
+                    push_literal_pattern_char(c, out);
+                }
+            }
+            Ok(())
+        }
+        WordPiece::SingleQuotedText(s) => {
+            for c in s.chars() {
+                push_literal_pattern_char(c, out);
+            }
+            Ok(())
+        }
+        WordPiece::EscapeSequence(s) => {
+            // Always a backslash followed by exactly the escaped character.
+            push_literal_pattern_char(s[1..].chars().next().unwrap(), out);
+            Ok(())
+        }
+        WordPiece::DoubleQuotedSequence(inner) | WordPiece::GettextDoubleQuotedSequence(inner) => {
+            for p in inner {
+                push_pattern_piece(&p.piece, out, false)?;
+            }
+            Ok(())
+        }
+        WordPiece::AnsiCQuotedText(_) => Err("ANSI-C quoting ($'...') is not supported yet".into()),
+        WordPiece::TildeExpansion(brush_parser::word::TildeExpr::Home) => {
+            match std::env::var("HOME") {
+                Ok(home) => {
+                    out.push_str(&home);
+                    Ok(())
+                }
+                Err(_) => Err("cannot expand `~`: $HOME is not set".into()),
+            }
+        }
+        WordPiece::TildeExpansion(_) => {
+            Err("tilde expansion is only supported for `~` (the home directory)".into())
+        }
+        WordPiece::ParameterExpansion(_) => Err("variable expansion is not supported yet".into()),
+        WordPiece::CommandSubstitution(_) | WordPiece::BackquotedCommandSubstitution(_) => {
+            Err("command substitution is not supported yet".into())
+        }
+        WordPiece::ArithmeticExpression(_) => {
+            Err("arithmetic expansion is not supported yet".into())
+        }
+    }
+}
+
+/// Append `c` to a case pattern's literal (quoted/escaped) text,
+/// escaping it first if it's one of the matcher's own metacharacters so
+/// it's matched as itself rather than as a wildcard.
+fn push_literal_pattern_char(c: char, out: &mut String) {
+    if c == '*' || c == '?' || c == '\\' {
+        out.push('\\');
+    }
+    out.push(c);
 }
 
 #[cfg(test)]
@@ -183,5 +280,60 @@ mod tests {
             panic!("expected word");
         };
         assert!(literal_word(w).is_err());
+    }
+
+    #[test]
+    fn literal_word_allows_a_lone_bracket() {
+        // The `[` test command (and any filename that just happens to
+        // contain a `[`) isn't rejected as "globbing": a lone `[` has no
+        // matching `]`, so it's not an actual bracket expression.
+        let program = parse("[ -f x ]").unwrap();
+        let ast::Command::Simple(cmd) = &program.complete_commands[0].0[0].0.first.seq[0] else {
+            panic!("expected a simple command");
+        };
+        assert_eq!(
+            literal_word(cmd.word_or_name.as_ref().unwrap()).unwrap(),
+            "["
+        );
+    }
+
+    #[test]
+    fn literal_word_still_rejects_a_real_bracket_expression() {
+        let program = parse("echo [ab]").unwrap();
+        let ast::Command::Simple(cmd) = &program.complete_commands[0].0[0].0.first.seq[0] else {
+            panic!("expected a simple command");
+        };
+        let word = &cmd.suffix.as_ref().unwrap().0[0];
+        let ast::CommandPrefixOrSuffixItem::Word(w) = word else {
+            panic!("expected word");
+        };
+        assert!(literal_word(w).is_err());
+    }
+
+    fn case_patterns(script: &str) -> Vec<String> {
+        let program = parse(script).expect("should parse");
+        let ast::Command::Compound(ast::CompoundCommand::CaseClause(case), _) =
+            &program.complete_commands[0].0[0].0.first.seq[0]
+        else {
+            panic!("expected a case clause");
+        };
+        case.cases[0]
+            .patterns
+            .iter()
+            .map(|p| case_pattern_word(p).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn case_pattern_word_keeps_unquoted_glob_meaningful() {
+        assert_eq!(case_patterns("case x in Linux*) ;; esac"), vec!["Linux*"]);
+    }
+
+    #[test]
+    fn case_pattern_word_escapes_quoted_glob_metachars() {
+        assert_eq!(
+            case_patterns(r#"case x in "*") ;; esac"#),
+            vec![r"\*".to_string()]
+        );
     }
 }
