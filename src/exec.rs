@@ -118,6 +118,53 @@ pub fn record_would_create(action: &Action, session: &mut Session) {
     }
 }
 
+/// Refuse to operate through a symlink planted between the filesystem
+/// root and `path`. `Session::owns` is a lexical prefix match on the
+/// path a script *named*; it has no idea that a directory component on
+/// the way to the leaf might actually be a symlink — planted by an
+/// earlier step, e.g. a `ln -s` the subprocess tier ran — that the OS
+/// would silently resolve through to wherever it points. Without this
+/// check, `mkdir owned/escape/x` or `rm -rf owned/escape/passwd` with
+/// `owned/escape -> /etc` operates on `/etc/x` or `/etc/passwd`, well
+/// outside anything this run actually created. Only intermediate
+/// components are checked when `allow_symlink_leaf` is set: removing a
+/// symlink removes just the link, which is safe; chmod, writes, and
+/// reads all follow a symlink leaf to its target, so callers that do
+/// those must pass `false`.
+fn assert_no_symlink_escape(path: &Path, allow_symlink_leaf: bool) -> Result<(), String> {
+    let components: Vec<_> = path.components().collect();
+    let Some((leaf, ancestors)) = components.split_last() else {
+        return Ok(());
+    };
+    let mut current = PathBuf::new();
+    for component in ancestors {
+        current.push(component);
+        if is_symlink(&current) {
+            return Err(format!(
+                "`{}` is a symlink; refusing to operate through it onto `{}`",
+                current.display(),
+                path.display()
+            ));
+        }
+    }
+    if !allow_symlink_leaf {
+        current.push(leaf);
+        if is_symlink(&current) {
+            return Err(format!(
+                "`{}` is a symlink; refusing to follow it to its target",
+                current.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn is_symlink(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
 fn mkdir(path: &Path, parents: bool, session: &mut Session) -> Result<(), String> {
     if path.exists() {
         if parents {
@@ -125,6 +172,7 @@ fn mkdir(path: &Path, parents: bool, session: &mut Session) -> Result<(), String
         }
         return Err(format!("mkdir: `{}` already exists", path.display()));
     }
+    assert_no_symlink_escape(path, true).map_err(|e| format!("mkdir: {e}"))?;
     // The topmost ancestor that does not exist yet is what this call
     // brings into being; owning it covers the whole subtree beneath.
     let topmost = path
@@ -152,6 +200,7 @@ fn remove(path: &Path, recursive: bool, force: bool, session: &Session) -> Resul
             path.display()
         ));
     }
+    assert_no_symlink_escape(path, true).map_err(|e| format!("rm: {e}"))?;
     let metadata = match fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(_) if force => return Ok(()),
@@ -173,6 +222,9 @@ fn remove(path: &Path, recursive: bool, force: bool, session: &Session) -> Resul
 
 fn chmod(path: &Path, mode: Mode) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
+    // Real chmod(2) follows a symlink to its target, so a leaf symlink
+    // must be refused too, not just intermediate components.
+    assert_no_symlink_escape(path, false).map_err(|e| format!("chmod: {e}"))?;
     let bits = match mode {
         Mode::Octal(bits) => bits,
         Mode::AddBits(add) => {
@@ -215,6 +267,7 @@ fn fetch(url: &str, output: &FetchOutput, session: &mut Session) -> Result<(), S
                 .map_err(|e| format!("GET {url}: writing to stdout: {e}"))?;
         }
         FetchOutput::File(path) => {
+            assert_no_symlink_escape(path, false).map_err(|e| format!("GET {url}: {e}"))?;
             let existed = path.exists();
             let mut file = fs::File::create(path)
                 .map_err(|e| format!("GET {url}: cannot create `{}`: {e}", path.display()))?;
@@ -233,6 +286,7 @@ fn fetch(url: &str, output: &FetchOutput, session: &mut Session) -> Result<(), S
 /// Append already-vetted text (the env-file grammar was checked in
 /// policy.rs) to `path`, creating it if it doesn't exist yet.
 fn append_file(path: &Path, text: &str, session: &mut Session) -> Result<(), String> {
+    assert_no_symlink_escape(path, false).map_err(|e| format!("append: {e}"))?;
     let existed = path.exists();
     let mut file = fs::OpenOptions::new()
         .create(true)
@@ -248,6 +302,7 @@ fn append_file(path: &Path, text: &str, session: &mut Session) -> Result<(), Str
 }
 
 fn sha256_hex(path: &Path) -> Result<String, String> {
+    assert_no_symlink_escape(path, false).map_err(|e| format!("sha256sum: {e}"))?;
     let mut file =
         fs::File::open(path).map_err(|e| format!("sha256sum: `{}`: {e}", path.display()))?;
     let mut hasher = Sha256::new();
@@ -467,5 +522,139 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("iish-definitely-not-a-real-binary"), "{err}");
+    }
+
+    // A subprocess (e.g. `ln -s`) can plant a symlink under a directory
+    // this run owns. Session::owns() is a lexical prefix match with no
+    // idea that a path component might actually redirect elsewhere on
+    // disk; these reproduce that escape and confirm assert_no_symlink_escape
+    // now blocks it before any of these ever call the real syscall.
+
+    #[test]
+    fn mkdir_refuses_to_create_through_a_symlink() {
+        let base = scratch("mkdir-symlink");
+        let outside = scratch("mkdir-symlink-outside");
+        fs::create_dir_all(&base).unwrap();
+        std::os::unix::fs::symlink(&outside, base.join("escape")).unwrap();
+        let mut session = Session::new();
+        session.record_created(&base);
+
+        let err = execute(
+            &Action::MkDir {
+                paths: vec![base.join("escape").join("newdir")],
+                parents: true,
+            },
+            &mut session,
+        )
+        .unwrap_err();
+        assert!(err.contains("symlink"), "{err}");
+        assert!(
+            !outside.exists(),
+            "must not have been created via the symlink"
+        );
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn remove_refuses_to_delete_through_a_symlink() {
+        let base = scratch("rm-symlink");
+        let outside = scratch("rm-symlink-outside");
+        fs::create_dir_all(&base).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let victim = outside.join("victim.txt");
+        fs::write(&victim, b"do not delete me").unwrap();
+        std::os::unix::fs::symlink(&outside, base.join("escape")).unwrap();
+        let mut session = Session::new();
+        session.record_created(&base);
+
+        let err = execute(
+            &Action::Remove {
+                paths: vec![base.join("escape").join("victim.txt")],
+                recursive: false,
+                force: false,
+            },
+            &mut session,
+        )
+        .unwrap_err();
+        assert!(err.contains("symlink"), "{err}");
+        assert!(
+            victim.exists(),
+            "the file outside the owned tree must survive"
+        );
+        fs::remove_dir_all(&base).unwrap();
+        fs::remove_dir_all(&outside).unwrap();
+    }
+
+    #[test]
+    fn chmod_refuses_a_symlink_leaf() {
+        let base = scratch("chmod-symlink-leaf");
+        fs::create_dir_all(&base).unwrap();
+        let target = base.join("target.txt");
+        fs::write(&target, b"x").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let mut session = Session::new();
+
+        let err = execute(
+            &Action::Chmod {
+                mode: Mode::Octal(0o777),
+                paths: vec![link],
+            },
+            &mut session,
+        )
+        .unwrap_err();
+        assert!(err.contains("symlink"), "{err}");
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o644,
+            "chmod must not have followed the symlink to its target"
+        );
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn chmod_refuses_through_an_intermediate_symlink() {
+        let base = scratch("chmod-symlink-intermediate");
+        let outside = scratch("chmod-symlink-intermediate-outside");
+        fs::create_dir_all(&base).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let target = outside.join("target.txt");
+        fs::write(&target, b"x").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink(&outside, base.join("escape")).unwrap();
+        let mut session = Session::new();
+
+        let err = execute(
+            &Action::Chmod {
+                mode: Mode::Octal(0o777),
+                paths: vec![base.join("escape").join("target.txt")],
+            },
+            &mut session,
+        )
+        .unwrap_err();
+        assert!(err.contains("symlink"), "{err}");
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        fs::remove_dir_all(&base).unwrap();
+        fs::remove_dir_all(&outside).unwrap();
+    }
+
+    #[test]
+    fn sha256sum_refuses_a_symlink_leaf() {
+        let base = scratch("sha256-symlink-leaf");
+        fs::create_dir_all(&base).unwrap();
+        let secret = base.join("secret.txt");
+        fs::write(&secret, b"outside content, not this run's to read").unwrap();
+        let link = base.join("owned-name.txt");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+        let mut session = Session::new();
+        session.record_created(&link);
+
+        let err = execute(&Action::Sha256Sum { paths: vec![link] }, &mut session).unwrap_err();
+        assert!(err.contains("symlink"), "{err}");
+        fs::remove_dir_all(&base).unwrap();
     }
 }

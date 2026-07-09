@@ -1,0 +1,49 @@
+#!/bin/bash
+# Run a real installer script through the real iish binary and, only if
+# it runs to completion, check that the program it was supposed to
+# install actually works. Exit codes carry the outcome for the host
+# script (scripts/verify-installers.sh) to interpret; the full iish
+# transcript is always on stdout/stderr for a human (or a `grep` for a
+# pinned deny/failure reason) to read.
+#
+#   0  iish ran the whole script and the verify command succeeded
+#      (or no verify command was given)
+#   1  iish refused or failed partway through (the expected case for
+#      every real corpus script today, since none of them run to
+#      completion yet — see PLAN.md milestone 7)
+#   2  iish ran the whole script, but the verify command failed: iish's
+#      policy let something through that did not actually produce a
+#      usable program. Always a bug worth looking at.
+set -u
+
+ask_mode="$1"
+shift
+script="$1"
+shift
+
+if ! /usr/local/bin/iish --no-config --"$ask_mode" "$script"; then
+    echo "run-corpus: iish did not run '$script' to completion"
+    exit 1
+fi
+
+echo "run-corpus: iish ran '$script' to completion"
+if [ "$#" -eq 0 ]; then
+    exit 0
+fi
+
+# Pick up PATH/env changes the script made via the env-file append
+# grammar (milestone 6) before running the verify command.
+# shellcheck disable=SC1090
+source "$HOME/.bash_profile" 2>/dev/null
+# shellcheck disable=SC1090
+source "$HOME/.profile" 2>/dev/null
+# shellcheck disable=SC1090
+source "$HOME/.bashrc" 2>/dev/null
+
+if "$@"; then
+    echo "run-corpus: verify command succeeded: $*"
+    exit 0
+else
+    echo "run-corpus: verify command FAILED: $*"
+    exit 2
+fi
