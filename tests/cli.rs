@@ -696,3 +696,120 @@ fn case_with_no_matching_arm_is_a_noop() {
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     assert_eq!(stdout(&out), "after\n");
 }
+
+#[test]
+fn and_runs_the_second_command_only_when_the_first_succeeds() {
+    let out = iish("[ 1 -eq 1 ] && echo yes\n", &[]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "yes\n");
+}
+
+#[test]
+fn and_short_circuits_and_survives_when_the_second_command_never_runs() {
+    // Matches real bash under `set -e`: `false && echo hi; echo after`
+    // prints "after" -- `echo hi`, the last pipeline in the list, never
+    // ran, so its (never-produced) failure can't trip errexit.
+    let out = iish("[ 1 -eq 2 ] && echo yes\necho after\n", &[]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "after\n");
+}
+
+#[test]
+fn and_aborts_when_the_last_pipeline_runs_and_fails() {
+    // `true && false` does NOT survive `set -e`: `false` is the last
+    // pipeline in the list, and it actually ran.
+    let out = iish("true && [ 1 -eq 2 ]\necho after\n", &[]);
+    assert!(!out.status.success());
+    assert_eq!(stdout(&out), "");
+}
+
+#[test]
+fn or_runs_the_fallback_only_when_the_first_fails() {
+    let out = iish("[ 1 -eq 2 ] || echo fallback\n", &[]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "fallback\n");
+}
+
+#[test]
+fn or_skips_the_fallback_when_the_first_succeeds() {
+    let out = iish("[ 1 -eq 1 ] || echo fallback\necho after\n", &[]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "after\n");
+}
+
+#[test]
+fn or_fallback_pattern_survives_when_the_fallback_succeeds() {
+    // The extremely common installer idiom: `probe || fallback`. If the
+    // probe fails but the fallback succeeds, the whole line succeeds and
+    // the script keeps going.
+    let out = iish("[ 1 -eq 2 ] || echo fallback\necho still-running\n", &[]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "fallback\nstill-running\n");
+}
+
+#[test]
+fn command_list_condition_side_effects_persist_across_short_circuit() {
+    let base = scratch("and-or-mkdir");
+    let script = format!("[ -d {0} ] || mkdir -p {0}\nrm -r {0}\n", base.display());
+    let out = iish(&script, &[]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(!base.exists());
+}
+
+#[test]
+fn and_or_list_works_as_an_if_condition() {
+    let out = iish(
+        "if [ 1 -eq 2 ] || true; then echo yes; else echo no; fi\n",
+        &[],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "yes\n");
+}
+
+#[test]
+fn a_denial_inside_a_command_list_aborts_the_whole_run() {
+    let out = iish("sudo rm -rf / || echo fallback\necho after\n", &[]);
+    assert!(!out.status.success());
+    assert_eq!(stdout(&out), "");
+}
+
+#[test]
+fn bare_assignment_can_be_read_back_by_echo() {
+    let out = iish("FOO=\"hello world\"\necho $FOO\n", &[]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "hello world\n");
+}
+
+#[test]
+fn later_assignment_replaces_an_earlier_one() {
+    let out = iish("FOO=first\nFOO=second\necho $FOO\n", &[]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "second\n");
+}
+
+#[test]
+fn assigned_variable_can_drive_an_if_condition() {
+    let out = iish(
+        "OS=linux\nif [ \"$OS\" = linux ]; then echo yes; else echo no; fi\n",
+        &[],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "yes\n");
+}
+
+#[test]
+fn assigned_variable_can_drive_a_case_value() {
+    let out = iish(
+        "OS=linux\ncase \"$OS\" in linux) echo is-linux;; *) echo other;; esac\n",
+        &[],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "is-linux\n");
+}
+
+#[test]
+fn referencing_an_unset_variable_aborts_the_run() {
+    let out = iish("echo $NOT_ASSIGNED_ANYWHERE_IISH\n", &[]);
+    assert!(!out.status.success());
+    assert_eq!(stdout(&out), "");
+}

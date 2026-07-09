@@ -52,6 +52,18 @@ pub enum Verdict {
         then_branch: Vec<ast::CompoundListItem>,
         elses: Option<Vec<ast::ElseClause>>,
     },
+    /// `first && second || third ...`: like `If`'s condition, whether
+    /// `second`/`third`/... even run depends on the real exit status of
+    /// what came before, so this can't be resolved to a fixed action
+    /// here either. The runner evaluates `first`, then walks `rest`
+    /// left to right, running each pipeline only if its operator's
+    /// short-circuit condition is met (`&&` — the status so far was
+    /// success; `||` — it wasn't); the list's own status is whichever
+    /// pipeline ran last.
+    AndOrList {
+        first: ast::Pipeline,
+        rest: Vec<ast::AndOr>,
+    },
 }
 
 fn allow(reason: impl Into<String>, action: Action) -> Verdict {
@@ -119,10 +131,30 @@ fn evaluate_list_item(item: &ast::CompoundListItem, session: &Session, config: &
 }
 
 fn evaluate_and_or_list(list: &ast::AndOrList, session: &Session, config: &Config) -> Verdict {
-    if !list.additional.is_empty() {
-        return deny("command lists joined by `&&`/`||` are not implemented yet");
+    if list.additional.is_empty() {
+        evaluate_pipeline(&list.first, session, config)
+    } else {
+        Verdict::AndOrList {
+            first: list.first.clone(),
+            rest: list.additional.clone(),
+        }
     }
-    evaluate_pipeline(&list.first, session, config)
+}
+
+/// Evaluate a single pipeline from inside an `AndOrList`'s chain — the
+/// runner's counterpart to [`evaluate_item`], at pipeline rather than
+/// whole-statement granularity, since a `&&`/`||` chain must decide
+/// each pipeline's policy one at a time as it actually runs it (a later
+/// pipeline may depend on ledger changes an earlier one made).
+pub fn evaluate_pipeline_item(
+    pipeline: &ast::Pipeline,
+    session: &Session,
+    config: &Config,
+) -> Statement {
+    Statement {
+        raw: pipeline.to_string(),
+        verdict: evaluate_pipeline(pipeline, session, config),
+    }
 }
 
 fn evaluate_pipeline(pipeline: &ast::Pipeline, session: &Session, config: &Config) -> Verdict {
@@ -164,7 +196,7 @@ fn is_shell_name(name: &str) -> bool {
 fn evaluate_command(cmd: &ast::Command, session: &Session, config: &Config) -> Verdict {
     match cmd {
         ast::Command::Simple(sc) => evaluate_simple_command(sc, session, config),
-        ast::Command::Function(def) => evaluate_function_definition(def),
+        ast::Command::Function(def) => evaluate_function_definition(def, session),
         ast::Command::ExtendedTest(_, redirects) => {
             if redirects.is_some() {
                 return deny("redirection is not implemented yet");
@@ -184,7 +216,9 @@ fn evaluate_command(cmd: &ast::Command, session: &Session, config: &Config) -> V
                     statements: group.list.0.clone(),
                 },
                 ast::CompoundCommand::IfClause(if_clause) => evaluate_if(if_clause),
-                ast::CompoundCommand::CaseClause(case_clause) => evaluate_case(case_clause),
+                ast::CompoundCommand::CaseClause(case_clause) => {
+                    evaluate_case(case_clause, session)
+                }
                 other => deny(format!("{} are not implemented yet", compound_kind(other))),
             }
         }
@@ -196,8 +230,8 @@ fn evaluate_command(cmd: &ast::Command, session: &Session, config: &Config) -> V
 /// plain brace-group body with no redirects is supported; a subshell
 /// body (`name() ( ... )`) or one with its own redirects would need
 /// machinery (subshell isolation, redirect handling) iish doesn't have.
-fn evaluate_function_definition(def: &ast::FunctionDefinition) -> Verdict {
-    let name = match literal_word(&def.fname) {
+fn evaluate_function_definition(def: &ast::FunctionDefinition, session: &Session) -> Verdict {
+    let name = match literal_word(&def.fname, session.variables()) {
         Ok(n) => n,
         Err(reason) => return deny(reason),
     };
@@ -242,8 +276,8 @@ fn evaluate_if(if_clause: &ast::IfClauseCommand) -> Verdict {
 /// — the runner doesn't need to know it came from a `case` at all. No
 /// arm matching falls through to a no-op, matching real `case`'s exit
 /// status of 0 when nothing matches.
-fn evaluate_case(case: &ast::CaseClauseCommand) -> Verdict {
-    let value = match literal_word(&case.value) {
+fn evaluate_case(case: &ast::CaseClauseCommand, session: &Session) -> Verdict {
+    let value = match literal_word(&case.value, session.variables()) {
         Ok(v) => v,
         Err(reason) => return deny(reason),
     };
@@ -313,25 +347,72 @@ fn compound_kind(compound: &ast::CompoundCommand) -> &'static str {
     }
 }
 
+/// `VAR=value [VAR2=value2 ...]` with no command word: assigns one or
+/// more shell variables tracked for the rest of this run (parser.rs's
+/// `literal_word` reads them back for a later `$VAR` expansion) and
+/// nothing else — no filesystem or process side effects, so always
+/// allowed once every value renders as a literal word. Each value is
+/// rendered against the session as it stood *before* this statement, so
+/// (unlike real bash) a later assignment on the same line can't yet see
+/// an earlier one's freshly-set value — a rare enough shape in practice
+/// that it isn't worth the added complexity here. `VAR+=value`
+/// (appending), array-element (`VAR[i]=value`), and array-valued
+/// (`VAR=(a b c)`) assignments aren't implemented.
+fn evaluate_bare_assignment(
+    items: &[ast::CommandPrefixOrSuffixItem],
+    session: &Session,
+) -> Verdict {
+    let mut assignments = Vec::with_capacity(items.len());
+    for item in items {
+        let ast::CommandPrefixOrSuffixItem::AssignmentWord(assignment, _) = item else {
+            return deny("bare variable assignment is not implemented yet");
+        };
+        if assignment.append {
+            return deny("`VAR+=value` (appending to an existing variable) is not implemented yet");
+        }
+        let name = match &assignment.name {
+            ast::AssignmentName::VariableName(name) => name.clone(),
+            ast::AssignmentName::ArrayElementName(..) => {
+                return deny("array element assignment (`VAR[i]=value`) is not implemented yet")
+            }
+        };
+        let ast::AssignmentValue::Scalar(word) = &assignment.value else {
+            return deny("array-valued assignment (`VAR=(a b c)`) is not implemented yet");
+        };
+        let value = match literal_word(word, session.variables()) {
+            Ok(v) => v,
+            Err(reason) => return deny(reason),
+        };
+        assignments.push((name, value));
+    }
+    allow(
+        "assigns only literal values to shell variables tracked for this run; no filesystem \
+         or process side effects",
+        Action::Assign { assignments },
+    )
+}
+
 fn evaluate_simple_command(
     cmd: &ast::SimpleCommand,
     session: &Session,
     config: &Config,
 ) -> Verdict {
+    if cmd.word_or_name.is_none() {
+        // A bare `VAR=value [VAR2=value2 ...]` statement: no command to
+        // run at all, just one or more assignments. `cmd.prefix` is
+        // guaranteed non-empty by the grammar whenever there's no
+        // command word.
+        let items = cmd.prefix.as_ref().map(|p| p.0.as_slice()).unwrap_or(&[]);
+        return evaluate_bare_assignment(items, session);
+    }
     if let Some(prefix) = &cmd.prefix {
         if !prefix.0.is_empty() {
-            return deny(if cmd.word_or_name.is_none() {
-                "bare variable assignment (`VAR=value`) is not implemented yet"
-            } else {
-                "`VAR=value` prefix assignments are not implemented yet"
-            });
+            return deny("`VAR=value` prefix assignments are not implemented yet");
         }
     }
 
-    let Some(name_word) = &cmd.word_or_name else {
-        return deny("bare variable assignment is not implemented yet");
-    };
-    let name = match literal_word(name_word) {
+    let name_word = cmd.word_or_name.as_ref().unwrap();
+    let name = match literal_word(name_word, session.variables()) {
         Ok(n) => n,
         Err(reason) => return deny(reason),
     };
@@ -346,10 +427,12 @@ fn evaluate_simple_command(
     if let Some(suffix) = &cmd.suffix {
         for item in &suffix.0 {
             match item {
-                ast::CommandPrefixOrSuffixItem::Word(w) => match literal_word(w) {
-                    Ok(s) => args.push(s),
-                    Err(reason) => return deny(reason),
-                },
+                ast::CommandPrefixOrSuffixItem::Word(w) => {
+                    match literal_word(w, session.variables()) {
+                        Ok(s) => args.push(s),
+                        Err(reason) => return deny(reason),
+                    }
+                }
                 ast::CommandPrefixOrSuffixItem::AssignmentWord(..) => {
                     return deny("assignment arguments are not implemented yet");
                 }
@@ -527,7 +610,7 @@ fn evaluate_env_file_append(
         Ok(t) => t,
         Err(reason) => return deny(reason),
     };
-    let path_str = match literal_word(target) {
+    let path_str = match literal_word(target, session.variables()) {
         Ok(s) => s,
         Err(reason) => return deny(reason),
     };
@@ -1897,8 +1980,30 @@ mod tests {
     }
 
     #[test]
-    fn denies_expansion() {
-        assert!(matches!(verdict("echo $HOME"), Deny { .. }));
+    fn denies_expansion_of_an_unset_variable() {
+        assert!(matches!(
+            verdict("echo $NOT_A_REAL_VARIABLE_IISH_TEST"),
+            Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn expands_a_real_environment_variable() {
+        let home = std::env::var("HOME").expect("test environment should have $HOME set");
+        match verdict("echo $HOME") {
+            Allow {
+                action: Action::Print { text },
+                ..
+            } => assert_eq!(text, format!("{home}\n")),
+            other => panic!("expected allow/print, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn denies_unsupported_parameter_expansion_operators() {
+        assert!(matches!(verdict(r#"echo "${FOO:-default}""#), Deny { .. }));
+        assert!(matches!(verdict("echo $1"), Deny { .. }));
+        assert!(matches!(verdict("echo $?"), Deny { .. }));
     }
 
     #[test]
@@ -2028,11 +2133,77 @@ mod tests {
     }
 
     #[test]
-    fn denies_command_lists() {
-        assert!(matches!(
-            verdict("mkdir /tmp/a && mkdir /tmp/b"),
-            Deny { .. }
-        ));
+    fn command_list_produces_an_and_or_list_verdict() {
+        match verdict("mkdir /tmp/a && mkdir /tmp/b") {
+            Verdict::AndOrList { rest, .. } => assert_eq!(rest.len(), 1),
+            other => panic!("expected an and/or list verdict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bare_assignment_of_a_literal_value_is_allowed() {
+        match verdict(r#"FOO="bar""#) {
+            Allow {
+                action: Action::Assign { assignments },
+                ..
+            } => assert_eq!(assignments, vec![("FOO".to_string(), "bar".to_string())]),
+            other => panic!("expected allow/assign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bare_assignment_supports_multiple_variables_on_one_line() {
+        match verdict("A=1 B=2") {
+            Allow {
+                action: Action::Assign { assignments },
+                ..
+            } => assert_eq!(
+                assignments,
+                vec![
+                    ("A".to_string(), "1".to_string()),
+                    ("B".to_string(), "2".to_string())
+                ]
+            ),
+            other => panic!("expected allow/assign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bare_assignment_of_an_unsupported_value_is_denied() {
+        assert!(matches!(verdict("FOO=$(uname -s)"), Deny { .. }));
+    }
+
+    #[test]
+    fn bare_assignment_can_be_read_back_by_a_later_statement() {
+        let mut session = Session::new();
+        let assign = verdict("FOO=bar");
+        let Allow {
+            action: Action::Assign { assignments },
+            ..
+        } = assign
+        else {
+            panic!("expected allow/assign");
+        };
+        for (name, value) in assignments {
+            session.set_variable(name, value);
+        }
+        match verdict_with("echo $FOO", &session) {
+            Allow {
+                action: Action::Print { text },
+                ..
+            } => assert_eq!(text, "bar\n"),
+            other => panic!("expected allow/print, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prefix_assignment_before_a_command_is_still_denied() {
+        assert!(matches!(verdict("FOO=bar echo hi"), Deny { .. }));
+    }
+
+    #[test]
+    fn appending_assignment_is_not_implemented() {
+        assert!(matches!(verdict("FOO+=bar"), Deny { .. }));
     }
 
     #[test]

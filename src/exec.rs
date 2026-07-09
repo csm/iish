@@ -79,6 +79,10 @@ pub enum Action {
     /// `mkdir`'s "does this path already exist?" check runs) since
     /// nothing about it needs confirming or deferring.
     Test { result: bool },
+    /// `VAR=value [VAR2=value2 ...]`: record each `(name, value)` in the
+    /// session's variable table for a later `$VAR` expansion to read
+    /// back. No filesystem or process side effects.
+    Assign { assignments: Vec<(String, String)> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,6 +146,12 @@ pub fn execute(action: &Action, session: &mut Session) -> Result<(), String> {
                 Err("test: expression was false".to_string())
             }
         }
+        Action::Assign { assignments } => {
+            for (name, value) in assignments {
+                session.set_variable(name.clone(), value.clone());
+            }
+            Ok(())
+        }
     }
 }
 
@@ -181,6 +191,11 @@ pub fn record_would_create(action: &Action, session: &mut Session) {
         Action::Copy { pairs, .. } => {
             for (_, dest) in pairs {
                 session.record_created(dest);
+            }
+        }
+        Action::Assign { assignments } => {
+            for (name, value) in assignments {
+                session.set_variable(name.clone(), value.clone());
             }
         }
         _ => {}

@@ -148,52 +148,60 @@ set_corpus_expectation() {
     verify_cmd=()
     case "$1" in
         rustup)
-            # Function definitions, brace groups, and `set` are all
-            # implemented now; this trips on the next unimplemented
-            # construct, a `cmd1 || cmd2` list, well past where it used
-            # to stop.
-            expected_reason="command lists joined by \`&&\`/\`||\` are not implemented yet"
+            # Function definitions, brace groups, `set`, and `&&`/`||`
+            # command lists are all implemented now (so the `||` that
+            # used to stop this one no longer does); this trips on the
+            # next unimplemented construct, a `2>` stderr redirect (only
+            # a single `>>` onto a plain filename is supported).
+            expected_reason="redirection is only implemented for a single \`>>\` onto a plain filename"
             verify_cmd=(rustc --version)
             ;;
         zoxide)
             # Reached from inside a call to zoxide's own \`main\`
             # function (a real function call, not just its definition)
             # -- see the indented DENY in \`iish --dry-run\`'s output.
-            expected_reason="command lists joined by \`&&\`/\`||\` are not implemented yet"
+            # `&&`/`||` are implemented now; this trips on `main`'s own
+            # `"$@"`, a special parameter (only plain `$VAR`/`${VAR}` is
+            # implemented).
+            expected_reason="special parameters (\`\$?\`, \`\$#\`, \`\$@\`, \`\$*\`, ...) are not supported yet"
             verify_cmd=(zoxide --version)
             ;;
         pnpm)
-            # `if`/`test`/`[` (including `-t`) are all implemented now;
-            # this trips on the next unimplemented construct, a bare
-            # `VAR=value` prefix, from well inside pnpm's own tty-color
-            # setup (past a real `if [ -t 1 ]` check).
-            expected_reason="bare variable assignment (\`VAR=value\`) is not implemented yet"
+            # `if`/`test`/`[` (including `-t`) and bare `VAR=value`
+            # assignment are all implemented now; this trips on the next
+            # unimplemented construct, a command substitution
+            # (`$(tty_mkbold 34)`) as the assigned value.
+            expected_reason="command substitution is not supported yet"
             verify_cmd=(pnpm --version)
             ;;
         nvm)
             # Reached from inside a brace group actually running now,
-            # into the very first `if` -- `if`/`[` are implemented, but
-            # this condition's `||` is the next unimplemented construct.
-            expected_reason="command lists joined by \`&&\`/\`||\` are not implemented yet"
+            # into the very first `if` -- `if`/`[`/`||` are implemented;
+            # this trips on `$BASH_VERSION`, a real environment variable
+            # that's genuinely unset in iish's own process (iish isn't
+            # bash), matching what a real, non-bash `sh` would see too.
+            expected_reason="\`\$BASH_VERSION\` is unset"
             verify_cmd=(bash -lc 'source "$HOME/.nvm/nvm.sh" 2>/dev/null; command -v nvm')
             ;;
         starship)
-            # `set -eu` is a recognized no-op now; this trips on the
-            # next unimplemented construct, a bare `VAR=value` prefix
-            # (command substitution as the value would be denied too,
-            # but the bare-assignment shape is what iish reports first).
-            expected_reason="bare variable assignment (\`VAR=value\`) is not implemented yet"
+            # `set -eu` and bare `VAR=value` assignment are implemented
+            # now; this trips on the next unimplemented construct, a
+            # command substitution (`$(tput bold ...)`) as the assigned
+            # value.
+            expected_reason="command substitution is not supported yet"
             verify_cmd=(starship --version)
             ;;
         atuin)
-            expected_reason="bare variable assignment (\`VAR=value\`) is not implemented yet"
+            # Bare `VAR=value` assignment is implemented now; this trips
+            # on the next unimplemented construct, a `for` loop.
+            expected_reason="for-loops are not implemented yet"
             verify_cmd=(atuin --version)
             ;;
         deno)
-            # `if`/`test`/`[` (including `!` negation) are implemented
-            # now; this trips on the condition's `&&`, the next
+            # `if`/`test`/`[` and `&&`/`||` are implemented now; this
+            # trips on the condition's `!` pipeline negation, the next
             # unimplemented construct.
-            expected_reason="command lists joined by \`&&\`/\`||\` are not implemented yet"
+            expected_reason="\`!\` pipeline negation is not implemented yet"
             verify_cmd=(deno --version)
             ;;
         *)
