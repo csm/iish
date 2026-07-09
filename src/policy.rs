@@ -11,6 +11,7 @@
 //! refusing to tokenize; now that parsing covers the full grammar, the
 //! evaluator enforces it instead.
 
+use crate::config::{Config, NetworkPolicy, Verb};
 use crate::exec::{Action, FetchOutput, Mode};
 use crate::parser::{ast, literal_word};
 use crate::state::{self, Session};
@@ -66,31 +67,35 @@ pub fn items(program: &ast::Program) -> Vec<&ast::CompoundListItem> {
         .collect()
 }
 
-/// Evaluate one top-level statement against the policy and the current
-/// session ledger.
-pub fn evaluate_item(item: &ast::CompoundListItem, session: &Session) -> Statement {
+/// Evaluate one top-level statement against the policy, the current
+/// session ledger, and the effective configuration.
+pub fn evaluate_item(
+    item: &ast::CompoundListItem,
+    session: &Session,
+    config: &Config,
+) -> Statement {
     Statement {
         raw: item.0.to_string(),
-        verdict: evaluate_list_item(item, session),
+        verdict: evaluate_list_item(item, session, config),
     }
 }
 
-fn evaluate_list_item(item: &ast::CompoundListItem, session: &Session) -> Verdict {
+fn evaluate_list_item(item: &ast::CompoundListItem, session: &Session, config: &Config) -> Verdict {
     let ast::CompoundListItem(and_or, separator) = item;
     if matches!(separator, ast::SeparatorOperator::Async) {
         return deny("background jobs (`&`) are not implemented yet");
     }
-    evaluate_and_or_list(and_or, session)
+    evaluate_and_or_list(and_or, session, config)
 }
 
-fn evaluate_and_or_list(list: &ast::AndOrList, session: &Session) -> Verdict {
+fn evaluate_and_or_list(list: &ast::AndOrList, session: &Session, config: &Config) -> Verdict {
     if !list.additional.is_empty() {
         return deny("command lists joined by `&&`/`||` are not implemented yet");
     }
-    evaluate_pipeline(&list.first, session)
+    evaluate_pipeline(&list.first, session, config)
 }
 
-fn evaluate_pipeline(pipeline: &ast::Pipeline, session: &Session) -> Verdict {
+fn evaluate_pipeline(pipeline: &ast::Pipeline, session: &Session, config: &Config) -> Verdict {
     if pipeline.timed.is_some() {
         return deny("`time` is not implemented yet");
     }
@@ -99,7 +104,7 @@ fn evaluate_pipeline(pipeline: &ast::Pipeline, session: &Session) -> Verdict {
     }
     match pipeline.seq.as_slice() {
         [] => deny("empty pipeline"),
-        [only] => evaluate_command(only, session),
+        [only] => evaluate_command(only, session, config),
         stages => {
             if stages.iter().any(is_shell_invocation) {
                 deny("piping into a shell is exactly what iish exists to replace; refusing")
@@ -118,13 +123,17 @@ fn is_shell_invocation(cmd: &ast::Command) -> bool {
     };
     sc.word_or_name
         .as_ref()
-        .map(|w| matches!(w.value.as_str(), "sh" | "bash" | "zsh" | "dash" | "ksh"))
+        .map(|w| is_shell_name(&w.value))
         .unwrap_or(false)
 }
 
-fn evaluate_command(cmd: &ast::Command, session: &Session) -> Verdict {
+fn is_shell_name(name: &str) -> bool {
+    matches!(name, "sh" | "bash" | "zsh" | "dash" | "ksh")
+}
+
+fn evaluate_command(cmd: &ast::Command, session: &Session, config: &Config) -> Verdict {
     match cmd {
-        ast::Command::Simple(sc) => evaluate_simple_command(sc, session),
+        ast::Command::Simple(sc) => evaluate_simple_command(sc, session, config),
         ast::Command::Function(_) => deny("function definitions are not implemented yet"),
         ast::Command::ExtendedTest(_, redirects) => {
             if redirects.is_some() {
@@ -159,7 +168,11 @@ fn compound_kind(compound: &ast::CompoundCommand) -> &'static str {
     }
 }
 
-fn evaluate_simple_command(cmd: &ast::SimpleCommand, session: &Session) -> Verdict {
+fn evaluate_simple_command(
+    cmd: &ast::SimpleCommand,
+    session: &Session,
+    config: &Config,
+) -> Verdict {
     if let Some(prefix) = &cmd.prefix {
         if !prefix.0.is_empty() {
             return deny(if cmd.word_or_name.is_none() {
@@ -199,10 +212,14 @@ fn evaluate_simple_command(cmd: &ast::SimpleCommand, session: &Session) -> Verdi
         }
     }
 
-    evaluate_argv(&name, &args, session)
+    evaluate_argv(&name, &args, session, config)
 }
 
-fn evaluate_argv(name: &str, args: &[String], session: &Session) -> Verdict {
+fn evaluate_argv(name: &str, args: &[String], session: &Session, config: &Config) -> Verdict {
+    if config.command_override(name) == Some(Verb::Deny) {
+        return deny(format!("`{name}` is denied by configuration"));
+    }
+
     match name {
         "true" | ":" => allow("does nothing", Action::Noop),
         "echo" => evaluate_echo(args),
@@ -210,18 +227,70 @@ fn evaluate_argv(name: &str, args: &[String], session: &Session) -> Verdict {
         "mkdir" => evaluate_mkdir(args),
         "rm" => evaluate_rm(args, session),
         "chmod" => evaluate_chmod(args, session),
-        "curl" => evaluate_curl(args, session),
-        "wget" => evaluate_wget(args, session),
+        "curl" => evaluate_curl(args, session, config),
+        "wget" => evaluate_wget(args, session, config),
 
-        // Recognized installer staples we haven't implemented yet.
-        // Listed separately from the generic deny so the report shows
-        // them as "planned" rather than "unknown".
-        "cp" | "mv" | "tar" | "install" | "ln" | "cd" | "export" | "source" | "." => {
-            deny(format!("`{name}` is recognized but not implemented yet"))
+        // A shell is exactly what iish exists to replace; no config
+        // knob may reopen this escape hatch (see PLAN.md's "no pass
+        // through to bash" principle).
+        "sh" | "bash" | "zsh" | "dash" | "ksh" => deny(format!(
+            "`{name}` is a shell; iish parses and vets scripts itself instead of handing them to one"
+        )),
+
+        // Shell builtins with no external binary: running them as a
+        // subprocess would either find no binary to exec, or (`cd`,
+        // `export`) run against a throwaway child process and have no
+        // effect on iish's own state. Not implemented, and not eligible
+        // for the subprocess tier below for that reason.
+        "cd" | "export" | "source" | "." => {
+            deny(format!("`{name}` is a shell builtin; iish does not implement it"))
         }
 
-        other => deny(format!("`{other}` is not on the installer allowlist")),
+        // Everything else: real external binaries iish has no native
+        // implementation for (cp, mv, tar, install, ln, sudo, package
+        // managers, ...). Governed by the "subprocess" policy
+        // (milestone 5, PLAN.md "Configuration") — allow/ask/deny,
+        // globally or per command.
+        other => evaluate_subprocess(other, args, session, config),
     }
+}
+
+/// The subprocess tier: commands iish has no native implementation for.
+/// The already-parsed, literal argv is compiled into an `Action` that,
+/// if allowed, execs it directly — never through a shell. This is also
+/// how `sudo <cmd>` behaves until the sudo broker (milestone 4b) lands:
+/// exactly the "degrade to per-command real sudo with fixed argv"
+/// fallback PLAN.md's sudo-broker caveats describe.
+fn evaluate_subprocess(name: &str, args: &[String], session: &Session, config: &Config) -> Verdict {
+    let action = Action::Subprocess {
+        name: name.to_string(),
+        args: args.to_vec(),
+    };
+    let verb = config.command_override(name).unwrap_or_else(|| {
+        if runs_a_created_path(name, session) {
+            config.run_created
+        } else {
+            config.subprocess
+        }
+    });
+    match verb {
+        Verb::Deny => deny(format!("`{name}` is not on the installer allowlist")),
+        Verb::Ask => prompt(
+            format!("`{name}` is not natively implemented; run the literal command directly?"),
+            action,
+        ),
+        Verb::Allow => allow(
+            format!("`{name}` runs as a subprocess per configuration"),
+            action,
+        ),
+    }
+}
+
+/// True if `name` looks like a path (not a bare `$PATH` lookup) to
+/// something this run created earlier — e.g. a second-stage script the
+/// install downloaded and is now executing.
+fn runs_a_created_path(name: &str, session: &Session) -> bool {
+    name.contains('/') && session.owns(&state::normalize(Path::new(name)))
 }
 
 fn evaluate_echo(args: &[String]) -> Verdict {
@@ -451,7 +520,10 @@ fn parse_chmod_mode(s: &str) -> Result<Mode, String> {
 /// binary. Every flag must be on the allowlist below; anything else —
 /// non-GET methods, data uploads, `--insecure`, config files, … — is
 /// denied by not being on it.
-fn evaluate_curl(args: &[String], session: &Session) -> Verdict {
+fn evaluate_curl(args: &[String], session: &Session, config: &Config) -> Verdict {
+    if config.network == NetworkPolicy::Deny {
+        return deny("network access is disabled by configuration");
+    }
     let mut output: Option<String> = None;
     let mut remote_name = false;
     let mut urls: Vec<&str> = Vec::new();
@@ -523,12 +595,15 @@ fn evaluate_curl(args: &[String], session: &Session) -> Verdict {
         }
     }
 
-    finish_fetch("curl", &urls, output, remote_name, session)
+    finish_fetch("curl", &urls, output, remote_name, session, config)
 }
 
 /// wget, same posture as curl: a small allowlist of flags, GET only,
 /// fetched in-process.
-fn evaluate_wget(args: &[String], session: &Session) -> Verdict {
+fn evaluate_wget(args: &[String], session: &Session, config: &Config) -> Verdict {
+    if config.network == NetworkPolicy::Deny {
+        return deny("network access is disabled by configuration");
+    }
     let mut output: Option<String> = None;
     let mut urls: Vec<&str> = Vec::new();
 
@@ -554,7 +629,7 @@ fn evaluate_wget(args: &[String], session: &Session) -> Verdict {
     }
 
     // wget writes to the URL's basename when no -O is given.
-    finish_fetch("wget", &urls, output, true, session)
+    finish_fetch("wget", &urls, output, true, session, config)
 }
 
 /// Shared tail of curl/wget evaluation: validate the URL, resolve where
@@ -565,6 +640,7 @@ fn finish_fetch(
     output: Option<String>,
     remote_name: bool,
     session: &Session,
+    config: &Config,
 ) -> Verdict {
     let url = match urls {
         [] => return deny(format!("{name} without a URL")),
@@ -621,13 +697,26 @@ fn finish_fetch(
             ),
             action,
         ),
-        FetchOutput::File(path) => prompt(
-            format!(
-                "GET `{url}` would overwrite pre-existing `{}`",
-                path.display()
+        FetchOutput::File(path) => match config.overwrite {
+            Verb::Ask => prompt(
+                format!(
+                    "GET `{url}` would overwrite pre-existing `{}`",
+                    path.display()
+                ),
+                action,
             ),
-            action,
-        ),
+            Verb::Allow => allow(
+                format!(
+                    "GET `{url}` overwrites pre-existing `{}` (allowed by configuration)",
+                    path.display()
+                ),
+                action,
+            ),
+            Verb::Deny => deny(format!(
+                "GET `{url}` would overwrite pre-existing `{}`; overwriting is disabled by configuration",
+                path.display()
+            )),
+        },
     }
 }
 
@@ -641,9 +730,13 @@ mod tests {
     }
 
     fn verdict_with(line: &str, session: &Session) -> Verdict {
+        verdict_with_config(line, session, &Config::default())
+    }
+
+    fn verdict_with_config(line: &str, session: &Session, config: &Config) -> Verdict {
         let program = parse(line).expect("should parse");
         let item = *items(&program).first().expect("should have one statement");
-        evaluate_item(item, session).verdict
+        evaluate_item(item, session, config).verdict
     }
 
     use Verdict::{Allow, Deny, Prompt};
@@ -687,8 +780,182 @@ mod tests {
     }
 
     #[test]
-    fn denies_unknown_binaries() {
-        assert!(matches!(verdict("sudo make install"), Deny { .. }));
+    fn unknown_binaries_ask_by_default() {
+        // Milestone 5: PLAN.md's built-in default is "unlisted
+        // subprocesses ⇒ ask", not a hard deny. This is also how
+        // `sudo <cmd>` behaves pre-broker.
+        match verdict("sudo make install") {
+            Prompt {
+                action: Action::Subprocess { name, args },
+                ..
+            } => {
+                assert_eq!(name, "sudo");
+                assert_eq!(args, vec!["make", "install"]);
+            }
+            other => panic!("expected prompt/subprocess, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subprocess_deny_config_denies_unknown_binaries() {
+        let config = Config {
+            subprocess: Verb::Deny,
+            ..Config::default()
+        };
+        assert!(matches!(
+            verdict_with_config("sudo make install", &Session::new(), &config),
+            Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn subprocess_allow_config_allows_unknown_binaries() {
+        let config = Config {
+            subprocess: Verb::Allow,
+            ..Config::default()
+        };
+        assert!(matches!(
+            verdict_with_config("uname -a", &Session::new(), &config),
+            Allow {
+                action: Action::Subprocess { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn per_command_override_wins_over_subprocess_default() {
+        let mut config = Config {
+            subprocess: Verb::Allow,
+            ..Config::default()
+        };
+        config.commands.insert("systemctl".to_string(), Verb::Deny);
+        assert!(matches!(
+            verdict_with_config("systemctl enable foo", &Session::new(), &config),
+            Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn config_deny_override_beats_native_command_logic() {
+        let mut config = Config::default();
+        config.commands.insert("curl".to_string(), Verb::Deny);
+        assert!(matches!(
+            verdict_with_config("curl https://example.com", &Session::new(), &config),
+            Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn shells_are_denied_even_if_configured_allow() {
+        let mut config = Config {
+            subprocess: Verb::Allow,
+            ..Config::default()
+        };
+        config.commands.insert("bash".to_string(), Verb::Allow);
+        assert!(matches!(
+            verdict_with_config("bash script.sh", &Session::new(), &config),
+            Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn shell_builtins_are_denied_even_if_configured_allow() {
+        let config = Config {
+            subprocess: Verb::Allow,
+            ..Config::default()
+        };
+        assert!(matches!(
+            verdict_with_config("cd /tmp", &Session::new(), &config),
+            Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn recognized_but_unimplemented_binaries_use_subprocess_tier() {
+        let config = Config {
+            subprocess: Verb::Allow,
+            ..Config::default()
+        };
+        assert!(matches!(
+            verdict_with_config("cp a b", &Session::new(), &config),
+            Allow {
+                action: Action::Subprocess { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn network_deny_config_denies_curl_and_wget() {
+        let config = Config {
+            network: NetworkPolicy::Deny,
+            ..Config::default()
+        };
+        assert!(matches!(
+            verdict_with_config("curl https://example.com", &Session::new(), &config),
+            Deny { .. }
+        ));
+        assert!(matches!(
+            verdict_with_config("wget https://example.com", &Session::new(), &config),
+            Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn overwrite_allow_config_skips_the_prompt() {
+        let config = Config {
+            overwrite: Verb::Allow,
+            ..Config::default()
+        };
+        assert!(matches!(
+            verdict_with_config(
+                "curl -o /etc/hostname https://example.com/x",
+                &Session::new(),
+                &config
+            ),
+            Allow {
+                action: Action::Fetch { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn overwrite_deny_config_refuses_outright() {
+        let config = Config {
+            overwrite: Verb::Deny,
+            ..Config::default()
+        };
+        assert!(matches!(
+            verdict_with_config(
+                "curl -o /etc/hostname https://example.com/x",
+                &Session::new(),
+                &config
+            ),
+            Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn run_created_policy_governs_executing_a_downloaded_path() {
+        let mut session = Session::new();
+        session.record_created("/tmp/iish-nonexistent-stage2");
+        let config = Config {
+            run_created: Verb::Allow,
+            ..Config::default()
+        };
+        assert!(matches!(
+            verdict_with_config(
+                "/tmp/iish-nonexistent-stage2/install.sh --now",
+                &session,
+                &config
+            ),
+            Allow {
+                action: Action::Subprocess { .. },
+                ..
+            }
+        ));
     }
 
     #[test]

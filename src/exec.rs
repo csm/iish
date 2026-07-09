@@ -33,6 +33,12 @@ pub enum Action {
     Chmod { mode: Mode, paths: Vec<PathBuf> },
     /// `curl` / `wget`: an HTTP(S) GET performed in-process.
     Fetch { url: String, output: FetchOutput },
+    /// A command iish has no native implementation for, compiled by
+    /// the "subprocess" policy tier (milestone 5, see policy.rs): the
+    /// literal, already-parsed argv, exec'd directly — never through a
+    /// shell, so no word splitting, globbing, or expansion happens
+    /// that the parser didn't already vet.
+    Subprocess { name: String, args: Vec<String> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +80,7 @@ pub fn execute(action: &Action, session: &mut Session) -> Result<(), String> {
             .try_for_each(|path| remove(path, *recursive, *force, session)),
         Action::Chmod { mode, paths } => paths.iter().try_for_each(|path| chmod(path, *mode)),
         Action::Fetch { url, output } => fetch(url, output, session),
+        Action::Subprocess { name, args } => run_subprocess(name, args),
     }
 }
 
@@ -194,6 +201,25 @@ fn fetch(url: &str, output: &FetchOutput, session: &mut Session) -> Result<(), S
     Ok(())
 }
 
+/// Exec `name` with `args` directly (no shell in between: `Command`
+/// does its own fork/exec, it does not consult `$SHELL`), inheriting
+/// this process's stdio so the child can prompt or stream output.
+fn run_subprocess(name: &str, args: &[String]) -> Result<(), String> {
+    let status = std::process::Command::new(name)
+        .args(args)
+        .status()
+        .map_err(|e| format!("{name}: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        let how = status
+            .code()
+            .map(|code| format!("exit code {code}"))
+            .unwrap_or_else(|| "a signal".to_string());
+        Err(format!("{name}: failed ({how})"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,5 +330,49 @@ mod tests {
             0o755
         );
         fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn subprocess_runs_the_literal_argv() {
+        let base = scratch("subprocess");
+        let mut session = Session::new();
+        execute(
+            &Action::Subprocess {
+                name: "mkdir".to_string(),
+                args: vec![base.to_str().unwrap().to_string()],
+            },
+            &mut session,
+        )
+        .unwrap();
+        assert!(base.is_dir());
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn subprocess_reports_a_nonzero_exit() {
+        let mut session = Session::new();
+        let err = execute(
+            &Action::Subprocess {
+                name: "false".to_string(),
+                args: vec![],
+            },
+            &mut session,
+        )
+        .unwrap_err();
+        assert!(err.contains("false"), "{err}");
+    }
+
+    #[test]
+    fn subprocess_reports_a_missing_binary() {
+        let mut session = Session::new();
+        let err = execute(
+            &Action::Subprocess {
+                name: "iish-definitely-not-a-real-binary".to_string(),
+                args: vec![],
+            },
+            &mut session,
+        )
+        .unwrap_err();
+        assert!(err.contains("iish-definitely-not-a-real-binary"), "{err}");
     }
 }
