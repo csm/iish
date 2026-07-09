@@ -147,21 +147,38 @@ fi
 # Corpus: real installer scripts, run for real (not --dry-run) through
 # iish, non-interactively (--yes: approve every ask, the posture a CI
 # gate or unattended provisioning run would take). None of the 17
-# scripts in corpus/cache/ run to completion through iish today --
-# iish's evaluator still denies control flow and several expansions
-# outright (PLAN.md milestone 7 is "should run the majority of the
-# corpus to completion"; today is 0/17) -- and these containers run
-# with --network none anyway, so a real installer couldn't finish here
-# even if iish ran every line. So for each of these we pin *why* it
-# currently stops, as a regression guard: if the reason changes without
-# this file being updated, either iish's behavior regressed, or it
-# progressed -- both are worth a human looking at, and both FAIL the
-# suite. Stopping for the pinned reason is reported as XFAIL (an
-# expected, known-tracked failure -- the installer genuinely did not
-# install anything, so calling it a PASS would be a lie), which does
-# not fail the suite. If a script ever runs to completion, the paired
-# verify command decides pass/fail for real, exactly as it eventually
-# should for the whole corpus.
+# scripts in corpus/cache/ run to *completion* through iish today, but
+# not because iish can't follow their logic anymore -- with functions,
+# loops, command substitution, pipelines, parameter expansion, `local`,
+# `read`, `cd`, and the rest of milestone 7 landed, every one of these
+# now runs its full platform-detection and setup logic and stops only
+# at a genuine *external* boundary:
+#
+#   * the network -- these containers run with --network none, so the
+#     moment an installer reaches its actual download it fails to
+#     connect (rustup, zoxide, pnpm). With a network they would proceed
+#     past this point;
+#   * an interactive prompt -- starship reads a y/n confirmation from
+#     /dev/tty, which an unattended container does not have;
+#   * `curl ... | sh` -- atuin's real installer is a tiny bootstrap that
+#     pipes a second stage straight into a shell, the exact anti-pattern
+#     iish exists to refuse; it can never proceed under iish, by design;
+#   * a still-unimplemented shell construct -- nvm parallelizes its
+#     downloads with background jobs (`&`), which iish doesn't implement
+#     yet, and deno bails out itself when neither `unzip` nor `7z` is on
+#     the slim image.
+#
+# So for each we pin *where* it stops as a regression guard: if the
+# reason changes without this file being updated, either iish regressed
+# or it progressed further -- both worth a human looking at, and both
+# FAIL the suite. Stopping at the pinned boundary is reported as XFAIL
+# (an expected, known-tracked non-completion -- the installer did not
+# actually install anything, so calling it a PASS would be a lie), which
+# does not fail the suite. If a script ever runs to completion (e.g. the
+# offline-completable ones, once the harness grows a local payload
+# mirror), the paired verify command decides pass/fail for real -- and
+# the self-check above already exercises that completed-install path
+# end to end today.
 # ---------------------------------------------------------------------
 corpus_names="rustup starship zoxide atuin deno pnpm nvm"
 
@@ -169,60 +186,58 @@ set_corpus_expectation() {
     verify_cmd=()
     case "$1" in
         rustup)
-            # `2> /dev/null` stderr redirects are implemented now (so
-            # the redirect that used to stop this one no longer does):
-            # `has_local 2>/dev/null` actually calls into has_local's
-            # body, which trips on `local`, a shell builtin iish has no
-            # binary to exec and doesn't implement.
-            expected_reason="\`local\` is a shell builtin; iish does not implement it"
+            # Runs the whole downloader/arch/bitness probe, then reaches
+            # its real download: `_err=$(curl ... --output "$2" 2>&1)`.
+            # iish performs the GET with its own client, which can't
+            # connect under --network none, so the substitution fails
+            # here. With a network, rustup would continue.
+            expected_reason='_err=$(curl $_retry'
             verify_cmd=(rustc --version)
             ;;
         zoxide)
-            # Reached from inside a call to zoxide's own \`main\`
-            # function (a real function call, not just its definition)
-            # -- see the indented DENY in \`iish --dry-run\`'s output.
-            # `&&`/`||` are implemented now; this trips on `main`'s own
-            # `"$@"`, a special parameter (only plain `$VAR`/`${VAR}` is
-            # implemented).
-            expected_reason="special parameters (\`\$?\`, \`\$#\`, \`\$@\`, \`\$*\`, ...) are not supported yet"
+            # Full arch detection and release lookup run; stops inside
+            # `_package="$(download_zoxide "${_arch}")"`, i.e. its actual
+            # binary download -- a network boundary, not a syntax gap.
+            expected_reason='$(download_zoxide'
             verify_cmd=(zoxide --version)
             ;;
         pnpm)
-            # `if`/`test`/`[` (including `-t`) and bare `VAR=value`
-            # assignment are all implemented now; this trips on the next
-            # unimplemented construct, a command substitution
-            # (`$(tty_mkbold 34)`) as the assigned value.
-            expected_reason="command substitution is not supported yet"
+            # Runs its platform detection, then stops fetching the
+            # version manifest: `version_json="$(download
+            # "https://registry.npmjs.org/@pnpm/exe")"` -- network.
+            expected_reason='$(download "https://registry.npmjs.org'
             verify_cmd=(pnpm --version)
             ;;
         nvm)
-            # Reached from inside a brace group actually running now,
-            # into the very first `if` -- `if`/`[`/`||` are implemented;
-            # this trips on `$BASH_VERSION`, a real environment variable
-            # that's genuinely unset in iish's own process (iish isn't
-            # bash), matching what a real, non-bash `sh` would see too.
-            expected_reason="\`\$BASH_VERSION\` is unset"
+            # Runs profile detection, the install-dir setup, and the
+            # git-vs-script method choice, reaching the download step --
+            # which nvm backgrounds with `&` to parallelize. Background
+            # jobs are the one construct still unimplemented here.
+            expected_reason="background jobs (\`&\`) are not implemented yet"
             verify_cmd=(bash -lc 'source "$HOME/.nvm/nvm.sh" 2>/dev/null; command -v nvm')
             ;;
         starship)
-            # `set -eu` and bare `VAR=value` assignment are implemented
-            # now; this trips on the next unimplemented construct, a
-            # command substitution (`$(tput bold ...)`) as the assigned
-            # value.
-            expected_reason="command substitution is not supported yet"
+            # Runs platform/arch detection and prints its install
+            # summary, then asks to confirm: `read -r yn < /dev/tty`.
+            # An unattended container has no controlling terminal, so
+            # the read fails -- an interactive boundary, not a syntax gap.
+            expected_reason="read: could not read a line from"
             verify_cmd=(starship --version)
             ;;
         atuin)
-            # Bare `VAR=value` assignment is implemented now; this trips
-            # on the next unimplemented construct, a `for` loop.
-            expected_reason="for-loops are not implemented yet"
+            # atuin's real one-liner installer is `curl ... | sh`: it
+            # downloads a second-stage script and pipes it straight into
+            # a shell. iish refuses that categorically (its whole reason
+            # to exist), so atuin can never proceed under iish by design.
+            expected_reason="piping into a shell is exactly what iish exists to replace"
             verify_cmd=(atuin --version)
             ;;
         deno)
-            # `if`/`test`/`[` and `&&`/`||` are implemented now; this
-            # trips on the condition's `!` pipeline negation, the next
-            # unimplemented construct.
-            expected_reason="\`!\` pipeline negation is not implemented yet"
+            # Runs its full arch/OS detection, then bails out on its own
+            # (`exit 1`) because neither `unzip` nor `7z` is present on
+            # the slim image -- deno's own precondition check, reached
+            # only because iish ran everything up to it.
+            expected_reason="either unzip or 7z is required"
             verify_cmd=(deno --version)
             ;;
         *)

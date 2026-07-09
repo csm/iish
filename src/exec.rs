@@ -7,6 +7,11 @@
 //! it, and fetches are performed by iish's own GET-only HTTP client
 //! rather than a real curl/wget binary. Executing an action never
 //! re-interprets shell syntax.
+//!
+//! Every entry point takes an [`Out`]: where the *script's* stdout goes.
+//! Normally that's iish's own stdout, but inside a `$(command)`
+//! substitution the runner captures it into a buffer instead — that
+//! buffer becomes the substitution's value.
 
 use crate::parser::ast;
 use crate::state::Session;
@@ -15,6 +20,76 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+/// Where the script's stdout is going: through to iish's own stdout, or
+/// captured into a buffer (the value of a `$(command)` substitution).
+/// The script's stderr is never captured — bash substitutions don't
+/// capture stderr either (short of `2>&1`, handled per-command).
+pub struct Out<'a> {
+    capture: Option<&'a mut Vec<u8>>,
+}
+
+impl<'a> Out<'a> {
+    /// Script stdout passes straight through to iish's stdout.
+    pub fn inherit() -> Out<'static> {
+        Out { capture: None }
+    }
+
+    /// Script stdout accumulates in `buf` (command substitution).
+    pub fn capture(buf: &'a mut Vec<u8>) -> Out<'a> {
+        Out { capture: Some(buf) }
+    }
+
+    pub fn is_capturing(&self) -> bool {
+        self.capture.is_some()
+    }
+}
+
+impl io::Write for Out<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match &mut self.capture {
+            Some(vec) => vec.write(buf),
+            None => io::stdout().write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match &mut self.capture {
+            Some(vec) => vec.flush(),
+            None => io::stdout().flush(),
+        }
+    }
+}
+
+/// Where a command's stdout was redirected by the statement itself:
+/// nowhere special, `> /dev/null`, or `>&2`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StdoutDest {
+    #[default]
+    Inherit,
+    Null,
+    Stderr,
+}
+
+/// Where a command's stderr was redirected: nowhere special,
+/// `2> /dev/null`, or `2>&1` (following wherever stdout goes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StderrDest {
+    #[default]
+    Inherit,
+    Null,
+    Stdout,
+}
+
+/// How `command -v NAME` / `type NAME` report what they found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LookupStyle {
+    /// `command -v`: print the path (or bare name for a function or
+    /// builtin), nothing when not found.
+    CommandV,
+    /// `type`: print a `NAME is ...` sentence, nothing when not found.
+    Type,
+}
 
 /// A vetted operation, compiled by the policy from a statement it
 /// allowed (or will allow once the user confirms).
@@ -27,8 +102,9 @@ use std::time::Duration;
 pub enum Action {
     /// `true`, `:`, `mkdir -p` on directories that all exist, …
     Noop,
-    /// `echo` / `printf`: write `text` to stdout exactly as given.
-    Print { text: String },
+    /// `echo` / `printf`: write `text` exactly as given, to wherever
+    /// `dest` says (`>&2` sends it to stderr, `> /dev/null` drops it).
+    Print { text: String, dest: StdoutDest },
     /// `mkdir`: every path in `paths` was verified not to exist yet.
     MkDir { paths: Vec<PathBuf>, parents: bool },
     /// `rm` restricted to ledger-owned paths.
@@ -55,13 +131,13 @@ pub enum Action {
     /// the "subprocess" policy tier (milestone 5, see policy.rs): the
     /// literal, already-parsed argv, exec'd directly — never through a
     /// shell, so no word splitting, globbing, or expansion happens
-    /// that the parser didn't already vet. `discard_stderr` is a
-    /// `2> /dev/null` on the command: the child's stderr goes to the
-    /// null device instead of being inherited.
+    /// that the parser didn't already vet. `stdout`/`stderr` carry the
+    /// statement's own vetted redirects (`> /dev/null`, `2>&1`, ...).
     Subprocess {
         name: String,
         args: Vec<String>,
-        discard_stderr: bool,
+        stdout: StdoutDest,
+        stderr: StderrDest,
     },
     /// `name() { ... }`: register `name` so a later call to it runs
     /// `body` (a brace-group's statement list) — see policy.rs's
@@ -89,6 +165,37 @@ pub enum Action {
     /// session's variable table for a later `$VAR` expansion to read
     /// back. No filesystem or process side effects.
     Assign { assignments: Vec<(String, String)> },
+    /// `local VAR=value [VAR2 ...]`: declare each name in the innermost
+    /// function call's scope (state.rs frames). Errs outside a function.
+    DeclareLocal { assignments: Vec<(String, String)> },
+    /// `shift [n]`: drop the first `n` positional parameters of the
+    /// innermost function call.
+    Shift { n: usize },
+    /// `unset NAME...` / `unset -f NAME...`: remove variables or
+    /// function definitions from the session.
+    Unset { names: Vec<String>, functions: bool },
+    /// `set -u` / `set +u`: toggle refusing unset-variable expansion.
+    SetNounset { on: bool },
+    /// `true < /dev/tty` (or `< /dev/null`): succeed exactly when the
+    /// device opens for reading — the shell idiom for "is there a
+    /// controlling terminal?". Opens and immediately closes; reads
+    /// nothing.
+    ProbeRead { path: PathBuf },
+    /// `cd dir`: change iish's own working directory.
+    ChangeDir { path: PathBuf },
+    /// `read [-r] NAME < /dev/tty`: read one line from the named device
+    /// into a shell variable. Fails (like bash's `read`) when the
+    /// device can't be opened or is at EOF.
+    ReadLine { name: String, path: PathBuf },
+    /// `command -v NAME` / `type NAME`: resolve what NAME would run —
+    /// a function defined this run, an iish builtin, or a `$PATH`
+    /// binary — printing per `style` and succeeding only if found. Pure
+    /// lookup; runs nothing.
+    CommandLookup {
+        name: String,
+        style: LookupStyle,
+        dest: StdoutDest,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,16 +215,39 @@ pub enum FetchOutput {
     File(PathBuf),
 }
 
-pub fn execute(action: &Action, session: &mut Session) -> Result<(), String> {
+/// Command names iish itself implements (natively or as builtins), for
+/// `command -v`/`type` resolution: these would "run" under iish even
+/// with no such binary on `$PATH`.
+pub const NATIVE_COMMAND_NAMES: &[&str] = &[
+    "true",
+    ":",
+    "echo",
+    "printf",
+    "mkdir",
+    "rm",
+    "chmod",
+    "cp",
+    "curl",
+    "wget",
+    "sha256sum",
+    "set",
+    "test",
+    "[",
+    "local",
+    "command",
+    "type",
+    "unset",
+    "shift",
+    "return",
+    "exit",
+    "break",
+    "continue",
+];
+
+pub fn execute(action: &Action, session: &mut Session, out: &mut Out) -> Result<(), String> {
     match action {
         Action::Noop => Ok(()),
-        Action::Print { text } => {
-            let mut stdout = io::stdout();
-            stdout
-                .write_all(text.as_bytes())
-                .and_then(|()| stdout.flush())
-                .map_err(|e| format!("writing to stdout: {e}"))
-        }
+        Action::Print { text, dest } => print_text(text, *dest, out),
         Action::MkDir { paths, parents } => paths
             .iter()
             .try_for_each(|path| mkdir(path, *parents, session)),
@@ -129,15 +259,16 @@ pub fn execute(action: &Action, session: &mut Session) -> Result<(), String> {
             .iter()
             .try_for_each(|path| remove(path, *recursive, *force, session)),
         Action::Chmod { mode, paths } => paths.iter().try_for_each(|path| chmod(path, *mode)),
-        Action::Fetch { url, output } => fetch(url, output, session),
+        Action::Fetch { url, output } => fetch(url, output, session, out),
         Action::AppendFile { path, text } => append_file(path, text, session),
-        Action::Sha256Sum { paths } => paths.iter().try_for_each(|path| print_sha256(path)),
-        Action::Sha256Check { entries } => verify_sha256(entries),
+        Action::Sha256Sum { paths } => paths.iter().try_for_each(|path| print_sha256(path, out)),
+        Action::Sha256Check { entries } => verify_sha256(entries, out),
         Action::Subprocess {
             name,
             args,
-            discard_stderr,
-        } => run_subprocess(name, args, *discard_stderr),
+            stdout,
+            stderr,
+        } => run_subprocess(name, args, *stdout, *stderr, out),
         Action::DefineFunction { name, body } => {
             session.define_function(name.clone(), body.clone());
             Ok(())
@@ -162,25 +293,125 @@ pub fn execute(action: &Action, session: &mut Session) -> Result<(), String> {
             }
             Ok(())
         }
+        Action::DeclareLocal { assignments } => {
+            for (name, value) in assignments {
+                session.declare_local(name.clone(), value.clone())?;
+            }
+            Ok(())
+        }
+        Action::Shift { n } => session.shift_positional(*n),
+        Action::SetNounset { on } => {
+            session.set_nounset(*on);
+            Ok(())
+        }
+        Action::ProbeRead { path } => fs::File::open(path)
+            .map(|_| ())
+            .map_err(|e| format!("cannot open `{}` for reading: {e}", path.display())),
+        Action::ChangeDir { path } => {
+            std::env::set_current_dir(path).map_err(|e| format!("cd: `{}`: {e}", path.display()))
+        }
+        Action::ReadLine { name, path } => {
+            if read_line_into(name, path, session)? {
+                Ok(())
+            } else {
+                Err(format!(
+                    "read: could not read a line from `{}`",
+                    path.display()
+                ))
+            }
+        }
+        Action::Unset { names, functions } => {
+            for name in names {
+                if *functions {
+                    session.undefine_function(name);
+                } else {
+                    session.unset_variable(name);
+                }
+            }
+            Ok(())
+        }
+        Action::CommandLookup { name, style, dest } => {
+            if command_lookup(name, *style, *dest, session, out)? {
+                Ok(())
+            } else {
+                Err(format!("{name}: not found"))
+            }
+        }
     }
 }
 
 /// Like [`execute`], but reports an action's exit status as a `bool`
 /// instead of turning "ran fine but said no" into an `Err`. Every action
-/// except `Subprocess` and `Test` either fully succeeds or hits a real,
-/// unrecoverable error, so those still propagate as `Err` here too; only
-/// a subprocess's exit code and a test expression's result are the kind
-/// of "failure" bash's `if`/`while`/`until` conditions are specifically
+/// except `Subprocess`, `Test`, and `CommandLookup` either fully
+/// succeeds or hits a real, unrecoverable error, so those still
+/// propagate as `Err` here too; only a subprocess's exit code, a test
+/// expression's result, and a lookup's found/not-found are the kind of
+/// "failure" bash's `if`/`while`/`until` conditions are specifically
 /// exempted from treating as fatal (see main.rs's `run_if`/`run_condition`).
-pub fn execute_returning_status(action: &Action, session: &mut Session) -> Result<bool, String> {
+pub fn execute_returning_status(
+    action: &Action,
+    session: &mut Session,
+    out: &mut Out,
+) -> Result<bool, String> {
     match action {
         Action::Test { result } => Ok(*result),
         Action::Subprocess {
             name,
             args,
-            discard_stderr,
-        } => run_subprocess_status(name, args, *discard_stderr),
-        other => execute(other, session).map(|()| true),
+            stdout,
+            stderr,
+        } => run_subprocess_status(name, args, *stdout, *stderr, out),
+        Action::CommandLookup { name, style, dest } => {
+            command_lookup(name, *style, *dest, session, out)
+        }
+        Action::ProbeRead { path } => Ok(fs::File::open(path).is_ok()),
+        Action::ReadLine { name, path } => read_line_into(name, path, session),
+        other => execute(other, session, out).map(|()| true),
+    }
+}
+
+/// Read one line from `path` into the shell variable `name`. `Ok(false)`
+/// — bash `read`'s non-zero status — when the device can't be opened or
+/// gives EOF before any bytes.
+fn read_line_into(name: &str, path: &Path, session: &mut Session) -> Result<bool, String> {
+    use std::io::BufRead;
+    let Ok(file) = fs::File::open(path) else {
+        return Ok(false);
+    };
+    let mut line = String::new();
+    let bytes = std::io::BufReader::new(file)
+        .read_line(&mut line)
+        .map_err(|e| format!("read: `{}`: {e}", path.display()))?;
+    if bytes == 0 {
+        return Ok(false);
+    }
+    if line.ends_with('\n') {
+        line.pop();
+    }
+    session.set_variable(name, line);
+    Ok(true)
+}
+
+/// Run one already-vetted stage of a multi-stage pipeline: like
+/// [`execute_returning_status`], with the previous stage's captured
+/// output as this stage's stdin. Only a subprocess actually consumes
+/// stdin — no native action reads it — so for everything else the
+/// carried bytes are simply dropped, as they would be by a
+/// non-stdin-reading program.
+pub fn execute_piped(
+    action: &Action,
+    session: &mut Session,
+    stdin: Option<Vec<u8>>,
+    out: &mut Out,
+) -> Result<bool, String> {
+    match action {
+        Action::Subprocess {
+            name,
+            args,
+            stdout,
+            stderr,
+        } => Ok(spawn(name, args, *stdout, *stderr, out, stdin)?.success()),
+        other => execute_returning_status(other, session, out),
     }
 }
 
@@ -212,8 +443,86 @@ pub fn record_would_create(action: &Action, session: &mut Session) {
                 session.set_variable(name.clone(), value.clone());
             }
         }
+        Action::SetNounset { on } => session.set_nounset(*on),
         _ => {}
     }
+}
+
+fn print_text(text: &str, dest: StdoutDest, out: &mut Out) -> Result<(), String> {
+    match dest {
+        StdoutDest::Null => Ok(()),
+        StdoutDest::Stderr => {
+            let mut stderr = io::stderr();
+            stderr
+                .write_all(text.as_bytes())
+                .and_then(|()| stderr.flush())
+                .map_err(|e| format!("writing to stderr: {e}"))
+        }
+        StdoutDest::Inherit => out
+            .write_all(text.as_bytes())
+            .and_then(|()| out.flush())
+            .map_err(|e| format!("writing to stdout: {e}")),
+    }
+}
+
+/// `command -v NAME` / `type NAME`: what would NAME run? A function
+/// defined earlier this run wins (as it does in iish's own dispatch),
+/// then a native iish command name, then a `$PATH` search for an
+/// executable file. Returns whether NAME resolved at all.
+fn command_lookup(
+    name: &str,
+    style: LookupStyle,
+    dest: StdoutDest,
+    session: &Session,
+    out: &mut Out,
+) -> Result<bool, String> {
+    let found: Option<String> = if session.lookup_function(name).is_some() {
+        Some(match style {
+            LookupStyle::CommandV => format!("{name}\n"),
+            LookupStyle::Type => format!("{name} is a function\n"),
+        })
+    } else if NATIVE_COMMAND_NAMES.contains(&name) {
+        Some(match style {
+            LookupStyle::CommandV => format!("{name}\n"),
+            LookupStyle::Type => format!("{name} is a shell builtin\n"),
+        })
+    } else {
+        path_search(name).map(|path| match style {
+            LookupStyle::CommandV => format!("{}\n", path.display()),
+            LookupStyle::Type => format!("{name} is {}\n", path.display()),
+        })
+    };
+    match found {
+        Some(text) => {
+            print_text(&text, dest, out)?;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
+/// Find `name` as an executable regular file on `$PATH`, like a shell's
+/// command lookup would. A name containing `/` is checked as a path
+/// directly, no search.
+fn path_search(name: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let is_executable_file = |path: &Path| {
+        fs::metadata(path)
+            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    };
+    if name.contains('/') {
+        let path = PathBuf::from(name);
+        return is_executable_file(&path).then_some(path);
+    }
+    let path_var = std::env::var("PATH").ok()?;
+    for dir in path_var.split(':').filter(|d| !d.is_empty()) {
+        let candidate = Path::new(dir).join(name);
+        if is_executable_file(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 /// Refuse to operate through a symlink planted between the filesystem
@@ -414,7 +723,12 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<(), String> {
 /// plaintext `http://`. Installers' own `--connect-timeout`/`--max-time`
 /// flags are accepted by the policy layer but not consulted here: iish's
 /// client, not the script, decides these.
-fn fetch(url: &str, output: &FetchOutput, session: &mut Session) -> Result<(), String> {
+fn fetch(
+    url: &str,
+    output: &FetchOutput,
+    session: &mut Session,
+    out: &mut Out,
+) -> Result<(), String> {
     let agent = ureq::AgentBuilder::new()
         .try_proxy_from_env(true)
         .https_only(url.starts_with("https://"))
@@ -429,9 +743,8 @@ fn fetch(url: &str, output: &FetchOutput, session: &mut Session) -> Result<(), S
     let mut body = response.into_reader();
     match output {
         FetchOutput::Stdout => {
-            let mut stdout = io::stdout();
-            io::copy(&mut body, &mut stdout)
-                .and_then(|_| stdout.flush())
+            io::copy(&mut body, out)
+                .and_then(|_| out.flush())
                 .map_err(|e| format!("GET {url}: writing to stdout: {e}"))?;
         }
         FetchOutput::File(path) => {
@@ -483,15 +796,15 @@ fn sha256_hex(path: &Path) -> Result<String, String> {
         .collect())
 }
 
-fn print_sha256(path: &Path) -> Result<(), String> {
+fn print_sha256(path: &Path, out: &mut Out) -> Result<(), String> {
     let hex = sha256_hex(path)?;
-    writeln!(io::stdout(), "{hex}  {}", path.display())
+    writeln!(out, "{hex}  {}", path.display())
         .map_err(|e| format!("sha256sum: writing to stdout: {e}"))
 }
 
 /// `sha256sum -c`: print `<path>: OK`/`FAILED` per entry, like the real
 /// tool, and fail the statement (aborting the run) if anything mismatched.
-fn verify_sha256(entries: &[(String, PathBuf)]) -> Result<(), String> {
+fn verify_sha256(entries: &[(String, PathBuf)], out: &mut Out) -> Result<(), String> {
     let mut failed = 0usize;
     for (expected, path) in entries {
         let status = match sha256_hex(path) {
@@ -505,7 +818,7 @@ fn verify_sha256(entries: &[(String, PathBuf)]) -> Result<(), String> {
                 "FAILED open or read"
             }
         };
-        writeln!(io::stdout(), "{}: {status}", path.display())
+        writeln!(out, "{}: {status}", path.display())
             .map_err(|e| format!("sha256sum: writing to stdout: {e}"))?;
     }
     if failed > 0 {
@@ -518,12 +831,17 @@ fn verify_sha256(entries: &[(String, PathBuf)]) -> Result<(), String> {
 }
 
 /// Exec `name` with `args` directly (no shell in between: `Command`
-/// does its own fork/exec, it does not consult `$SHELL`), inheriting
-/// this process's stdio so the child can prompt or stream output —
-/// except stderr when the script's own `2> /dev/null` asked for it to
-/// be discarded.
-fn run_subprocess(name: &str, args: &[String], discard_stderr: bool) -> Result<(), String> {
-    let status = spawn(name, args, discard_stderr)?;
+/// does its own fork/exec, it does not consult `$SHELL`), routing the
+/// child's stdout and stderr per the statement's vetted redirects and
+/// the caller's capture mode.
+fn run_subprocess(
+    name: &str,
+    args: &[String],
+    stdout: StdoutDest,
+    stderr: StderrDest,
+    out: &mut Out,
+) -> Result<(), String> {
+    let status = spawn(name, args, stdout, stderr, out, None)?;
     if status.success() {
         Ok(())
     } else {
@@ -541,28 +859,125 @@ fn run_subprocess(name: &str, args: &[String], discard_stderr: bool) -> Result<(
 fn run_subprocess_status(
     name: &str,
     args: &[String],
-    discard_stderr: bool,
+    stdout: StdoutDest,
+    stderr: StderrDest,
+    out: &mut Out,
 ) -> Result<bool, String> {
-    Ok(spawn(name, args, discard_stderr)?.success())
+    Ok(spawn(name, args, stdout, stderr, out, None)?.success())
+}
+
+/// Feed `bytes` to the child's piped stdin from a helper thread, so a
+/// child that fills its output pipe before draining its input can't
+/// deadlock against us. Write errors (the child closed stdin early —
+/// `head`, `grep -q`, ...) are exactly the EPIPE a shell pipeline
+/// would shrug off.
+fn feed_stdin(handle: Option<std::process::ChildStdin>, bytes: Vec<u8>) {
+    if let Some(mut handle) = handle {
+        std::thread::spawn(move || {
+            let _ = handle.write_all(&bytes);
+        });
+    }
 }
 
 fn spawn(
     name: &str,
     args: &[String],
-    discard_stderr: bool,
+    stdout: StdoutDest,
+    mut stderr: StderrDest,
+    out: &mut Out,
+    stdin: Option<Vec<u8>>,
 ) -> Result<std::process::ExitStatus, String> {
+    // `2>&1` follows wherever stdout points; resolve the shapes that
+    // need no pipe up front.
+    if stderr == StderrDest::Stdout && stdout == StdoutDest::Null {
+        stderr = StderrDest::Null;
+    }
+    if stderr == StderrDest::Stdout && stdout == StdoutDest::Inherit && !out.is_capturing() {
+        // Approximation: the child's stderr keeps its own inherited
+        // stream rather than being dup'd onto iish's stdout — the two
+        // only differ if iish's own stdout/stderr point different
+        // places, and the child's output still reaches the user.
+        stderr = StderrDest::Inherit;
+    }
+
     let mut command = std::process::Command::new(name);
     command.args(args);
-    if discard_stderr {
-        command.stderr(std::process::Stdio::null());
+    if stdin.is_some() {
+        command.stdin(std::process::Stdio::piped());
     }
-    command.status().map_err(|e| format!("{name}: {e}"))
+
+    // Anything that must be rerouted after the fact (captured stdout, a
+    // `>&2`, a captured `2>&1`) is piped; `wait_with_output` reads the
+    // pipes concurrently, so a chatty child can't deadlock against us.
+    let pipe_stdout = matches!(stdout, StdoutDest::Stderr)
+        || (stdout == StdoutDest::Inherit && out.is_capturing());
+    let pipe_stderr = stderr == StderrDest::Stdout;
+
+    if !pipe_stdout && !pipe_stderr {
+        match stdout {
+            StdoutDest::Null => {
+                command.stdout(std::process::Stdio::null());
+            }
+            StdoutDest::Inherit | StdoutDest::Stderr => {}
+        }
+        if stderr == StderrDest::Null {
+            command.stderr(std::process::Stdio::null());
+        }
+        let mut child = command.spawn().map_err(|e| format!("{name}: {e}"))?;
+        if let Some(bytes) = stdin {
+            feed_stdin(child.stdin.take(), bytes);
+        }
+        return child.wait().map_err(|e| format!("{name}: {e}"));
+    }
+
+    command.stdout(match stdout {
+        StdoutDest::Null => std::process::Stdio::null(),
+        _ if pipe_stdout => std::process::Stdio::piped(),
+        StdoutDest::Inherit | StdoutDest::Stderr => std::process::Stdio::inherit(),
+    });
+    command.stderr(match stderr {
+        StderrDest::Null => std::process::Stdio::null(),
+        StderrDest::Inherit => std::process::Stdio::inherit(),
+        StderrDest::Stdout => std::process::Stdio::piped(),
+    });
+    let mut child = command.spawn().map_err(|e| format!("{name}: {e}"))?;
+    if let Some(bytes) = stdin {
+        feed_stdin(child.stdin.take(), bytes);
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("{name}: {e}"))?;
+
+    let mut route_to_stdout = |bytes: &[u8]| -> Result<(), String> {
+        out.write_all(bytes)
+            .and_then(|()| out.flush())
+            .map_err(|e| format!("{name}: writing output: {e}"))
+    };
+    if pipe_stdout {
+        match stdout {
+            StdoutDest::Stderr => {
+                io::stderr()
+                    .write_all(&output.stdout)
+                    .map_err(|e| format!("{name}: writing output: {e}"))?;
+            }
+            _ => route_to_stdout(&output.stdout)?,
+        }
+    }
+    if pipe_stderr {
+        // `2>&1`: the child's stderr joins its stdout's destination.
+        route_to_stdout(&output.stderr)?;
+    }
+    Ok(output.status)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    fn run(action: &Action, session: &mut Session) -> Result<(), String> {
+        execute(action, session, &mut Out::inherit())
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("iish-exec-{name}-{}", std::process::id()));
@@ -575,7 +990,7 @@ mod tests {
         let base = scratch("mkdir");
         let deep = base.join("a/b/c");
         let mut session = Session::new();
-        execute(
+        run(
             &Action::MkDir {
                 paths: vec![deep.clone()],
                 parents: true,
@@ -596,7 +1011,7 @@ mod tests {
         let base = scratch("rm-foreign");
         fs::create_dir_all(&base).unwrap();
         let mut session = Session::new();
-        let err = execute(
+        let err = run(
             &Action::Remove {
                 paths: vec![base.clone()],
                 recursive: true,
@@ -614,7 +1029,7 @@ mod tests {
     fn remove_deletes_owned_paths() {
         let base = scratch("rm-owned");
         let mut session = Session::new();
-        execute(
+        run(
             &Action::MkDir {
                 paths: vec![base.clone()],
                 parents: true,
@@ -622,7 +1037,7 @@ mod tests {
             &mut session,
         )
         .unwrap();
-        execute(
+        run(
             &Action::Remove {
                 paths: vec![base.clone()],
                 recursive: true,
@@ -643,7 +1058,7 @@ mod tests {
         let mut session = Session::new();
         session.record_created(&base);
 
-        execute(
+        run(
             &Action::Chmod {
                 mode: Mode::Octal(0o644),
                 paths: vec![file.clone()],
@@ -656,7 +1071,7 @@ mod tests {
             0o644
         );
 
-        execute(
+        run(
             &Action::Chmod {
                 mode: Mode::AddBits(0o111),
                 paths: vec![file.clone()],
@@ -675,11 +1090,12 @@ mod tests {
     fn subprocess_runs_the_literal_argv() {
         let base = scratch("subprocess");
         let mut session = Session::new();
-        execute(
+        run(
             &Action::Subprocess {
                 name: "mkdir".to_string(),
                 args: vec![base.to_str().unwrap().to_string()],
-                discard_stderr: false,
+                stdout: StdoutDest::Inherit,
+                stderr: StderrDest::Inherit,
             },
             &mut session,
         )
@@ -691,11 +1107,12 @@ mod tests {
     #[test]
     fn subprocess_reports_a_nonzero_exit() {
         let mut session = Session::new();
-        let err = execute(
+        let err = run(
             &Action::Subprocess {
                 name: "false".to_string(),
                 args: vec![],
-                discard_stderr: false,
+                stdout: StdoutDest::Inherit,
+                stderr: StderrDest::Inherit,
             },
             &mut session,
         )
@@ -706,16 +1123,122 @@ mod tests {
     #[test]
     fn subprocess_reports_a_missing_binary() {
         let mut session = Session::new();
-        let err = execute(
+        let err = run(
             &Action::Subprocess {
                 name: "iish-definitely-not-a-real-binary".to_string(),
                 args: vec![],
-                discard_stderr: false,
+                stdout: StdoutDest::Inherit,
+                stderr: StderrDest::Inherit,
             },
             &mut session,
         )
         .unwrap_err();
         assert!(err.contains("iish-definitely-not-a-real-binary"), "{err}");
+    }
+
+    #[test]
+    fn subprocess_stdout_is_captured() {
+        let mut session = Session::new();
+        let mut buf = Vec::new();
+        execute(
+            &Action::Subprocess {
+                name: "echo".to_string(),
+                args: vec!["captured".to_string()],
+                stdout: StdoutDest::Inherit,
+                stderr: StderrDest::Inherit,
+            },
+            &mut session,
+            &mut Out::capture(&mut buf),
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8_lossy(&buf), "captured\n");
+    }
+
+    #[test]
+    fn print_is_captured_and_null_discards() {
+        let mut session = Session::new();
+        let mut buf = Vec::new();
+        execute(
+            &Action::Print {
+                text: "hello\n".into(),
+                dest: StdoutDest::Inherit,
+            },
+            &mut session,
+            &mut Out::capture(&mut buf),
+        )
+        .unwrap();
+        execute(
+            &Action::Print {
+                text: "dropped\n".into(),
+                dest: StdoutDest::Null,
+            },
+            &mut session,
+            &mut Out::capture(&mut buf),
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8_lossy(&buf), "hello\n");
+    }
+
+    #[test]
+    fn command_lookup_finds_functions_builtins_and_binaries() {
+        let mut session = Session::new();
+        let program = crate::parser::parse("f() { true; }").unwrap();
+        let crate::parser::ast::Command::Function(def) =
+            &program.complete_commands[0].0[0].0.first.seq[0]
+        else {
+            panic!("expected function definition");
+        };
+        let crate::parser::ast::FunctionBody(
+            crate::parser::ast::CompoundCommand::BraceGroup(group),
+            _,
+        ) = &def.body
+        else {
+            panic!("expected brace group body");
+        };
+        session.define_function("myfunc", group.list.clone());
+
+        let mut buf = Vec::new();
+        assert!(command_lookup(
+            "myfunc",
+            LookupStyle::CommandV,
+            StdoutDest::Inherit,
+            &session,
+            &mut Out::capture(&mut buf)
+        )
+        .unwrap());
+        assert_eq!(String::from_utf8_lossy(&buf), "myfunc\n");
+
+        let mut buf = Vec::new();
+        assert!(command_lookup(
+            "echo",
+            LookupStyle::Type,
+            StdoutDest::Inherit,
+            &session,
+            &mut Out::capture(&mut buf)
+        )
+        .unwrap());
+        assert!(String::from_utf8_lossy(&buf).contains("shell builtin"));
+
+        // `sh` exists on every test system.
+        let mut buf = Vec::new();
+        assert!(command_lookup(
+            "sh",
+            LookupStyle::CommandV,
+            StdoutDest::Inherit,
+            &session,
+            &mut Out::capture(&mut buf)
+        )
+        .unwrap());
+        assert!(String::from_utf8_lossy(&buf).contains("/sh"));
+
+        assert!(!command_lookup(
+            "iish-definitely-not-a-real-binary",
+            LookupStyle::CommandV,
+            StdoutDest::Inherit,
+            &session,
+            &mut Out::inherit()
+        )
+        .unwrap());
     }
 
     // A subprocess (e.g. `ln -s`) can plant a symlink under a directory
@@ -733,7 +1256,7 @@ mod tests {
         let mut session = Session::new();
         session.record_created(&base);
 
-        let err = execute(
+        let err = run(
             &Action::MkDir {
                 paths: vec![base.join("escape").join("newdir")],
                 parents: true,
@@ -761,7 +1284,7 @@ mod tests {
         let mut session = Session::new();
         session.record_created(&base);
 
-        let err = execute(
+        let err = run(
             &Action::Remove {
                 paths: vec![base.join("escape").join("victim.txt")],
                 recursive: false,
@@ -790,7 +1313,7 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let mut session = Session::new();
 
-        let err = execute(
+        let err = run(
             &Action::Chmod {
                 mode: Mode::Octal(0o777),
                 paths: vec![link],
@@ -819,7 +1342,7 @@ mod tests {
         std::os::unix::fs::symlink(&outside, base.join("escape")).unwrap();
         let mut session = Session::new();
 
-        let err = execute(
+        let err = run(
             &Action::Chmod {
                 mode: Mode::Octal(0o777),
                 paths: vec![base.join("escape").join("target.txt")],
@@ -852,7 +1375,7 @@ mod tests {
         let dest = base.join("copied-tool");
         let mut session = Session::new();
 
-        execute(
+        run(
             &Action::Copy {
                 pairs: vec![(base.join("bin/tool"), dest.clone())],
                 recursive: false,
@@ -874,7 +1397,7 @@ mod tests {
         let dest = base.join("copied");
         let mut session = Session::new();
 
-        execute(
+        run(
             &Action::Copy {
                 pairs: vec![(base.join("link"), dest.clone())],
                 recursive: false,
@@ -900,7 +1423,7 @@ mod tests {
         std::os::unix::fs::symlink(&outside, base.join("escape")).unwrap();
         let mut session = Session::new();
 
-        let err = execute(
+        let err = run(
             &Action::Copy {
                 pairs: vec![(base.join("src"), base.join("escape").join("victim"))],
                 recursive: false,
@@ -928,7 +1451,7 @@ mod tests {
         let mut session = Session::new();
         session.record_created(&link);
 
-        let err = execute(&Action::Sha256Sum { paths: vec![link] }, &mut session).unwrap_err();
+        let err = run(&Action::Sha256Sum { paths: vec![link] }, &mut session).unwrap_err();
         assert!(err.contains("symlink"), "{err}");
         fs::remove_dir_all(&base).unwrap();
     }

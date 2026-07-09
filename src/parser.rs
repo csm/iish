@@ -1,4 +1,5 @@
-//! Bash parsing, delegated to brush-parser (see docs/parser-eval.md).
+//! Bash parsing, delegated to brush-parser (see docs/parser-eval.md),
+//! plus iish's word-expansion machinery.
 //!
 //! iish does not implement bash grammar itself. This module hands the
 //! script to brush-parser and returns its AST, or a top-level syntax
@@ -8,12 +9,66 @@
 //! same "if we didn't understand it, we don't run it" posture the old
 //! hand-rolled parser used to enforce directly, just moved one layer up
 //! now that parsing itself covers the full grammar.
+//!
+//! Word expansion happens here too, against an [`ExpandCtx`]: the live
+//! session (variables, call frames, `$?`) plus a [`Substituter`] that
+//! can run a `$(command)` and capture its output — the runner (main.rs)
+//! provides the real one, `--dry-run` and unit tests one that refuses.
 
-use std::collections::HashMap;
+use crate::state::Session;
 
 pub use brush_parser::ast;
 pub use brush_parser::word::WordPiece;
-use brush_parser::word::{Parameter, ParameterExpr};
+use brush_parser::word::{Parameter, ParameterExpr, ParameterTestType, SpecialParameter};
+
+/// Runs the command text inside a `$(...)`/backquote substitution and
+/// returns its captured stdout (before bash's trailing-newline
+/// stripping, which the caller here applies). The real implementation
+/// lives in main.rs, where the full runner — policy, prompts, native
+/// execution — is available to interpret the inner script; it may
+/// mutate `session` exactly like any other statements it runs.
+pub trait Substituter {
+    fn substitute(&mut self, session: &mut Session, command: &str) -> Result<String, String>;
+}
+
+/// A [`Substituter`] for contexts where no command may run: `--dry-run`
+/// (which executes nothing, so a substitution's output is unknowable)
+/// and unit tests. Every substitution fails with the given reason,
+/// which becomes the enclosing statement's deny reason.
+pub struct RefuseSubstituter(pub &'static str);
+
+impl Substituter for RefuseSubstituter {
+    fn substitute(&mut self, _session: &mut Session, _command: &str) -> Result<String, String> {
+        Err(self.0.to_string())
+    }
+}
+
+/// Everything word expansion may consult: the live session (variables,
+/// call frames, `$?`, the ledger) and a way to run `$(command)`
+/// substitutions. Mutable because a substitution really runs — it may
+/// assign variables, create files, or anything else its statements are
+/// allowed to do — and `${VAR:=default}` assigns too.
+pub struct ExpandCtx<'a> {
+    pub session: &'a mut Session,
+    pub subst: &'a mut dyn Substituter,
+}
+
+/// Shell-identity variables iish answers for even though its own
+/// process environment doesn't have them: scripts probe these to learn
+/// what shell is interpreting them. iish executes the bash dialect
+/// (brush-parser's grammar) with POSIX-style semantics, so it
+/// identifies as a bash in POSIX mode — the version string is
+/// deliberately shaped like bash's with an `iish` suffix, and
+/// `POSIXLY_CORRECT` answers as set (starship's "please use a POSIX
+/// shell" guard accepts exactly this pair). `ZSH_VERSION` is left
+/// genuinely unset: a `${ZSH_VERSION+x}` set-test must say "not zsh".
+fn shell_identity(name: &str) -> Option<&'static str> {
+    match name {
+        "BASH_VERSION" => Some("5.2.0(1)-iish"),
+        "POSIXLY_CORRECT" => Some("1"),
+        _ => None,
+    }
+}
 
 /// Parser options shared across script and word parsing.
 fn options() -> brush_parser::ParserOptions {
@@ -26,23 +81,95 @@ pub fn parse(script: &str) -> Result<ast::Program, String> {
     parser.parse_program().map_err(|e| e.to_string())
 }
 
-/// Render a shell [`ast::Word`] to a literal string, if it is one — i.e.
-/// contains no command substitution, tilde expansion, ANSI-C quoting, or
-/// unquoted globbing, and no parameter expansion beyond a plain
-/// `$VAR`/`${VAR}` reference (resolved against `vars` — this run's
-/// bare-assignment-tracked shell variables — falling back to the real
-/// process environment, same as `~` already falls back to `$HOME`).
-/// Those all require expansion machinery iish does not implement yet, so
-/// a word that needs any of them is rejected with a reason instead of
-/// being guessed at.
-pub fn literal_word(word: &ast::Word, vars: &HashMap<String, String>) -> Result<String, String> {
-    let pieces = brush_parser::word::parse(&word.value, &options())
-        .map_err(|e| format!("could not parse word `{}`: {e}", word.value))?;
+fn parse_word_pieces(
+    word_text: &str,
+) -> Result<Vec<brush_parser::word::WordPieceWithSource>, String> {
+    brush_parser::word::parse(word_text, &options())
+        .map_err(|e| format!("could not parse word `{word_text}`: {e}"))
+}
+
+/// Render a shell [`ast::Word`] to a single literal string. Anything the
+/// expansion machinery here doesn't cover — most parameter-expansion
+/// operators, array/most special parameters, ANSI-C quoting, unquoted
+/// globbing — is rejected with a reason instead of being guessed at.
+/// `$@`/`$*` in this scalar context join the positional parameters with
+/// single spaces (callers that care about argument boundaries — command
+/// arguments, `for` lists — use [`word_fields`] instead).
+pub fn literal_word(word: &ast::Word, ctx: &mut ExpandCtx) -> Result<String, String> {
+    render_word_text(&word.value, ctx)
+}
+
+/// [`literal_word`] over raw word source text (used for a parameter
+/// expansion's embedded default value, e.g. the `${HOME}` inside
+/// `${ZDOTDIR:-${HOME}}`, which brush keeps as unparsed text).
+fn render_word_text(text: &str, ctx: &mut ExpandCtx) -> Result<String, String> {
+    let pieces = parse_word_pieces(text)?;
     let mut out = String::new();
     for piece in &pieces {
-        push_literal_piece(&piece.piece, &mut out, true, vars)?;
+        push_literal_piece(&piece.piece, &mut out, true, ctx)?;
     }
     Ok(out)
+}
+
+/// Expand a shell [`ast::Word`] to the list of argument fields it
+/// produces — bash's real unit for command arguments and `for` lists,
+/// where one word can become zero, one, or many arguments:
+///
+/// * `"$@"` (and unquoted `$@`/`$*`) expands to one field per
+///   positional parameter — zero fields when there are none — so
+///   `main "$@"` forwards argument boundaries intact;
+/// * a word that is exactly one unquoted `$VAR` or `$(cmd)` is
+///   whitespace-split after expansion (and an empty value disappears
+///   entirely), matching bash's IFS field splitting for the shapes
+///   installers actually rely on (`for f in $FILES`, `curl $FLAGS ...`);
+/// * everything else renders to exactly one field via [`literal_word`]'s
+///   rules (quoted text never splits).
+pub fn word_fields(word: &ast::Word, ctx: &mut ExpandCtx) -> Result<Vec<String>, String> {
+    let pieces = parse_word_pieces(&word.value)?;
+
+    // A word that is exactly `$@`/`$*`, possibly double-quoted.
+    if let [only] = pieces.as_slice() {
+        let unquoted_expr = match &only.piece {
+            WordPiece::ParameterExpansion(expr) => Some((expr, true)),
+            WordPiece::DoubleQuotedSequence(inner) => match inner.as_slice() {
+                [one] => match &one.piece {
+                    WordPiece::ParameterExpansion(expr) => Some((expr, false)),
+                    _ => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some((
+            ParameterExpr::Parameter {
+                parameter:
+                    Parameter::Special(SpecialParameter::AllPositionalParameters { concatenate }),
+                indirect: false,
+            },
+            unquoted,
+        )) = unquoted_expr
+        {
+            // `"$*"` is the one shape that joins instead of splitting.
+            if *concatenate && !unquoted {
+                return Ok(vec![ctx.session.positional().join(" ")]);
+            }
+            return Ok(ctx.session.positional().to_vec());
+        }
+
+        // A lone unquoted `$VAR` or `$(cmd)`: expand, then field-split.
+        let expanded = match &only.piece {
+            WordPiece::ParameterExpansion(expr) => Some(resolve_parameter_expansion(expr, ctx)?),
+            WordPiece::CommandSubstitution(cmd) | WordPiece::BackquotedCommandSubstitution(cmd) => {
+                Some(run_substitution(cmd, ctx)?)
+            }
+            _ => None,
+        };
+        if let Some(value) = expanded {
+            return Ok(value.split_whitespace().map(str::to_string).collect());
+        }
+    }
+
+    Ok(vec![literal_word(word, ctx)?])
 }
 
 /// True if `s` contains a character that would undergo bash pathname
@@ -61,6 +188,16 @@ fn contains_glob_metachar(s: &str) -> bool {
     }
 }
 
+/// Run one `$(command)` substitution and apply bash's trailing-newline
+/// stripping to what it captured.
+fn run_substitution(command: &str, ctx: &mut ExpandCtx) -> Result<String, String> {
+    let mut output = ctx.subst.substitute(ctx.session, command)?;
+    while output.ends_with('\n') {
+        output.pop();
+    }
+    Ok(output)
+}
+
 /// Append one word piece's literal text to `out`, or fail with the reason
 /// it can't be rendered without expansion. `unquoted` is true for pieces
 /// that sit directly in the word (where bash would still glob-expand
@@ -70,7 +207,7 @@ fn push_literal_piece(
     piece: &WordPiece,
     out: &mut String,
     unquoted: bool,
-    vars: &HashMap<String, String>,
+    ctx: &mut ExpandCtx,
 ) -> Result<(), String> {
     match piece {
         WordPiece::Text(s) => {
@@ -91,7 +228,7 @@ fn push_literal_piece(
         }
         WordPiece::DoubleQuotedSequence(inner) | WordPiece::GettextDoubleQuotedSequence(inner) => {
             for p in inner {
-                push_literal_piece(&p.piece, out, false, vars)?;
+                push_literal_piece(&p.piece, out, false, ctx)?;
             }
             Ok(())
         }
@@ -109,11 +246,12 @@ fn push_literal_piece(
             Err("tilde expansion is only supported for `~` (the home directory)".into())
         }
         WordPiece::ParameterExpansion(expr) => {
-            out.push_str(&resolve_parameter_expansion(expr, vars)?);
+            out.push_str(&resolve_parameter_expansion(expr, ctx)?);
             Ok(())
         }
-        WordPiece::CommandSubstitution(_) | WordPiece::BackquotedCommandSubstitution(_) => {
-            Err("command substitution is not supported yet".into())
+        WordPiece::CommandSubstitution(cmd) | WordPiece::BackquotedCommandSubstitution(cmd) => {
+            out.push_str(&run_substitution(cmd, ctx)?);
+            Ok(())
         }
         WordPiece::ArithmeticExpression(_) => {
             Err("arithmetic expansion is not supported yet".into())
@@ -121,79 +259,281 @@ fn push_literal_piece(
     }
 }
 
-/// Resolve a parameter expansion to its literal text. Only the plain
-/// `$VAR`/`${VAR}` form (a direct, non-indirect reference to a named
-/// variable) is supported: default/alternative-value operators
-/// (`${VAR:-x}`, `${VAR:+x}`, ...), pattern removal (`${VAR#x}`,
-/// `${VAR%x}`, ...), length (`${#VAR}`), indirection (`${!VAR}`),
-/// positional (`$1`) and special (`$?`, `$@`, `$#`, ...) parameters, and
-/// array variables are all real bash features installers do use, just
-/// not ones iish implements yet.
+/// The value of `parameter` right now, or `None` if it's genuinely
+/// unset (what the `${VAR:-default}` family branches on). Named
+/// variables resolve through the session's call frames and globals
+/// first (an assignment always shadows the environment, as in bash),
+/// then the real process environment, then the shell-identity table.
+fn resolve_parameter(parameter: &Parameter, ctx: &ExpandCtx) -> Result<Option<String>, String> {
+    match parameter {
+        Parameter::Named(name) => Ok(ctx
+            .session
+            .get_variable(name)
+            .map(str::to_string)
+            .or_else(|| std::env::var(name).ok())
+            .or_else(|| shell_identity(name).map(str::to_string))),
+        Parameter::Positional(0) => Ok(Some(ctx.session.script_name().to_string())),
+        Parameter::Positional(n) => Ok(ctx.session.positional().get((*n - 1) as usize).cloned()),
+        Parameter::Special(special) => match special {
+            SpecialParameter::AllPositionalParameters { .. } => {
+                // In a scalar context both `$@` and `$*` join with
+                // spaces; argument-boundary-preserving `"$@"` lives in
+                // `word_fields`.
+                Ok(Some(ctx.session.positional().join(" ")))
+            }
+            SpecialParameter::PositionalParameterCount => {
+                Ok(Some(ctx.session.positional().len().to_string()))
+            }
+            SpecialParameter::LastExitStatus => Ok(Some(ctx.session.last_status().to_string())),
+            SpecialParameter::ProcessId => Ok(Some(std::process::id().to_string())),
+            SpecialParameter::ShellName => Ok(Some(ctx.session.script_name().to_string())),
+            SpecialParameter::CurrentOptionFlags => {
+                Err("`$-` (current option flags) is not supported yet".into())
+            }
+            SpecialParameter::LastBackgroundProcessId => {
+                Err("`$!` is not supported: background jobs are not implemented".into())
+            }
+        },
+        Parameter::NamedWithIndex { .. } | Parameter::NamedWithAllIndices { .. } => {
+            Err("array variable expansion is not supported yet".into())
+        }
+    }
+}
+
+fn describe_parameter(parameter: &Parameter) -> String {
+    match parameter {
+        Parameter::Named(name) => format!("${name}"),
+        Parameter::Positional(n) => format!("${n}"),
+        other => format!("{other:?}"),
+    }
+}
+
+/// Is a resolved value "missing" for this test type? `${VAR-x}`
+/// (`Unset`) only treats a genuinely unset variable as missing;
+/// `${VAR:-x}` (`UnsetOrNull`) treats an empty value as missing too.
+fn is_missing(value: &Option<String>, test_type: &ParameterTestType) -> bool {
+    match test_type {
+        ParameterTestType::Unset => value.is_none(),
+        ParameterTestType::UnsetOrNull => value.as_deref().map(str::is_empty).unwrap_or(true),
+    }
+}
+
+/// Resolve a parameter expansion to its literal text: plain
+/// `$VAR`/`${VAR}` references, positional (`$1`, ...) and the common
+/// special parameters (`$?`, `$#`, `$@`, `$*`, `$$`, `$0`), the
+/// default/alternative-value operators (`${VAR:-x}`, `${VAR-x}`,
+/// `${VAR:=x}`, `${VAR:+x}`), and `${#VAR}` length. The rest — pattern
+/// removal (`${VAR#x}`, `${VAR%x}`), substrings, case modification,
+/// indirection, arrays — is rejected with a reason.
+///
+/// A plain reference to an outright-unset name expands to empty (bash's
+/// default) unless the script itself said `set -u`, in which case it is
+/// rejected; the default-value operators are bash's own explicit way of
+/// saying "unset is fine here", so they behave normally either way.
 fn resolve_parameter_expansion(
     expr: &ParameterExpr,
-    vars: &HashMap<String, String>,
+    ctx: &mut ExpandCtx,
 ) -> Result<String, String> {
+    if let ParameterExpr::Parameter { indirect: true, .. }
+    | ParameterExpr::UseDefaultValues { indirect: true, .. }
+    | ParameterExpr::AssignDefaultValues { indirect: true, .. }
+    | ParameterExpr::UseAlternativeValue { indirect: true, .. } = expr
+    {
+        return Err("indirect parameter expansion (`${!VAR}`) is not supported yet".into());
+    }
     match expr {
-        ParameterExpr::Parameter {
-            parameter: Parameter::Named(name),
-            indirect: false,
-        } => resolve_named_variable(name, vars),
-        ParameterExpr::Parameter { indirect: true, .. } => {
-            Err("indirect parameter expansion (`${!VAR}`) is not supported yet".into())
+        ParameterExpr::Parameter { parameter, .. } => {
+            match resolve_parameter(parameter, ctx)? {
+                Some(value) => Ok(value),
+                // Unless the script asked for `set -u`, an unset
+                // variable expands to empty exactly as bash's would.
+                None if !ctx.session.nounset() => Ok(String::new()),
+                None => Err(format!("`{}` is unset", describe_parameter(parameter))),
+            }
         }
-        ParameterExpr::Parameter {
-            parameter: Parameter::Special(_),
+        ParameterExpr::UseDefaultValues {
+            parameter,
+            test_type,
+            default_value,
             ..
-        } => Err("special parameters (`$?`, `$#`, `$@`, `$*`, ...) are not supported yet".into()),
-        ParameterExpr::Parameter {
-            parameter: Parameter::Positional(_),
+        } => {
+            let value = resolve_parameter(parameter, ctx)?;
+            if is_missing(&value, test_type) {
+                match default_value {
+                    Some(default) => render_word_text(default, ctx),
+                    None => Ok(String::new()),
+                }
+            } else {
+                Ok(value.unwrap_or_default())
+            }
+        }
+        ParameterExpr::AssignDefaultValues {
+            parameter,
+            test_type,
+            default_value,
             ..
-        } => Err("positional parameters (`$1`, `$2`, ...) are not supported yet".into()),
-        ParameterExpr::Parameter {
-            parameter: Parameter::NamedWithIndex { .. } | Parameter::NamedWithAllIndices { .. },
+        } => {
+            let value = resolve_parameter(parameter, ctx)?;
+            if is_missing(&value, test_type) {
+                let default = match default_value {
+                    Some(default) => render_word_text(default, ctx)?,
+                    None => String::new(),
+                };
+                let Parameter::Named(name) = parameter else {
+                    return Err(
+                        "`${PARAM:=default}` assignment is only supported for named variables"
+                            .into(),
+                    );
+                };
+                ctx.session.set_variable(name.clone(), default.clone());
+                Ok(default)
+            } else {
+                Ok(value.unwrap_or_default())
+            }
+        }
+        ParameterExpr::UseAlternativeValue {
+            parameter,
+            test_type,
+            alternative_value,
             ..
-        } => Err("array variable expansion is not supported yet".into()),
+        } => {
+            let value = resolve_parameter(parameter, ctx)?;
+            if is_missing(&value, test_type) {
+                Ok(String::new())
+            } else {
+                match alternative_value {
+                    Some(alternative) => render_word_text(alternative, ctx),
+                    None => Ok(String::new()),
+                }
+            }
+        }
+        ParameterExpr::ParameterLength { parameter, .. } => {
+            match resolve_parameter(parameter, ctx)? {
+                Some(value) => Ok(value.chars().count().to_string()),
+                None if !ctx.session.nounset() => Ok("0".to_string()),
+                None => Err(format!("`{}` is unset", describe_parameter(parameter))),
+            }
+        }
+        ParameterExpr::RemoveSmallestSuffixPattern {
+            parameter, pattern, ..
+        } => remove_pattern(parameter, pattern.as_deref(), false, true, ctx),
+        ParameterExpr::RemoveLargestSuffixPattern {
+            parameter, pattern, ..
+        } => remove_pattern(parameter, pattern.as_deref(), false, false, ctx),
+        ParameterExpr::RemoveSmallestPrefixPattern {
+            parameter, pattern, ..
+        } => remove_pattern(parameter, pattern.as_deref(), true, true, ctx),
+        ParameterExpr::RemoveLargestPrefixPattern {
+            parameter, pattern, ..
+        } => remove_pattern(parameter, pattern.as_deref(), true, false, ctx),
         _ => Err(
-            "this form of parameter expansion (`${VAR:-default}`, `${VAR#pattern}`, \
-             `${#VAR}`, ...) is not supported yet"
+            "this form of parameter expansion (`${VAR/x/y}`, `${VAR:1:2}`, \
+             `${VAR^^}`, ...) is not supported yet"
                 .into(),
         ),
     }
 }
 
-/// `$VAR`/`${VAR}`: this run's own bare-assignment-tracked value takes
-/// priority (matching bash, where assigning a variable always shadows
-/// whatever the process environment had), falling back to the real
-/// process environment — the same fallback `~` already gets for
-/// `$HOME`. An unset name is rejected rather than expanding to an empty
-/// string: iish's execution model already behaves as if `nounset` were
-/// always on (see policy.rs's `evaluate_set`).
-fn resolve_named_variable(name: &str, vars: &HashMap<String, String>) -> Result<String, String> {
-    if let Some(value) = vars.get(name) {
-        return Ok(value.clone());
+/// `${VAR#pat}` / `${VAR##pat}` / `${VAR%pat}` / `${VAR%%pat}`: strip
+/// the smallest/largest prefix/suffix of the parameter's value matching
+/// the glob `pat`. The pattern text is itself expanded (quotes keep
+/// wildcards literal, `$VAR`s resolve) with the same rules as a `case`
+/// pattern, then matched with the same `*`/`?` glob matcher.
+fn remove_pattern(
+    parameter: &Parameter,
+    pattern: Option<&str>,
+    prefix: bool,
+    smallest: bool,
+    ctx: &mut ExpandCtx,
+) -> Result<String, String> {
+    let value = match resolve_parameter(parameter, ctx)? {
+        Some(value) => value,
+        None if !ctx.session.nounset() => String::new(),
+        None => return Err(format!("`{}` is unset", describe_parameter(parameter))),
+    };
+    let rendered_pattern = match pattern {
+        Some(text) => render_pattern_text(text, ctx)?,
+        None => String::new(),
+    };
+    let chars: Vec<char> = value.chars().collect();
+    let n = chars.len();
+    // Candidate removal lengths, ordered so the first match wins as
+    // the smallest (or largest) removal.
+    let lengths: Vec<usize> = if smallest {
+        (0..=n).collect()
+    } else {
+        (0..=n).rev().collect()
+    };
+    for len in lengths {
+        let (removed, kept): (String, String) = if prefix {
+            (chars[..len].iter().collect(), chars[len..].iter().collect())
+        } else {
+            (
+                chars[n - len..].iter().collect(),
+                chars[..n - len].iter().collect(),
+            )
+        };
+        if glob_match(&rendered_pattern, &removed) {
+            return Ok(kept);
+        }
     }
-    std::env::var(name).map_err(|_| format!("`${name}` is unset"))
+    Ok(value)
+}
+
+/// Minimal glob matching shared by `case` patterns and
+/// `${VAR#pattern}`-style removal: `*` matches any run of characters
+/// (including none), `?` matches exactly one, `\x` matches the literal
+/// character `x` (how a pattern character that came from quoted or
+/// escaped source text — or from an expansion's value — is
+/// represented, so it isn't treated as a wildcard even though it looks
+/// like one), and any other character matches itself. No
+/// bracket-expression (`[...]`) support: installers' patterns in
+/// practice only ever reach for `*`/`?` (`Linux*`, `x86_64`, `*=`, a
+/// bare `*` default, ...).
+pub fn glob_match(pattern: &str, text: &str) -> bool {
+    fn matches(p: &[char], t: &[char]) -> bool {
+        match p.first() {
+            None => t.is_empty(),
+            Some('*') => (0..=t.len()).any(|i| matches(&p[1..], &t[i..])),
+            Some('?') => !t.is_empty() && matches(&p[1..], &t[1..]),
+            Some('\\') if p.len() > 1 => !t.is_empty() && p[1] == t[0] && matches(&p[2..], &t[1..]),
+            Some(c) => !t.is_empty() && *c == t[0] && matches(&p[1..], &t[1..]),
+        }
+    }
+    let pattern_chars: Vec<char> = pattern.chars().collect();
+    let text_chars: Vec<char> = text.chars().collect();
+    matches(&pattern_chars, &text_chars)
 }
 
 /// Render a shell [`ast::Word`] as a `case` pattern: like [`literal_word`],
-/// expansion of any kind is rejected, but unquoted `*`/`?` are kept as
-/// glob wildcards instead of being rejected outright — that's exactly
-/// what makes them meaningful in a `case` pattern (`Linux*)`, `x86_64|
-/// amd64)`, a bare `*)` default, ...). A `*`/`?`/`\` that came from a
-/// quoted or escaped part of the word is escaped with a leading `\` in
-/// the result so policy.rs's matcher treats it as the literal character
-/// bash would, not a wildcard.
-pub fn case_pattern_word(word: &ast::Word) -> Result<String, String> {
-    let pieces = brush_parser::word::parse(&word.value, &options())
-        .map_err(|e| format!("could not parse word `{}`: {e}", word.value))?;
+/// but unquoted `*`/`?` are kept as glob wildcards instead of being
+/// rejected outright — that's exactly what makes them meaningful in a
+/// `case` pattern (`Linux*)`, `x86_64|amd64)`, a bare `*)` default, ...).
+/// A `*`/`?`/`\` that came from a quoted or escaped part of the word —
+/// or from an expansion's value — is escaped with a leading `\` in the
+/// result so policy.rs's matcher treats it as the literal character bash
+/// would, not a wildcard.
+pub fn case_pattern_word(word: &ast::Word, ctx: &mut ExpandCtx) -> Result<String, String> {
+    render_pattern_text(&word.value, ctx)
+}
+
+/// [`case_pattern_word`] over raw pattern source text (a
+/// `${VAR#pattern}`'s pattern, which brush keeps unparsed).
+fn render_pattern_text(text: &str, ctx: &mut ExpandCtx) -> Result<String, String> {
+    let pieces = parse_word_pieces(text)?;
     let mut out = String::new();
     for piece in &pieces {
-        push_pattern_piece(&piece.piece, &mut out, true)?;
+        push_pattern_piece(&piece.piece, &mut out, true, ctx)?;
     }
     Ok(out)
 }
 
-fn push_pattern_piece(piece: &WordPiece, out: &mut String, unquoted: bool) -> Result<(), String> {
+fn push_pattern_piece(
+    piece: &WordPiece,
+    out: &mut String,
+    unquoted: bool,
+    ctx: &mut ExpandCtx,
+) -> Result<(), String> {
     match piece {
         WordPiece::Text(s) => {
             if unquoted {
@@ -219,7 +559,7 @@ fn push_pattern_piece(piece: &WordPiece, out: &mut String, unquoted: bool) -> Re
         }
         WordPiece::DoubleQuotedSequence(inner) | WordPiece::GettextDoubleQuotedSequence(inner) => {
             for p in inner {
-                push_pattern_piece(&p.piece, out, false)?;
+                push_pattern_piece(&p.piece, out, false, ctx)?;
             }
             Ok(())
         }
@@ -236,9 +576,22 @@ fn push_pattern_piece(piece: &WordPiece, out: &mut String, unquoted: bool) -> Re
         WordPiece::TildeExpansion(_) => {
             Err("tilde expansion is only supported for `~` (the home directory)".into())
         }
-        WordPiece::ParameterExpansion(_) => Err("variable expansion is not supported yet".into()),
-        WordPiece::CommandSubstitution(_) | WordPiece::BackquotedCommandSubstitution(_) => {
-            Err("command substitution is not supported yet".into())
+        WordPiece::ParameterExpansion(expr) => {
+            // An expansion's *value* is matched literally, exactly as
+            // bash treats an unquoted variable in a case pattern whose
+            // value contains glob characters... it doesn't, but quoted
+            // semantics are the safe direction: never let runtime data
+            // smuggle in a wildcard.
+            for c in resolve_parameter_expansion(expr, ctx)?.chars() {
+                push_literal_pattern_char(c, out);
+            }
+            Ok(())
+        }
+        WordPiece::CommandSubstitution(cmd) | WordPiece::BackquotedCommandSubstitution(cmd) => {
+            for c in run_substitution(cmd, ctx)?.chars() {
+                push_literal_pattern_char(c, out);
+            }
+            Ok(())
         }
         WordPiece::ArithmeticExpression(_) => {
             Err("arithmetic expansion is not supported yet".into())
@@ -260,8 +613,20 @@ fn push_literal_pattern_char(c: char, out: &mut String) {
 mod tests {
     use super::*;
 
-    fn no_vars() -> HashMap<String, String> {
-        HashMap::new()
+    fn refuse() -> RefuseSubstituter {
+        RefuseSubstituter("command substitution refused in this test")
+    }
+
+    fn first_suffix_word(script: &str) -> ast::Word {
+        let program = parse(script).expect("should parse");
+        let ast::Command::Simple(cmd) = &program.complete_commands[0].0[0].0.first.seq[0] else {
+            panic!("expected a simple command");
+        };
+        let word = &cmd.suffix.as_ref().unwrap().0[0];
+        let ast::CommandPrefixOrSuffixItem::Word(w) = word else {
+            panic!("expected word");
+        };
+        w.clone()
     }
 
     fn simple_words(script: &str) -> Vec<String> {
@@ -270,14 +635,19 @@ mod tests {
         let ast::Command::Simple(cmd) = &item.0.first.seq[0] else {
             panic!("expected a simple command");
         };
-        let vars = no_vars();
-        let mut words = vec![literal_word(cmd.word_or_name.as_ref().unwrap(), &vars).unwrap()];
+        let mut session = Session::new();
+        let mut subst = refuse();
+        let mut ctx = ExpandCtx {
+            session: &mut session,
+            subst: &mut subst,
+        };
+        let mut words = vec![literal_word(cmd.word_or_name.as_ref().unwrap(), &mut ctx).unwrap()];
         if let Some(suffix) = &cmd.suffix {
             for item in &suffix.0 {
                 let ast::CommandPrefixOrSuffixItem::Word(w) = item else {
                     panic!("expected a plain word suffix item");
                 };
-                words.push(literal_word(w, &vars).unwrap());
+                words.push(literal_word(w, &mut ctx).unwrap());
             }
         }
         words
@@ -330,59 +700,56 @@ mod tests {
         );
     }
 
-    #[test]
-    fn tilde_user_expansion_is_not_supported() {
-        let program = parse("echo ~someuser/x").unwrap();
-        let ast::Command::Simple(cmd) = &program.complete_commands[0].0[0].0.first.seq[0] else {
-            panic!("expected simple command");
+    fn render_in(script: &str, session: &mut Session) -> Result<String, String> {
+        let word = first_suffix_word(script);
+        let mut subst = refuse();
+        let mut ctx = ExpandCtx {
+            session,
+            subst: &mut subst,
         };
-        let word = &cmd.suffix.as_ref().unwrap().0[0];
-        let ast::CommandPrefixOrSuffixItem::Word(w) = word else {
-            panic!("expected word");
+        literal_word(&word, &mut ctx)
+    }
+
+    fn render(script: &str) -> Result<String, String> {
+        render_in(script, &mut Session::new())
+    }
+
+    fn fields_in(script: &str, session: &mut Session) -> Result<Vec<String>, String> {
+        let word = first_suffix_word(script);
+        let mut subst = refuse();
+        let mut ctx = ExpandCtx {
+            session,
+            subst: &mut subst,
         };
-        assert!(literal_word(w, &no_vars()).is_err());
+        word_fields(&word, &mut ctx)
     }
 
     #[test]
-    fn literal_word_rejects_expansion_of_an_unset_variable() {
-        let program = parse("echo $HOME_BUT_NOT_REALLY_XYZZY").unwrap();
-        let ast::Command::Simple(cmd) = &program.complete_commands[0].0[0].0.first.seq[0] else {
-            panic!("expected simple command");
-        };
-        let word = &cmd.suffix.as_ref().unwrap().0[0];
-        let ast::CommandPrefixOrSuffixItem::Word(w) = word else {
-            panic!("expected word");
-        };
-        assert!(literal_word(w, &no_vars()).is_err());
+    fn tilde_user_expansion_is_not_supported() {
+        assert!(render("echo ~someuser/x").is_err());
+    }
+
+    #[test]
+    fn unset_variable_expands_empty_by_default_and_is_rejected_under_nounset() {
+        // bash's default: unset expands to empty.
+        assert_eq!(render("echo $HOME_BUT_NOT_REALLY_XYZZY").unwrap(), "");
+        // After the script's own `set -u`, it's refused instead.
+        let mut session = Session::new();
+        session.set_nounset(true);
+        assert!(render_in("echo $HOME_BUT_NOT_REALLY_XYZZY", &mut session).is_err());
     }
 
     #[test]
     fn literal_word_expands_a_tracked_variable() {
-        let program = parse("echo $FOO").unwrap();
-        let ast::Command::Simple(cmd) = &program.complete_commands[0].0[0].0.first.seq[0] else {
-            panic!("expected simple command");
-        };
-        let word = &cmd.suffix.as_ref().unwrap().0[0];
-        let ast::CommandPrefixOrSuffixItem::Word(w) = word else {
-            panic!("expected word");
-        };
-        let mut vars = no_vars();
-        vars.insert("FOO".to_string(), "bar".to_string());
-        assert_eq!(literal_word(w, &vars).unwrap(), "bar");
+        let mut session = Session::new();
+        session.set_variable("FOO", "bar");
+        assert_eq!(render_in("echo $FOO", &mut session).unwrap(), "bar");
     }
 
     #[test]
     fn literal_word_expands_a_real_environment_variable_as_a_fallback() {
-        let program = parse("echo ${HOME}").unwrap();
-        let ast::Command::Simple(cmd) = &program.complete_commands[0].0[0].0.first.seq[0] else {
-            panic!("expected simple command");
-        };
-        let word = &cmd.suffix.as_ref().unwrap().0[0];
-        let ast::CommandPrefixOrSuffixItem::Word(w) = word else {
-            panic!("expected word");
-        };
         let home = std::env::var("HOME").expect("test environment should have $HOME set");
-        assert_eq!(literal_word(w, &no_vars()).unwrap(), home);
+        assert_eq!(render("echo ${HOME}").unwrap(), home);
     }
 
     #[test]
@@ -394,23 +761,196 @@ mod tests {
         let ast::Command::Simple(cmd) = &program.complete_commands[0].0[0].0.first.seq[0] else {
             panic!("expected a simple command");
         };
+        let mut session = Session::new();
+        let mut subst = refuse();
+        let mut ctx = ExpandCtx {
+            session: &mut session,
+            subst: &mut subst,
+        };
         assert_eq!(
-            literal_word(cmd.word_or_name.as_ref().unwrap(), &no_vars()).unwrap(),
+            literal_word(cmd.word_or_name.as_ref().unwrap(), &mut ctx).unwrap(),
             "["
         );
     }
 
     #[test]
     fn literal_word_still_rejects_a_real_bracket_expression() {
-        let program = parse("echo [ab]").unwrap();
-        let ast::Command::Simple(cmd) = &program.complete_commands[0].0[0].0.first.seq[0] else {
-            panic!("expected a simple command");
+        assert!(render("echo [ab]").is_err());
+    }
+
+    #[test]
+    fn identity_variables_answer_as_bash() {
+        assert!(render("echo ${BASH_VERSION}").unwrap().contains("iish"));
+        assert_eq!(render("echo \"${ZSH_VERSION}\"").unwrap(), "");
+    }
+
+    #[test]
+    fn session_variables_shadow_identity_and_environment() {
+        let mut session = Session::new();
+        session.set_variable("BASH_VERSION", "overridden");
+        assert_eq!(
+            render_in("echo ${BASH_VERSION}", &mut session).unwrap(),
+            "overridden"
+        );
+    }
+
+    #[test]
+    fn special_parameters_resolve() {
+        let mut session = Session::new();
+        session.set_last_status(3);
+        session.push_frame("f", vec!["one".into(), "two words".into()]);
+        assert_eq!(render_in("echo $?", &mut session).unwrap(), "3");
+        assert_eq!(render_in("echo $#", &mut session).unwrap(), "2");
+        assert_eq!(render_in("echo $1", &mut session).unwrap(), "one");
+        assert_eq!(render_in("echo \"$2\"", &mut session).unwrap(), "two words");
+        assert_eq!(render_in("echo $0", &mut session).unwrap(), "iish");
+        assert_eq!(
+            render_in("echo \"$@\"", &mut session).unwrap(),
+            "one two words"
+        );
+    }
+
+    #[test]
+    fn unset_positional_parameter_is_rejected_under_nounset() {
+        let mut session = Session::new();
+        session.set_nounset(true);
+        session.push_frame("f", vec!["only".into()]);
+        assert!(render_in("echo $2", &mut session).is_err());
+        session.set_nounset(false);
+        assert_eq!(render_in("echo \"$2\"", &mut session).unwrap(), "");
+    }
+
+    #[test]
+    fn at_expansion_preserves_argument_boundaries_in_fields() {
+        let mut session = Session::new();
+        session.push_frame("f", vec!["one".into(), "two words".into()]);
+        assert_eq!(
+            fields_in("main \"$@\"", &mut session).unwrap(),
+            vec!["one", "two words"]
+        );
+        // "$*" joins into a single field instead.
+        assert_eq!(
+            fields_in("main \"$*\"", &mut session).unwrap(),
+            vec!["one two words"]
+        );
+    }
+
+    #[test]
+    fn empty_at_expansion_produces_zero_fields() {
+        let mut session = Session::new();
+        assert!(fields_in("main \"$@\"", &mut session).unwrap().is_empty());
+    }
+
+    #[test]
+    fn lone_unquoted_variable_field_splits() {
+        let mut session = Session::new();
+        session.set_variable("FLAGS", "  -a   -b ");
+        assert_eq!(
+            fields_in("cmd $FLAGS", &mut session).unwrap(),
+            vec!["-a", "-b"]
+        );
+        session.set_variable("FLAGS", "");
+        assert!(fields_in("cmd $FLAGS", &mut session).unwrap().is_empty());
+    }
+
+    #[test]
+    fn quoted_variable_never_field_splits() {
+        let mut session = Session::new();
+        session.set_variable("NAME", "two words");
+        assert_eq!(
+            fields_in("cmd \"$NAME\"", &mut session).unwrap(),
+            vec!["two words"]
+        );
+    }
+
+    #[test]
+    fn default_value_operators() {
+        let mut session = Session::new();
+        assert_eq!(
+            render_in("echo \"${UNSET_XYZ:-fallback}\"", &mut session).unwrap(),
+            "fallback"
+        );
+        assert_eq!(
+            render_in("echo \"${UNSET_XYZ-}\"", &mut session).unwrap(),
+            ""
+        );
+        session.set_variable("EMPTY", "");
+        // `:-` treats empty as missing; `-` does not.
+        assert_eq!(
+            render_in("echo \"${EMPTY:-fb}\"", &mut session).unwrap(),
+            "fb"
+        );
+        assert_eq!(render_in("echo \"${EMPTY-fb}\"", &mut session).unwrap(), "");
+        session.set_variable("SET", "value");
+        assert_eq!(
+            render_in("echo \"${SET:-fb}\"", &mut session).unwrap(),
+            "value"
+        );
+        assert_eq!(
+            render_in("echo \"${SET:+alt}\"", &mut session).unwrap(),
+            "alt"
+        );
+        assert_eq!(
+            render_in("echo \"${EMPTY:+alt}\"", &mut session).unwrap(),
+            ""
+        );
+    }
+
+    #[test]
+    fn default_value_may_itself_expand() {
+        let mut session = Session::new();
+        session.set_variable("FALLBACK", "resolved");
+        assert_eq!(
+            render_in("echo \"${UNSET_XYZ:-${FALLBACK}}\"", &mut session).unwrap(),
+            "resolved"
+        );
+    }
+
+    #[test]
+    fn assign_default_operator_assigns() {
+        let mut session = Session::new();
+        assert_eq!(
+            render_in("echo \"${NEWVAR:=assigned}\"", &mut session).unwrap(),
+            "assigned"
+        );
+        assert_eq!(session.get_variable("NEWVAR"), Some("assigned"));
+    }
+
+    #[test]
+    fn parameter_length() {
+        let mut session = Session::new();
+        session.set_variable("STR", "four");
+        assert_eq!(render_in("echo \"${#STR}\"", &mut session).unwrap(), "4");
+    }
+
+    #[test]
+    fn command_substitution_calls_the_substituter() {
+        struct Fixed;
+        impl Substituter for Fixed {
+            fn substitute(
+                &mut self,
+                _session: &mut Session,
+                command: &str,
+            ) -> Result<String, String> {
+                assert_eq!(command.trim(), "uname -s");
+                Ok("Linux\n\n".to_string())
+            }
+        }
+        let word = first_suffix_word("echo \"os: $(uname -s)\"");
+        let mut session = Session::new();
+        let mut subst = Fixed;
+        let mut ctx = ExpandCtx {
+            session: &mut session,
+            subst: &mut subst,
         };
-        let word = &cmd.suffix.as_ref().unwrap().0[0];
-        let ast::CommandPrefixOrSuffixItem::Word(w) = word else {
-            panic!("expected word");
-        };
-        assert!(literal_word(w, &no_vars()).is_err());
+        // Trailing newlines are stripped, interior text preserved.
+        assert_eq!(literal_word(&word, &mut ctx).unwrap(), "os: Linux");
+    }
+
+    #[test]
+    fn refused_substitution_reports_its_reason() {
+        let err = render("echo $(whoami)").unwrap_err();
+        assert!(err.contains("refused in this test"), "{err}");
     }
 
     fn case_patterns(script: &str) -> Vec<String> {
@@ -420,10 +960,16 @@ mod tests {
         else {
             panic!("expected a case clause");
         };
+        let mut session = Session::new();
+        let mut subst = refuse();
+        let mut ctx = ExpandCtx {
+            session: &mut session,
+            subst: &mut subst,
+        };
         case.cases[0]
             .patterns
             .iter()
-            .map(|p| case_pattern_word(p).unwrap())
+            .map(|p| case_pattern_word(p, &mut ctx).unwrap())
             .collect()
     }
 
@@ -437,6 +983,27 @@ mod tests {
         assert_eq!(
             case_patterns(r#"case x in "*") ;; esac"#),
             vec![r"\*".to_string()]
+        );
+    }
+
+    #[test]
+    fn case_pattern_word_escapes_an_expansions_value() {
+        let program = parse("case x in ${PAT}) ;; esac").unwrap();
+        let ast::Command::Compound(ast::CompoundCommand::CaseClause(case), _) =
+            &program.complete_commands[0].0[0].0.first.seq[0]
+        else {
+            panic!("expected a case clause");
+        };
+        let mut session = Session::new();
+        session.set_variable("PAT", "a*b");
+        let mut subst = refuse();
+        let mut ctx = ExpandCtx {
+            session: &mut session,
+            subst: &mut subst,
+        };
+        assert_eq!(
+            case_pattern_word(&case.cases[0].patterns[0], &mut ctx).unwrap(),
+            r"a\*b"
         );
     }
 }
