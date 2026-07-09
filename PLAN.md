@@ -224,7 +224,29 @@ doubles as the integration-test corpus later.
    `sha256sum`/`sha256sum -c` checksum verification, restricted like
    `rm`/`chmod` to paths this run created. All other redirect shapes
    remain denied. *(done)*
-7. **Corpus as test suite** — iish should run the majority of the
-   corpus to completion (with expected asks).
+7. **Corpus as test suite** — the long-term goal is still "iish runs
+   the majority of the corpus to completion (with expected asks)", but
+   today's evaluator denies functions, control flow, and expansions
+   outright, so none of the 17 real corpus scripts get past their first
+   few lines yet. `scripts/verify-installers.sh` (Docker-isolated,
+   network-disabled, runnable in CI or by hand — see
+   `.github/workflows/installer-verify.yml`) runs a curated,
+   user-space-only subset of the corpus through the real binary and
+   pins *why* each currently stops, as a regression guard: the pin
+   breaking means either a regression or genuine milestone-7 progress,
+   either way worth a human's attention. If/when a script ever runs to
+   completion, the same harness checks the resulting program is
+   actually usable, not just that iish didn't refuse. The same script
+   also runs a small adversarial corpus (`corpus/adversarial/`) of
+   synthetic installers that attempt real attacks — root wipe, rc-file
+   persistence injection, writing outside the env-file grammar, and a
+   symlink-escape of `rm`/`chmod` outside anything the run owns.
+   Writing that last pair caught a real vulnerability: `Session::owns`
+   (state.rs) is a lexical prefix match with no idea a path component
+   could be a symlink; `exec.rs`'s `assert_no_symlink_escape` now
+   refuses to operate through one for every native filesystem action
+   (`mkdir`, `rm`, `chmod`, fetch-to-file, env-file append,
+   `sha256sum`). *(in progress — harness in place, corpus still
+   0/17 to completion)*
 8. **Sandboxing investigation** — Landlock/seccomp/Seatbelt for second
    stages (post-first-iteration).

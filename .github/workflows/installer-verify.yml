@@ -1,0 +1,21 @@
+name: Installer verify
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  verify:
+    name: corpus + adversarial installer verification
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Docker is preinstalled on the ubuntu runner image; this just
+      # confirms it's there and healthy before the (slow) image build.
+      - name: Check Docker
+        run: docker version
+
+      - name: Run scripts/verify-installers.sh
+        run: scripts/verify-installers.sh --verbose
