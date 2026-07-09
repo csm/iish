@@ -172,17 +172,72 @@ fn unknown_command_prompts_and_runs_as_a_subprocess_when_allowed() {
 
 #[test]
 fn subprocess_tier_runs_a_real_binary_when_allowed() {
-    let base = scratch("cp-subprocess");
+    let base = scratch("touch-subprocess");
+    fs::create_dir_all(&base).unwrap();
+    let target = base.join("touched.txt");
+    let out = iish(
+        &format!("touch {}\n", target.display()),
+        &["--allow", "touch"],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(target.is_file(), "the real `touch` binary should have run");
+    fs::remove_dir_all(&base).unwrap();
+}
+
+#[test]
+fn cp_copies_natively_without_the_subprocess_tier() {
+    let base = scratch("cp-native");
     fs::create_dir_all(&base).unwrap();
     let src = base.join("src.txt");
     let dst = base.join("dst.txt");
     fs::write(&src, b"hello").unwrap();
-    let out = iish(
-        &format!("cp {} {}\n", src.display(), dst.display()),
-        &["--allow", "cp"],
-    );
+    // Note the absence of `--allow cp`/`--subprocess=allow`: a native
+    // `cp` to a brand-new destination needs no policy confirmation at
+    // all, unlike the generic subprocess tier.
+    let out = iish(&format!("cp {} {}\n", src.display(), dst.display()), &[]);
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     assert_eq!(fs::read(&dst).unwrap(), b"hello");
+    fs::remove_dir_all(&base).unwrap();
+}
+
+#[test]
+fn cp_overwriting_a_foreign_file_is_refused_with_no() {
+    let base = scratch("cp-native-overwrite");
+    fs::create_dir_all(&base).unwrap();
+    let src = base.join("src.txt");
+    let dst = base.join("dst.txt");
+    fs::write(&src, b"new").unwrap();
+    fs::write(&dst, b"old").unwrap();
+    let out = iish(
+        &format!("cp {} {}\n", src.display(), dst.display()),
+        &["--no"],
+    );
+    assert!(!out.status.success());
+    assert_eq!(
+        fs::read(&dst).unwrap(),
+        b"old",
+        "a declined overwrite must leave the pre-existing file untouched"
+    );
+    fs::remove_dir_all(&base).unwrap();
+}
+
+#[test]
+fn cp_recursive_copies_a_directory_tree() {
+    let base = scratch("cp-native-recursive");
+    let src_dir = base.join("src");
+    fs::create_dir_all(src_dir.join("nested")).unwrap();
+    fs::write(src_dir.join("nested/file.txt"), b"payload").unwrap();
+    let dst_dir = base.join("dst");
+
+    let out = iish(
+        &format!("cp -r {} {}\n", src_dir.display(), dst_dir.display()),
+        &[],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(
+        fs::read(dst_dir.join("nested/file.txt")).unwrap(),
+        b"payload"
+    );
     fs::remove_dir_all(&base).unwrap();
 }
 
@@ -454,4 +509,77 @@ fn sha256sum_refuses_files_this_script_did_not_create() {
     let out = iish(&format!("sha256sum {}\n", foreign.display()), &[]);
     assert!(!out.status.success());
     fs::remove_dir_all(&base).unwrap();
+}
+
+#[test]
+fn set_eu_is_a_recognized_no_op() {
+    let out = iish("set -eu\necho still-running\n", &[]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "still-running\n");
+}
+
+#[test]
+fn set_unknown_flag_aborts_the_run() {
+    let out = iish("set -k\necho should-not-print\n", &[]);
+    assert!(!out.status.success());
+    assert_eq!(stdout(&out), "");
+}
+
+#[test]
+fn brace_group_runs_its_statements_against_the_live_session() {
+    let base = scratch("brace-group");
+    let script = format!(
+        "{{ mkdir -p {0}; echo inside; }}\nrm -r {0}\n",
+        base.display()
+    );
+    let out = iish(&script, &[]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "inside\n");
+    assert!(
+        !base.exists(),
+        "the rm after the group should see the dir the group created"
+    );
+}
+
+#[test]
+fn brace_group_stops_the_whole_run_on_a_denial_inside_it() {
+    let out = iish("{ echo one; sudo rm -rf /; echo two; }\n", &[]);
+    assert!(!out.status.success());
+    assert_eq!(
+        stdout(&out),
+        "one\n",
+        "the statement before the denial should have run, but not the one after"
+    );
+}
+
+#[test]
+fn defining_a_function_has_no_effect_until_it_is_called() {
+    let out = iish("greet() { echo hello; }\necho before-call\n", &[]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(
+        stdout(&out),
+        "before-call\n",
+        "the definition alone must not run the body"
+    );
+}
+
+#[test]
+fn calling_a_defined_function_runs_its_body() {
+    let out = iish("greet() { echo hello from greet; }\ngreet\n", &[]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "hello from greet\n");
+}
+
+#[test]
+fn a_later_function_definition_replaces_an_earlier_one() {
+    let out = iish("f() { echo first; }\nf() { echo second; }\nf\n", &[]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "second\n");
+}
+
+#[test]
+fn self_recursive_function_is_refused_instead_of_overflowing_the_stack() {
+    let out = iish("f() { f; }\nf\n", &[]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("deep"), "stderr: {}", stderr(&out));
 }

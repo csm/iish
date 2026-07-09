@@ -31,9 +31,11 @@ no "pass through to bash" escape hatch.
 | Delete file/dir | Allowed only for paths this script created earlier in the run |
 | Network | HTTP(S) GET only, performed by iish itself (no arbitrary curl flags); no other protocols |
 | chmod / chown | `chmod` allowed on files the script created; `chown` ⇒ ask |
+| `cp` | Native, same rule as write/create above: new destination allowed, overwrite governed by `overwrite` — not the subprocess tier |
+| Function definitions (`name() { ... }`) and calls, brace groups (`{ ...; }`), `set -e`/`-u`/`-x`/`-o <option>` | Allowed — a definition just registers the body (nothing runs until called); a call or brace group recurses into its statements against the live session; `set`'s flags are no-ops (iish's execution model already fails fast) |
 | sudo | Not a command — an **execution context**. See "Privilege: the sudo broker" below |
-| Shells (`sh`/`bash`/`zsh`/`dash`/`ksh`), shell builtins (`cd`, `export`, `source`, `.`), pipelines, control flow, `eval` | Denied — no config knob reopens these; see "Core principle" |
-| Everything else — external binaries iish has no native implementation for (`cp`, `tar`, `apt-get`, `systemctl`, `sudo <cmd>` pre-broker, …) | **ask** by default (the "subprocess" tier); allow/ask/deny, globally or per command, in config — see "Configuration" |
+| Shells (`sh`/`bash`/`zsh`/`dash`/`ksh`), shell builtins (`cd`, `export`, `source`, `.`), pipelines, control flow (`if`/`for`/`while`/`case`), command lists (`&&`/`||`), `eval` | Denied — no config knob reopens these; see "Core principle" |
+| Everything else — external binaries iish has no native implementation for (`tar`, `apt-get`, `systemctl`, `sudo <cmd>` pre-broker, …) | **ask** by default (the "subprocess" tier); allow/ask/deny, globally or per command, in config — see "Configuration" |
 
 Policy verbs are **allow / ask / deny**. `ask` is load-bearing: the
 corpus shows sudo (10/17), package managers, systemctl, and running a
@@ -106,8 +108,9 @@ uname = "allow"
 `subprocess`, `overwrite`, `network`, `run-created`, `env-file-append`,
 and `[commands]` are live: they change what policy.rs's evaluator does
 today, including a **subprocess tier** for any external binary iish has
-no native implementation for (`cp`, `tar`, `apt-get`, `sudo <cmd>`
-pre-broker, …) — the literal, already-parsed argv is exec'd directly,
+no native implementation for (`tar`, `apt-get`, `sudo <cmd>`
+pre-broker, … — `cp` moved out of this tier into a native
+implementation) — the literal, already-parsed argv is exec'd directly,
 never through a shell, once allowed or confirmed — and the restricted
 `>>` env-file append grammar (milestone 6). Shells and shell builtins
 (`cd`, `export`, `source`, `.`) stay hard-denied regardless of config —
@@ -141,11 +144,19 @@ src/
                top-level syntax error. Also renders a `Word` to a
                literal string when it needs no expansion.
   policy.rs    The evaluator: walks `parser::ast` node by node and
-               produces a Verdict { Allow, Prompt(reason), Deny(reason) }
-               per top-level statement. Anything not yet implemented
-               (pipelines, control flow, functions, redirects,
-               expansions, ...) is denied here — the Unsupported→deny
-               posture now lives in the evaluator, not the parser.
+               produces a Verdict { Allow, Prompt(reason), Deny(reason),
+               Group(statements) } per top-level statement. `Group` is a
+               brace group or a call to a function defined earlier in
+               the run (state.rs's `Session` now also carries a function
+               table) — not a single compiled `Action`, since its nested
+               statements must be evaluated one at a time against the
+               live session, exactly like top-level statements; the
+               runner (main.rs) recurses for it, depth-limited to guard
+               against unbounded self-recursion. Anything still not
+               implemented (pipelines, control flow, most redirects,
+               most expansions, command lists, ...) is denied here —
+               the Unsupported→deny posture lives in the evaluator, not
+               the parser.
   config.rs    Layered policy (milestone 5): builtin `Config::default()`
                ← config file (TOML via serde) ← CLI overrides. Exposes
                `Verb` (allow/ask/deny) and `NetworkPolicy` per PLAN's
@@ -154,16 +165,19 @@ src/
                the documented schema.
   exec.rs      Native implementations of allowed operations. The policy
                compiles each allowed statement into a closed `Action`
-               enum (Print, MkDir, Remove, Chmod, Fetch, AppendFile,
-               Sha256Sum, Sha256Check, Subprocess, Noop); exec runs
-               actions in Rust — echo/printf rendering, dir creation,
-               ledger-checked rm/chmod, GET fetches via an in-process,
+               enum (Print, MkDir, Remove, Chmod, Copy, Fetch,
+               AppendFile, Sha256Sum, Sha256Check, Subprocess,
+               DefineFunction, Noop); exec runs actions in Rust —
+               echo/printf rendering, dir creation, ledger-checked
+               rm/chmod, native `cp` (governed by `overwrite`, like
+               `curl -o`/`wget -O`), GET fetches via an in-process,
                timeout- and redirect-bounded HTTP client (ureq) that
                refuses to downgrade an https:// fetch to plaintext on
                redirect, restricted-grammar rc-file appends, native
-               SHA-256 compute/verify, and direct fork/exec (never a
-               shell) of the subprocess tier's literal argv — and
-               records created paths in the ledger.
+               SHA-256 compute/verify, direct fork/exec (never a shell)
+               of the subprocess tier's literal argv, and registering a
+               function body for a later call — and records created
+               paths (and defined functions) in the ledger.
   prompt.rs    /dev/tty confirmation for `ask` verdicts (stdin carries
                the script); `--yes`/`--no` resolve asks without a tty
   broker.rs    (planned) privileged worker: `sudo iish --broker`,
@@ -225,10 +239,20 @@ doubles as the integration-test corpus later.
    `rm`/`chmod` to paths this run created. All other redirect shapes
    remain denied. *(done)*
 7. **Corpus as test suite** — the long-term goal is still "iish runs
-   the majority of the corpus to completion (with expected asks)", but
-   today's evaluator denies functions, control flow, and expansions
-   outright, so none of the 17 real corpus scripts get past their first
-   few lines yet. `scripts/verify-installers.sh` (Docker-isolated,
+   the majority of the corpus to completion (with expected asks)".
+   Function definitions and calls, brace groups, and the `set` builtin
+   (`-e`/`-u`/`-x`/`-o <option>` flags — no-ops, since iish's
+   fail-fast-on-any-error execution model already behaves as if
+   `errexit`/`nounset` were always on) are implemented; `cp` is native
+   too (PLAN's filesystem-mutation tier: create-only, overwrite governed
+   by `overwrite`, no config knob needed to reach it — unlike the
+   subprocess tier). The evaluator still denies control flow
+   (`if`/`for`/`while`/`case`), most expansions, and command lists
+   (`&&`/`||`), so none of the 17 real corpus scripts run to completion
+   yet, but several now progress past their own function/`set`/brace-group
+   setup and into real control flow or a real function call before
+   stopping — see the updated pins in `scripts/verify-installers.sh`.
+   `scripts/verify-installers.sh` (Docker-isolated,
    network-disabled, runnable in CI or by hand — see
    `.github/workflows/installer-verify.yml`) runs a curated,
    user-space-only subset of the corpus through the real binary and
@@ -246,7 +270,8 @@ doubles as the integration-test corpus later.
    could be a symlink; `exec.rs`'s `assert_no_symlink_escape` now
    refuses to operate through one for every native filesystem action
    (`mkdir`, `rm`, `chmod`, fetch-to-file, env-file append,
-   `sha256sum`). *(in progress — harness in place, corpus still
+   `sha256sum`, and now `cp`). *(in progress — harness in place,
+   functions/brace-groups/`set`/native `cp` landed, corpus still
    0/17 to completion)*
 8. **Sandboxing investigation** — Landlock/seccomp/Seatbelt for second
    stages (post-first-iteration).

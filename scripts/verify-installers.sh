@@ -133,7 +133,7 @@ fi
 # iish, non-interactively (--yes: approve every ask, the posture a CI
 # gate or unattended provisioning run would take). None of the 17
 # scripts in corpus/cache/ run to completion through iish today --
-# iish's evaluator still denies functions, control flow, and expansions
+# iish's evaluator still denies control flow and several expansions
 # outright (PLAN.md milestone 7 is "should run the majority of the
 # corpus to completion"; today is 0/17). So for each of these we pin
 # *why* it currently stops, as a regression guard: if the reason changes
@@ -148,35 +148,43 @@ set_corpus_expectation() {
     verify_cmd=()
     case "$1" in
         rustup)
-            expected_reason="function definitions are not implemented yet"
+            # Function definitions, brace groups, and `set` are all
+            # implemented now; this trips on the next unimplemented
+            # construct, a `cmd1 || cmd2` list, well past where it used
+            # to stop.
+            expected_reason="command lists joined by \`&&\`/\`||\` are not implemented yet"
             verify_cmd=(rustc --version)
             ;;
         zoxide)
-            expected_reason="function definitions are not implemented yet"
+            # Reached from inside a call to zoxide's own \`main\`
+            # function (a real function call, not just its definition)
+            # -- see the indented DENY in \`iish --dry-run\`'s output.
+            expected_reason="command lists joined by \`&&\`/\`||\` are not implemented yet"
             verify_cmd=(zoxide --version)
             ;;
         pnpm)
-            expected_reason="function definitions are not implemented yet"
+            expected_reason="if statements are not implemented yet"
             verify_cmd=(pnpm --version)
             ;;
         nvm)
-            expected_reason="brace groups are not implemented yet"
+            # Reached from inside a brace group actually running now.
+            expected_reason="if statements are not implemented yet"
             verify_cmd=(bash -lc 'source "$HOME/.nvm/nvm.sh" 2>/dev/null; command -v nvm')
             ;;
         starship)
-            # `set -eu`/`set -u` is approved by --yes as a subprocess
-            # (iish has no native `set`), then fails because `set` is a
-            # shell builtin with no real binary on $PATH -- a runtime
-            # failure, not a policy denial, but still "not to completion".
-            expected_reason="set: No such file or directory"
+            # `set -eu` is a recognized no-op now; this trips on the
+            # next unimplemented construct, a bare `VAR=value` prefix
+            # (command substitution as the value would be denied too,
+            # but the bare-assignment shape is what iish reports first).
+            expected_reason="bare variable assignment (\`VAR=value\`) is not implemented yet"
             verify_cmd=(starship --version)
             ;;
         atuin)
-            expected_reason="set: No such file or directory"
+            expected_reason="bare variable assignment (\`VAR=value\`) is not implemented yet"
             verify_cmd=(atuin --version)
             ;;
         deno)
-            expected_reason="set: No such file or directory"
+            expected_reason="if statements are not implemented yet"
             verify_cmd=(deno --version)
             ;;
         *)
@@ -268,7 +276,20 @@ for name in $adversarial_names; do
                 -v "$repo_root/corpus/adversarial:/adversarial:ro" \
                 -v "$home_dir:/home/tester" \
                 "$image_tag" adversarial "$mode" "/adversarial/$name.sh" "$setup" "$check" >"$log" 2>&1 || status=$?
-            rm -rf "$home_dir"
+
+            # setup/check snippets and iish itself all ran as the
+            # container's unprivileged "tester" user, which can leave
+            # files under $home_dir owned by a uid the host user isn't
+            # (a directory like .ssh made with the default 755 blocks
+            # a different-uid host process from unlinking anything
+            # inside it, even though $home_dir itself is world-writable).
+            # Recursively opening permissions from *inside* the image,
+            # as the same "tester" user that owns everything, sidesteps
+            # any host/container uid mismatch without needing sudo.
+            docker run --rm --network none --entrypoint chmod \
+                -v "$home_dir:/home/tester" \
+                "$image_tag" -R u+rwX,go+rwX /home/tester >/dev/null 2>&1 || true
+            rm -rf "$home_dir" || true
 
             if [ "$status" -eq 0 ]; then
                 pass "$name (--$mode): attack refused, nothing iish didn't own was touched"

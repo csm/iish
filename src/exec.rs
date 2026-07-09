@@ -8,6 +8,7 @@
 //! rather than a real curl/wget binary. Executing an action never
 //! re-interprets shell syntax.
 
+use crate::parser::ast;
 use crate::state::Session;
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -17,7 +18,12 @@ use std::time::Duration;
 
 /// A vetted operation, compiled by the policy from a statement it
 /// allowed (or will allow once the user confirms).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Not `PartialEq`/`Eq`: `DefineFunction` carries a `brush_parser::ast`
+/// node, which only derives those outside of brush-parser's own test
+/// build (see its `cfg_attr(any(test, feature = "serde"), ...)`).
+/// Nothing here ever compares two `Action`s, so this costs nothing.
+#[derive(Debug, Clone)]
 pub enum Action {
     /// `true`, `:`, `mkdir -p` on directories that all exist, …
     Noop,
@@ -51,6 +57,23 @@ pub enum Action {
     /// shell, so no word splitting, globbing, or expansion happens
     /// that the parser didn't already vet.
     Subprocess { name: String, args: Vec<String> },
+    /// `name() { ... }`: register `name` so a later call to it runs
+    /// `body` (a brace-group's statement list) — see policy.rs's
+    /// `Verdict::Group`. Defining a function has no effect beyond this;
+    /// nothing in `body` runs until the function is called.
+    DefineFunction {
+        name: String,
+        body: ast::CompoundList,
+    },
+    /// `cp [-r] SRC... DEST`: copy each `(src, dest)` pair natively.
+    /// Ledger rules mirror `curl -o`/`wget -O`: a new destination is
+    /// always fine, one this run already owns is fine to overwrite, and
+    /// a pre-existing foreign destination is governed by
+    /// `config.overwrite` (policy.rs's `evaluate_cp`).
+    Copy {
+        pairs: Vec<(PathBuf, PathBuf)>,
+        recursive: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +119,13 @@ pub fn execute(action: &Action, session: &mut Session) -> Result<(), String> {
         Action::Sha256Sum { paths } => paths.iter().try_for_each(|path| print_sha256(path)),
         Action::Sha256Check { entries } => verify_sha256(entries),
         Action::Subprocess { name, args } => run_subprocess(name, args),
+        Action::DefineFunction { name, body } => {
+            session.define_function(name.clone(), body.clone());
+            Ok(())
+        }
+        Action::Copy { pairs, recursive } => pairs
+            .iter()
+            .try_for_each(|(src, dest)| copy_path(src, dest, *recursive, session)),
     }
 }
 
@@ -114,6 +144,14 @@ pub fn record_would_create(action: &Action, session: &mut Session) {
             ..
         } => session.record_created(path),
         Action::AppendFile { path, .. } => session.record_created(path),
+        Action::DefineFunction { name, body } => {
+            session.define_function(name.clone(), body.clone())
+        }
+        Action::Copy { pairs, .. } => {
+            for (_, dest) in pairs {
+                session.record_created(dest);
+            }
+        }
         _ => {}
     }
 }
@@ -237,6 +275,75 @@ fn chmod(path: &Path, mode: Mode) -> Result<(), String> {
     };
     fs::set_permissions(path, fs::Permissions::from_mode(bits))
         .map_err(|e| format!("chmod: `{}`: {e}", path.display()))
+}
+
+/// `cp`: copy `src` to `dest`, recursing into a directory only when
+/// `recursive` was given (matching real `cp`'s `-r`/`-R` requirement).
+/// Both ends are checked for a symlink planted between the filesystem
+/// root and the leaf, same as every other native filesystem action
+/// here — a source symlink would let the script read a file it was
+/// never granted access to, and a destination symlink would let it
+/// write through to an arbitrary target. Only a new destination enters
+/// the ledger; overwriting a pre-existing one leaves it exactly as
+/// unowned as it was before (matching `fetch`'s rule).
+fn copy_path(
+    src: &Path,
+    dest: &Path,
+    recursive: bool,
+    session: &mut Session,
+) -> Result<(), String> {
+    assert_no_symlink_escape(src, false).map_err(|e| format!("cp: {e}"))?;
+    assert_no_symlink_escape(dest, false).map_err(|e| format!("cp: {e}"))?;
+    let existed = dest.exists();
+    let metadata =
+        fs::symlink_metadata(src).map_err(|e| format!("cp: `{}`: {e}", src.display()))?;
+    if metadata.is_dir() {
+        if !recursive {
+            return Err(format!(
+                "cp: `{}` is a directory (missing -r)",
+                src.display()
+            ));
+        }
+        copy_dir_recursive(src, dest)?;
+    } else if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "cp: `{}` is a symlink; refusing to copy through it",
+            src.display()
+        ));
+    } else {
+        fs::copy(src, dest)
+            .map_err(|e| format!("cp: `{}` -> `{}`: {e}", src.display(), dest.display()))?;
+    }
+    if !existed {
+        session.record_created(dest);
+    }
+    Ok(())
+}
+
+/// Recursive directory copy for `cp -r`: descends `src`, refusing to
+/// follow any symlink it finds along the way rather than silently
+/// copying whatever it points at.
+fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<(), String> {
+    fs::create_dir_all(dest).map_err(|e| format!("cp: `{}`: {e}", dest.display()))?;
+    for entry in fs::read_dir(src).map_err(|e| format!("cp: `{}`: {e}", src.display()))? {
+        let entry = entry.map_err(|e| format!("cp: `{}`: {e}", src.display()))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("cp: `{}`: {e}", entry.path().display()))?;
+        let target = dest.join(entry.file_name());
+        if file_type.is_symlink() {
+            return Err(format!(
+                "cp: `{}` is a symlink; refusing to copy through it",
+                entry.path().display()
+            ));
+        } else if file_type.is_dir() {
+            copy_dir_recursive(&entry.path(), &target)?;
+        } else {
+            fs::copy(entry.path(), &target)
+                .map_err(|e| format!("cp: `{}`: {e}", entry.path().display()))?;
+        }
+    }
+    Ok(())
 }
 
 /// GET-only fetch, hardened (milestone 6): fixed, generous timeouts so a
