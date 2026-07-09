@@ -135,8 +135,16 @@ src/
                expansions, ...) is denied here — the Unsupported→deny
                posture now lives in the evaluator, not the parser.
   config.rs    (planned) layered policy: builtins ← config file ← CLI
-  exec.rs      Native implementations of allowed operations
-               (file writes, env-file appends, GET fetches, tracked rm)
+  exec.rs      Native implementations of allowed operations. The policy
+               compiles each allowed statement into a closed `Action`
+               enum (Print, MkDir, Remove, Chmod, Fetch, Noop); exec
+               runs actions in Rust — echo/printf rendering, dir
+               creation, ledger-checked rm/chmod, and GET fetches via
+               an in-process HTTP client (ureq) — and records created
+               paths in the ledger. Env-file appends land in
+               milestone 6.
+  prompt.rs    /dev/tty confirmation for `ask` verdicts (stdin carries
+               the script); `--yes`/`--no` resolve asks without a tty
   broker.rs    (planned) privileged worker: `sudo iish --broker`,
                closed enum of operations over a socketpair (see
                "Privilege: the sudo broker")
@@ -171,9 +179,14 @@ doubles as the integration-test corpus later.
    expansions, ...) it doesn't yet implement. Unsupported→deny posture
    preserved, now enforced in the evaluator rather than the tokenizer.
    *(done)*
-4. **Execution + ledger** — native implementations of the allowed
-   tiers, session ledger, `/dev/tty` prompting, and the sudo broker
-   (unprivileged path first; broker can trail as 4b).
+4. ~~**Execution + ledger**~~ — interleaved native execution of the
+   allowed tiers (echo/printf, mkdir, ledger-checked rm and chmod,
+   curl/wget GETs performed by iish's own HTTP client with
+   prompt-before-overwrite), session ledger wired through execution,
+   `/dev/tty` prompting with `--yes`/`--no` overrides, and `--dry-run`
+   keeping the static report (with simulated ledger). *(done)*
+   - 4b. **Sudo broker** — the privileged worker described above; not
+     started.
 5. **Configuration** — config-file policy + CLI overrides (see above).
 6. **Harden** — redirects, env-file append grammar, GET-only HTTP
    client, checksum verification.
