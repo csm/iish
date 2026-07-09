@@ -30,13 +30,54 @@ no "pass through to bash" escape hatch.
 | Append to shell env files (`~/.bashrc`, `~/.zshrc`, `~/.profile`, …) | Allowed only for a restricted grammar: `PATH=` additions, `export VAR=...`, `source`/`.` of a file the script created |
 | Delete file/dir | Allowed only for paths this script created earlier in the run |
 | Network | HTTP(S) GET only, performed by iish itself (no arbitrary curl flags); no other protocols |
-| chmod / chown | `chmod` allowed on files the script created; `chown`/`sudo` denied |
+| chmod / chown | `chmod` allowed on files the script created; `chown` ⇒ ask |
+| sudo | Not a command — an **execution context**. See "Privilege: the sudo broker" below |
 | Everything else (eval, exec, arbitrary binaries, pipes to sh, …) | Denied |
 
 Policy verbs are **allow / ask / deny**. `ask` is load-bearing: the
 corpus shows sudo (10/17), package managers, systemctl, and running a
 just-downloaded second stage are too common to deny outright and too
 consequential to allow silently (see `corpus/ANALYSIS.md`).
+
+## Privilege: the sudo broker (decided)
+
+`sudo <cmd>` is not allowed or denied as a unit. iish strips the
+`sudo`, evaluates the inner command under the exact same policy, and —
+if it passes — performs the operation through a privileged broker
+instead of handing root a shell.
+
+On the first operation needing root (elevation itself is an `ask`),
+iish runs `sudo iish --broker` once, prompting on `/dev/tty`, and holds
+a socketpair to it. The broker is not a shell: it accepts a closed enum
+of structured requests — `CreateDir`, `WriteFile{path, bytes, mode}`,
+`Chmod`, `Chown`, `Remove`, `Symlink`, `Stat`, `ExecArgv` — and nothing
+else. Parsing, policy, and prompting stay in the unprivileged parent;
+the broker executes only already-vetted operations. `sudo rm -rf /`
+dies on the same ledger rule as unprivileged `rm`. No escalation
+surface beyond the user's existing sudo rights.
+
+How this maps onto real sudo usage (corpus/ANALYSIS.md §6):
+
+1. **Root file ops** (most frequent: `sudo tee` of apt sources and
+   systemd units, `sudo mkdir/chmod/chown/cp`) → iish's native tier,
+   executed by the broker. Full mediation: create-only writes,
+   overwrite prompts, ledger tracking.
+2. **sudo bookkeeping** (`sudo -v`, `sudo -n -v`, existence probes) →
+   broker authentication or no-ops.
+3. **External root binaries** (`systemctl`, package managers,
+   `gpg --import`) → still **ask**, but the broker execs a fixed,
+   fully-expanded argv with a sanitized environment: the user confirms
+   exactly what runs, with no shell in between.
+
+`sudo sh -c '…'` (docker/k3s pattern): the inner string is fed back
+through iish's own parser and policy — recursively transparent.
+
+Caveats accepted with the design:
+- Restrictive sudoers (user may run only specific commands) can't
+  launch the broker → degrade to per-command real sudo with fixed
+  argv, losing native mediation but keeping argv transparency.
+- Existence/overwrite checks for root-only-readable paths must happen
+  broker-side (`Stat`), not in the unprivileged parent.
 
 ## Configuration
 
@@ -55,10 +96,11 @@ overwrite = "ask"         # writing over pre-existing files
 env-file-append = "ask"   # rc/profile appends (restricted grammar)
 run-created = "ask"       # executing files the script created
 network = "get-only"      # get-only|deny
+elevate = "ask"           # first use of the sudo broker: allow|ask|deny
 
 [commands]                # per-command overrides
-sudo = "deny"
 "apt-get" = "ask"
+systemctl = "deny"
 uname = "allow"
 ```
 
@@ -91,6 +133,9 @@ src/
   config.rs    (planned) layered policy: builtins ← config file ← CLI
   exec.rs      Native implementations of allowed operations
                (file writes, env-file appends, GET fetches, tracked rm)
+  broker.rs    (planned) privileged worker: `sudo iish --broker`,
+               closed enum of operations over a socketpair (see
+               "Privilege: the sudo broker")
   state.rs     Session ledger: paths created during this run — the
                source of truth for "may delete / may chmod / may run"
 ```
@@ -117,8 +162,9 @@ doubles as the integration-test corpus later.
 3. **Real parser** — adopt a shell-grammar crate, walk its AST with an
    interleaved evaluator; Unsupported→deny posture preserved.
 4. **Execution + ledger** — native implementations of the allowed
-   tiers, session ledger, `/dev/tty` prompting.
-5. **Configuration** — config-file policy + CLI overrides (see below).
+   tiers, session ledger, `/dev/tty` prompting, and the sudo broker
+   (unprivileged path first; broker can trail as 4b).
+5. **Configuration** — config-file policy + CLI overrides (see above).
 6. **Harden** — redirects, env-file append grammar, GET-only HTTP
    client, checksum verification.
 7. **Corpus as test suite** — iish should run the majority of the

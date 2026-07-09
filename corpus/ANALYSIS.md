@@ -108,3 +108,29 @@ Notable specifics:
    common to deny and too dangerous to allow.
 4. Native value-adds fall out for free: GET-only fetching, checksum
    verification, ledger-tracked temp dirs, restricted rc-appends.
+
+## 6. What sudo is actually used for
+
+Categorizing every `sudo`/`$SUDO`/`$sh_c` invocation across the 10
+scripts that escalate:
+
+1. **Root file operations** — the most frequent bucket: `sudo tee` of
+   apt source lists (tailscale) and systemd unit files (k3s),
+   `sudo mkdir -p`, `sudo chmod/chown/chgrp` (homebrew does this in
+   bulk), `sudo cp`. All of these are operations iish already mediates
+   natively for the unprivileged case.
+2. **sudo bookkeeping** — `sudo -v`, `sudo -n -v` credential checks,
+   probes for sudo/doas existence, `id -u` root tests.
+3. **External root binaries** — `systemctl enable/daemon-reload`
+   (docker, k3s, ollama, tailscale), package managers
+   (`apt-get`/`dnf`/`yum` update+install), `gpg --import` (rvm),
+   `xcode-select`/`xcodebuild -license` (homebrew), `lshw` (ollama).
+4. **`sudo sh -c '…'`** — docker wraps *every* mutating command in
+   `sh_c='sudo -E sh -c'`; k3s and tailscale use `$SUDO sh -c` for
+   redirection-as-root.
+
+**Implication (adopted in PLAN.md):** buckets 1–2 are fully coverable
+by a privileged iish broker executing the same native, ledger-checked
+operations as the unprivileged path; bucket 4 becomes transparent by
+recursively parsing the `sh -c` string; bucket 3 remains `ask` but
+gains fixed-argv, sanitized-env execution with no shell in between.
