@@ -67,13 +67,9 @@ fn push_literal_piece(piece: &WordPiece, out: &mut String, unquoted: bool) -> Re
             }
             Ok(())
         }
-        WordPiece::AnsiCQuotedText(_) => {
-            Err("ANSI-C quoting ($'...') is not supported yet".into())
-        }
+        WordPiece::AnsiCQuotedText(_) => Err("ANSI-C quoting ($'...') is not supported yet".into()),
         WordPiece::TildeExpansion(_) => Err("tilde expansion is not supported yet".into()),
-        WordPiece::ParameterExpansion(_) => {
-            Err("variable expansion is not supported yet".into())
-        }
+        WordPiece::ParameterExpansion(_) => Err("variable expansion is not supported yet".into()),
         WordPiece::CommandSubstitution(_) | WordPiece::BackquotedCommandSubstitution(_) => {
             Err("command substitution is not supported yet".into())
         }
