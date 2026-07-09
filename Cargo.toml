@@ -6,3 +6,4 @@ description = "A safe interpreter for curl-pipe-to-shell install scripts"
 license = "MIT"
 
 [dependencies]
+brush-parser = { version = "0.4.0", default-features = false }
