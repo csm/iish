@@ -201,6 +201,57 @@ fn cp_copies_natively_without_the_subprocess_tier() {
 }
 
 #[test]
+fn cp_copies_a_source_reached_through_a_symlinked_directory() {
+    // The merged-usr shape (`/bin -> usr/bin` on Debian and friends):
+    // copying *out of* a symlinked directory is an ordinary read, not a
+    // symlink escape, and real installers do it all the time.
+    let base = scratch("cp-src-symlinked-bin");
+    fs::create_dir_all(base.join("usr/bin")).unwrap();
+    fs::write(base.join("usr/bin/tool"), b"tool bytes").unwrap();
+    std::os::unix::fs::symlink("usr/bin", base.join("bin")).unwrap();
+    let dst = base.join("installed-tool");
+    let out = iish(
+        &format!("cp {}/bin/tool {}\n", base.display(), dst.display()),
+        &[],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(fs::read(&dst).unwrap(), b"tool bytes");
+    fs::remove_dir_all(&base).unwrap();
+}
+
+#[test]
+fn stderr_redirect_to_dev_null_silences_a_subprocess() {
+    let base = scratch("stderr-devnull");
+    // `ls` of a missing path exits non-zero and complains on stderr;
+    // `|| true` keeps the failure from aborting the run, so the only
+    // question left is whether the complaint itself was discarded.
+    // (iish echoes each statement it runs — including the path — on its
+    // own stderr, so the assertions look for ls's complaint text, which
+    // only the child process produces.)
+    let script = format!("ls {}/missing 2> /dev/null || true\n", base.display());
+    let out = iish(&script, &["--yes"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        !stderr(&out).contains("No such file"),
+        "the subprocess's stderr must go to /dev/null, got: {}",
+        stderr(&out)
+    );
+
+    // Same command without the redirect: the complaint comes through,
+    // proving the quiet run above was the redirect's doing.
+    let noisy = iish(
+        &format!("ls {}/missing || true\n", base.display()),
+        &["--yes"],
+    );
+    assert!(noisy.status.success(), "stderr: {}", stderr(&noisy));
+    assert!(
+        stderr(&noisy).contains("No such file"),
+        "without the redirect the complaint should reach stderr, got: {}",
+        stderr(&noisy)
+    );
+}
+
+#[test]
 fn cp_overwriting_a_foreign_file_is_refused_with_no() {
     let base = scratch("cp-native-overwrite");
     fs::create_dir_all(&base).unwrap();

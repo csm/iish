@@ -148,12 +148,12 @@ set_corpus_expectation() {
     verify_cmd=()
     case "$1" in
         rustup)
-            # Function definitions, brace groups, `set`, and `&&`/`||`
-            # command lists are all implemented now (so the `||` that
-            # used to stop this one no longer does); this trips on the
-            # next unimplemented construct, a `2>` stderr redirect (only
-            # a single `>>` onto a plain filename is supported).
-            expected_reason="redirection is only implemented for a single \`>>\` onto a plain filename"
+            # `2> /dev/null` stderr redirects are implemented now (so
+            # the redirect that used to stop this one no longer does):
+            # `has_local 2>/dev/null` actually calls into has_local's
+            # body, which trips on `local`, a shell builtin iish has no
+            # binary to exec and doesn't implement.
+            expected_reason="\`local\` is a shell builtin; iish does not implement it"
             verify_cmd=(rustc --version)
             ;;
         zoxide)

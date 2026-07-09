@@ -418,11 +418,14 @@ fn evaluate_simple_command(
     };
 
     let mut args: Vec<String> = Vec::new();
-    // The only redirect shape iish understands at all: a single `>>`
-    // onto a plain filename. Anything else (fds, `<`, `>`, heredocs,
-    // process substitution as a redirect target, more than one
-    // redirect, ...) is denied below.
+    // The only redirect shapes iish understands at all: a single `>>`
+    // onto a plain filename, and a single `2> /dev/null` (discarding
+    // stderr writes nothing anywhere, so there is no path or content to
+    // vet). Anything else (other fds, `<`, `>`, `2>` onto a real file,
+    // heredocs, process substitution as a redirect target, repeats of
+    // either supported shape, ...) is denied below.
     let mut append_target: Option<&ast::Word> = None;
+    let mut discard_stderr = false;
     let mut unsupported_redirect = false;
     if let Some(suffix) = &cmd.suffix {
         for item in &suffix.0 {
@@ -444,6 +447,16 @@ fn evaluate_simple_command(
                     ) if append_target.is_none() => {
                         append_target = Some(target);
                     }
+                    ast::IoRedirect::File(
+                        Some(2),
+                        ast::IoFileRedirectKind::Write,
+                        ast::IoFileRedirectTarget::Filename(target),
+                    ) if !discard_stderr
+                        && literal_word(target, session.variables()).ok().as_deref()
+                            == Some("/dev/null") =>
+                    {
+                        discard_stderr = true;
+                    }
                     _ => unsupported_redirect = true,
                 },
                 ast::CommandPrefixOrSuffixItem::ProcessSubstitution(..) => {
@@ -456,12 +469,12 @@ fn evaluate_simple_command(
     if unsupported_redirect {
         return deny(
             "redirection is only implemented for a single `>>` onto a plain filename \
-             (see the env-file append grammar)",
+             (see the env-file append grammar) and `2> /dev/null`",
         );
     }
 
     match append_target {
-        None => evaluate_argv(&name, &args, session, config),
+        None => evaluate_argv(&name, &args, discard_stderr, session, config),
         Some(target) if matches!(name.as_str(), "echo" | "printf") => {
             evaluate_env_file_append(&name, &args, target, session, config)
         }
@@ -471,14 +484,27 @@ fn evaluate_simple_command(
     }
 }
 
-fn evaluate_argv(name: &str, args: &[String], session: &Session, config: &Config) -> Verdict {
+/// `discard_stderr` is a `2> /dev/null` on the command. Only the
+/// subprocess tier consults it (the child's stderr goes to the null
+/// device); every native implementation writes the script's output to
+/// stdout only — anything on iish's own stderr is iish diagnosing the
+/// run, not the command's output — so for them it is already true.
+fn evaluate_argv(
+    name: &str,
+    args: &[String],
+    discard_stderr: bool,
+    session: &Session,
+    config: &Config,
+) -> Verdict {
     // A function defined earlier in the run shadows everything below,
     // exactly as it would in bash (function lookup happens before
     // builtins or a $PATH search). The call's own arguments are not
     // bound to `$1`/`$@` inside the body — positional-parameter
     // expansion isn't implemented — so a body that actually needs them
     // will simply deny at that specific statement, same as any other
-    // script that references an unsupported expansion.
+    // script that references an unsupported expansion. (A redirect on
+    // the call, e.g. `has_local 2> /dev/null`, applies to nothing here:
+    // the body's own statements are vetted and run individually.)
     if let Some(body) = session.lookup_function(name) {
         return Verdict::Group {
             statements: body.0.clone(),
@@ -512,11 +538,12 @@ fn evaluate_argv(name: &str, args: &[String], session: &Session, config: &Config
         )),
 
         // Shell builtins with no external binary: running them as a
-        // subprocess would either find no binary to exec, or (`cd`,
-        // `export`) run against a throwaway child process and have no
-        // effect on iish's own state. Not implemented, and not eligible
-        // for the subprocess tier below for that reason.
-        "cd" | "export" | "source" | "." => {
+        // subprocess would either find no binary to exec (`local`,
+        // `alias`), or (`cd`, `export`) run against a throwaway child
+        // process and have no effect on iish's own state. Not
+        // implemented, and not eligible for the subprocess tier below
+        // for that reason.
+        "cd" | "export" | "source" | "." | "local" | "alias" => {
             deny(format!("`{name}` is a shell builtin; iish does not implement it"))
         }
 
@@ -525,7 +552,7 @@ fn evaluate_argv(name: &str, args: &[String], session: &Session, config: &Config
         // managers, ...). Governed by the "subprocess" policy
         // (milestone 5, PLAN.md "Configuration") — allow/ask/deny,
         // globally or per command.
-        other => evaluate_subprocess(other, args, session, config),
+        other => evaluate_subprocess(other, args, discard_stderr, session, config),
     }
 }
 
@@ -535,10 +562,17 @@ fn evaluate_argv(name: &str, args: &[String], session: &Session, config: &Config
 /// how `sudo <cmd>` behaves until the sudo broker (milestone 4b) lands:
 /// exactly the "degrade to per-command real sudo with fixed argv"
 /// fallback PLAN.md's sudo-broker caveats describe.
-fn evaluate_subprocess(name: &str, args: &[String], session: &Session, config: &Config) -> Verdict {
+fn evaluate_subprocess(
+    name: &str,
+    args: &[String],
+    discard_stderr: bool,
+    session: &Session,
+    config: &Config,
+) -> Verdict {
     let action = Action::Subprocess {
         name: name.to_string(),
         args: args.to_vec(),
+        discard_stderr,
     };
     let verb = config.command_override(name).unwrap_or_else(|| {
         if runs_a_created_path(name, session) {
@@ -1616,11 +1650,17 @@ mod tests {
         // `sudo <cmd>` behaves pre-broker.
         match verdict("sudo make install") {
             Prompt {
-                action: Action::Subprocess { name, args },
+                action:
+                    Action::Subprocess {
+                        name,
+                        args,
+                        discard_stderr,
+                    },
                 ..
             } => {
                 assert_eq!(name, "sudo");
                 assert_eq!(args, vec!["make", "install"]);
+                assert!(!discard_stderr);
             }
             other => panic!("expected prompt/subprocess, got {other:?}"),
         }
@@ -1697,6 +1737,17 @@ mod tests {
         };
         assert!(matches!(
             verdict_with_config("cd /tmp", &Session::new(), &config),
+            Deny { .. }
+        ));
+        // `local`/`alias` too: there is no binary to exec, so sending
+        // them to the subprocess tier could only ever fail confusingly
+        // (or, worse, run an unrelated same-named binary on $PATH).
+        assert!(matches!(
+            verdict_with_config("local _has_local", &Session::new(), &config),
+            Deny { .. }
+        ));
+        assert!(matches!(
+            verdict_with_config("alias local=typeset", &Session::new(), &config),
             Deny { .. }
         ));
     }
@@ -2342,6 +2393,51 @@ mod tests {
             Deny { .. }
         ));
         assert!(matches!(verdict("mkdir /tmp/a 2> /tmp/err"), Deny { .. }));
+    }
+
+    #[test]
+    fn stderr_to_dev_null_is_recognized_on_a_subprocess() {
+        match verdict("uname -a 2> /dev/null") {
+            Prompt {
+                action:
+                    Action::Subprocess {
+                        name,
+                        args,
+                        discard_stderr,
+                    },
+                ..
+            } => {
+                assert_eq!(name, "uname");
+                assert_eq!(args, vec!["-a"]);
+                assert!(discard_stderr, "2> /dev/null must reach the subprocess");
+            }
+            other => panic!("expected prompt/subprocess, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stderr_to_dev_null_is_recognized_on_a_native_command() {
+        // Natives never write the script's output to stderr, so the
+        // redirect is satisfied by doing nothing — the point is only
+        // that its presence must not deny an otherwise fine statement.
+        match verdict("echo hi 2> /dev/null") {
+            Allow {
+                action: Action::Print { text },
+                ..
+            } => assert_eq!(text, "hi\n"),
+            other => panic!("expected allow/print, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stderr_to_a_real_file_is_denied() {
+        // Only the literal null device qualifies: `2>` onto anything
+        // else is a real write iish would have to vet and doesn't.
+        assert!(matches!(verdict("uname -a 2> /tmp/err.log"), Deny { .. }));
+        // And only fd 2 with `>`: these near-misses stay denied too.
+        assert!(matches!(verdict("uname -a > /dev/null"), Deny { .. }));
+        assert!(matches!(verdict("uname -a 2>> /dev/null"), Deny { .. }));
+        assert!(matches!(verdict("uname -a 2>&1"), Deny { .. }));
     }
 
     #[test]
