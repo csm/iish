@@ -153,7 +153,9 @@ iish walks the AST, evaluating policy at each command execution.
 ## Corpus
 
 `corpus/fetch.sh` pulls 17 real installer scripts (rustup, homebrew,
-nvm, docker, k3s, nix, …) into `corpus/cache/` (not committed).
+nvm, docker, k3s, nix, …) into `corpus/cache/`, which is git-tracked
+(see `corpus/cache/README.md`) so sessions don't need network access
+to use it; run `corpus/fetch.sh --force` to refresh it from upstream.
 Findings that drive the design are in `corpus/ANALYSIS.md`. The cache
 doubles as the integration-test corpus later.
 

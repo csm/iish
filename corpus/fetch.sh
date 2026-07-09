@@ -1,16 +1,25 @@
 #!/bin/sh
 # Fetch the installer-script corpus into corpus/cache/ for analysis and
-# (eventually) integration testing. Scripts are pulled from their source
-# repos on raw.githubusercontent.com rather than their vanity URLs
-# (sh.rustup.rs, get.docker.com, ...) so a single host allowlist works.
-# The cache is not committed; re-run this to (re)populate it.
+# integration testing. Scripts are pulled from their source repos on
+# raw.githubusercontent.com rather than their vanity URLs (sh.rustup.rs,
+# get.docker.com, ...) so a single host allowlist works.
+#
+# The cache is git-tracked (see corpus/cache/README.md) so sessions
+# don't need network access just to re-run analysis or tests against
+# it. By default this script only fills in scripts that are missing;
+# pass --force to re-download everything and pick up upstream changes.
 set -eu
 cd "$(dirname "$0")"
 mkdir -p cache
 
+force=0
+case "${1:-}" in
+    --force|-f) force=1 ;;
+esac
+
 while IFS='	' read -r name url; do
     case "$name" in \#*|'') continue ;; esac
-    if [ -f "cache/$name.sh" ]; then
+    if [ "$force" -eq 0 ] && [ -f "cache/$name.sh" ]; then
         echo "have $name"
         continue
     fi
@@ -40,3 +49,6 @@ rvm	https://raw.githubusercontent.com/rvm/rvm/master/binscripts/rvm-installer
 zoxide	https://raw.githubusercontent.com/ajeetdsouza/zoxide/main/install.sh
 atuin	https://raw.githubusercontent.com/atuinsh/atuin/main/install.sh
 EOF
+
+date -u +"%Y-%m-%d" > cache/FETCHED_AT
+echo "cache last synced: $(cat cache/FETCHED_AT) (UTC)"
