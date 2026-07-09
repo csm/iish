@@ -1,0 +1,8 @@
+[package]
+name = "iish"
+version = "0.1.0"
+edition = "2021"
+description = "A safe interpreter for curl-pipe-to-shell install scripts"
+license = "MIT"
+
+[dependencies]
