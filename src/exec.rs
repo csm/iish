@@ -74,6 +74,15 @@ pub enum Action {
         pairs: Vec<(PathBuf, PathBuf)>,
         recursive: bool,
     },
+    /// `test`/`[ ]`: a side-effect-free expression, already evaluated to
+    /// its truth value by policy.rs at verdict time (the same moment
+    /// `mkdir`'s "does this path already exist?" check runs) since
+    /// nothing about it needs confirming or deferring.
+    Test { result: bool },
+    /// `VAR=value [VAR2=value2 ...]`: record each `(name, value)` in the
+    /// session's variable table for a later `$VAR` expansion to read
+    /// back. No filesystem or process side effects.
+    Assign { assignments: Vec<(String, String)> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,6 +135,38 @@ pub fn execute(action: &Action, session: &mut Session) -> Result<(), String> {
         Action::Copy { pairs, recursive } => pairs
             .iter()
             .try_for_each(|(src, dest)| copy_path(src, dest, *recursive, session)),
+        // Run as an ordinary statement (not the condition of an
+        // `if`/`while`/`until`), a `test`/`[` follows the same
+        // errexit-like posture as everything else here: a false result
+        // is a failure that aborts the run, not silently ignored.
+        Action::Test { result } => {
+            if *result {
+                Ok(())
+            } else {
+                Err("test: expression was false".to_string())
+            }
+        }
+        Action::Assign { assignments } => {
+            for (name, value) in assignments {
+                session.set_variable(name.clone(), value.clone());
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Like [`execute`], but reports an action's exit status as a `bool`
+/// instead of turning "ran fine but said no" into an `Err`. Every action
+/// except `Subprocess` and `Test` either fully succeeds or hits a real,
+/// unrecoverable error, so those still propagate as `Err` here too; only
+/// a subprocess's exit code and a test expression's result are the kind
+/// of "failure" bash's `if`/`while`/`until` conditions are specifically
+/// exempted from treating as fatal (see main.rs's `run_if`/`run_condition`).
+pub fn execute_returning_status(action: &Action, session: &mut Session) -> Result<bool, String> {
+    match action {
+        Action::Test { result } => Ok(*result),
+        Action::Subprocess { name, args } => run_subprocess_status(name, args),
+        other => execute(other, session).map(|()| true),
     }
 }
 
@@ -150,6 +191,11 @@ pub fn record_would_create(action: &Action, session: &mut Session) {
         Action::Copy { pairs, .. } => {
             for (_, dest) in pairs {
                 session.record_created(dest);
+            }
+        }
+        Action::Assign { assignments } => {
+            for (name, value) in assignments {
+                session.set_variable(name.clone(), value.clone());
             }
         }
         _ => {}
@@ -460,10 +506,7 @@ fn verify_sha256(entries: &[(String, PathBuf)]) -> Result<(), String> {
 /// does its own fork/exec, it does not consult `$SHELL`), inheriting
 /// this process's stdio so the child can prompt or stream output.
 fn run_subprocess(name: &str, args: &[String]) -> Result<(), String> {
-    let status = std::process::Command::new(name)
-        .args(args)
-        .status()
-        .map_err(|e| format!("{name}: {e}"))?;
+    let status = spawn(name, args)?;
     if status.success() {
         Ok(())
     } else {
@@ -473,6 +516,20 @@ fn run_subprocess(name: &str, args: &[String]) -> Result<(), String> {
             .unwrap_or_else(|| "a signal".to_string());
         Err(format!("{name}: failed ({how})"))
     }
+}
+
+/// Same fork/exec as [`run_subprocess`], but reports success as a `bool`
+/// rather than turning a non-zero exit into an `Err` — a real spawn
+/// failure (missing binary, ...) still is one.
+fn run_subprocess_status(name: &str, args: &[String]) -> Result<bool, String> {
+    Ok(spawn(name, args)?.success())
+}
+
+fn spawn(name: &str, args: &[String]) -> Result<std::process::ExitStatus, String> {
+    std::process::Command::new(name)
+        .args(args)
+        .status()
+        .map_err(|e| format!("{name}: {e}"))
 }
 
 #[cfg(test)]

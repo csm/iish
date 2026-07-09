@@ -16,6 +16,11 @@ pub struct Session {
     /// brace-group body that a call should run (see policy.rs's
     /// `Verdict::Group`).
     functions: HashMap<String, ast::CompoundList>,
+    /// Shell variables assigned by a bare `VAR=value` statement so far
+    /// this run (parser.rs's `literal_word` reads these back for a
+    /// later `$VAR`/`${VAR}` expansion, falling back to the real process
+    /// environment only when a name was never assigned here).
+    variables: HashMap<String, String>,
 }
 
 impl Session {
@@ -48,6 +53,18 @@ impl Session {
     /// in this run.
     pub fn lookup_function(&self, name: &str) -> Option<&ast::CompoundList> {
         self.functions.get(name)
+    }
+
+    /// Record a `VAR=value` assignment, overwriting any earlier value —
+    /// matching bash, where a later assignment replaces an earlier one.
+    pub fn set_variable(&mut self, name: impl Into<String>, value: impl Into<String>) {
+        self.variables.insert(name.into(), value.into());
+    }
+
+    /// The variables assigned so far this run, for `$VAR`/`${VAR}`
+    /// expansion (parser.rs's `literal_word`).
+    pub fn variables(&self) -> &HashMap<String, String> {
+        &self.variables
     }
 }
 
