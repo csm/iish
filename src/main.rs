@@ -1,9 +1,10 @@
 //! iish — a safe interpreter for `curl … | sh` install scripts.
 //!
-//! Reads a bash script from a file argument or stdin, parses it, and
-//! evaluates every statement against an installer safety policy.
-//! Currently runs in plan/report mode: it shows what it would allow,
-//! prompt for, or refuse. Native execution is milestone 2 (see PLAN.md).
+//! Reads a bash script from a file argument or stdin, parses it with
+//! brush-parser, and evaluates every statement against an installer
+//! safety policy. Currently runs in plan/report mode: it shows what it
+//! would allow, prompt for, or refuse. Native execution is milestone 4
+//! (see PLAN.md).
 
 mod exec;
 mod parser;
@@ -42,22 +43,26 @@ fn main() -> ExitCode {
         }
     };
 
-    let nodes = parser::parse(&script);
-    if nodes.is_empty() {
+    let program = match parser::parse(&script) {
+        Ok(program) => program,
+        Err(reason) => {
+            eprintln!("iish: could not parse script: {reason}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let session = state::Session::new();
+    let statements = policy::evaluate_program(&program, &session);
+    if statements.is_empty() {
         eprintln!("iish: script contains no commands");
         return ExitCode::FAILURE;
     }
 
-    let session = state::Session::new();
     let mut denied = 0usize;
 
-    println!("iish plan ({} statements):", nodes.len());
-    for node in &nodes {
-        let raw = match node {
-            parser::Node::Simple(cmd) => &cmd.raw,
-            parser::Node::Unsupported { raw, .. } => raw,
-        };
-        let (tag, detail) = match policy::evaluate(node, &session) {
+    println!("iish plan ({} statements):", statements.len());
+    for policy::Statement { raw, verdict } in &statements {
+        let (tag, detail) = match verdict {
             Verdict::Allow(why) => ("ALLOW ", why),
             Verdict::Prompt(why) => ("PROMPT", why),
             Verdict::Deny(why) => {

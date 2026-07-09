@@ -122,14 +122,18 @@ plus `--yes`/`--no` to resolve every `ask` non-interactively.
 ```
 src/
   main.rs      CLI entry: read script (stdin or file), interpret
-  parser.rs    bash → AST. Currently a minimal hand-rolled parser for
-               simple commands; anything it can't parse becomes an
-               explicit Unsupported node (which policy denies).
-               To be replaced by **brush-parser** (decided — parses
+  parser.rs    Thin wrapper around **brush-parser** (decided — parses
                17/17 corpus scripts vs yash-syntax's 13/17, MIT vs
-               GPL; see docs/parser-eval.md). The Unsupported→deny
-               posture moves into the evaluator.
-  policy.rs    command → Verdict { Allow, Ask(reason), Deny(reason) }
+               GPL; see docs/parser-eval.md): hands it the script and
+               returns its AST (`parser::ast`, re-exported), or a
+               top-level syntax error. Also renders a `Word` to a
+               literal string when it needs no expansion.
+  policy.rs    The evaluator: walks `parser::ast` node by node and
+               produces a Verdict { Allow, Prompt(reason), Deny(reason) }
+               per top-level statement. Anything not yet implemented
+               (pipelines, control flow, functions, redirects,
+               expansions, ...) is denied here — the Unsupported→deny
+               posture now lives in the evaluator, not the parser.
   config.rs    (planned) layered policy: builtins ← config file ← CLI
   exec.rs      Native implementations of allowed operations
                (file writes, env-file appends, GET fetches, tracked rm)
@@ -149,7 +153,9 @@ iish walks the AST, evaluating policy at each command execution.
 ## Corpus
 
 `corpus/fetch.sh` pulls 17 real installer scripts (rustup, homebrew,
-nvm, docker, k3s, nix, …) into `corpus/cache/` (not committed).
+nvm, docker, k3s, nix, …) into `corpus/cache/`, which is git-tracked
+(see `corpus/cache/README.md`) so sessions don't need network access
+to use it; run `corpus/fetch.sh --force` to refresh it from upstream.
 Findings that drive the design are in `corpus/ANALYSIS.md`. The cache
 doubles as the integration-test corpus later.
 
@@ -159,9 +165,12 @@ doubles as the integration-test corpus later.
    policy stub, report mode. *(done)*
 2. ~~**Corpus**~~ — fetch + empirical analysis of real installers.
    *(done — see corpus/ANALYSIS.md)*
-3. **Real parser** — adopt brush-parser (decided, docs/parser-eval.md),
-   walk its AST with an interleaved evaluator; Unsupported→deny
-   posture preserved.
+3. ~~**Real parser**~~ — adopted brush-parser (decided,
+   docs/parser-eval.md); the evaluator walks its AST directly, denying
+   every construct (pipelines, control flow, functions, redirects,
+   expansions, ...) it doesn't yet implement. Unsupported→deny posture
+   preserved, now enforced in the evaluator rather than the tokenizer.
+   *(done)*
 4. **Execution + ledger** — native implementations of the allowed
    tiers, session ledger, `/dev/tty` prompting, and the sudo broker
    (unprivileged path first; broker can trail as 4b).
