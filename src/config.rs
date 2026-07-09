@@ -4,12 +4,11 @@
 //! PLAN.md's "Configuration" section for the schema this mirrors.
 //!
 //! Not every knob is consulted by the evaluator yet: `subprocess`,
-//! `run-created`, `overwrite`, `network`, and per-command overrides all
-//! change behavior today (see policy.rs). `env-file-append` and
-//! `elevate` are accepted here — so a config file written against
-//! PLAN.md's sketch parses cleanly — but nothing consults them until
-//! the env-file grammar (milestone 6) and the sudo broker (milestone
-//! 4b) exist.
+//! `run-created`, `overwrite`, `network`, `env-file-append`, and
+//! per-command overrides all change behavior today (see policy.rs).
+//! `elevate` is accepted here — so a config file written against
+//! PLAN.md's sketch parses cleanly — but nothing consults it until the
+//! sudo broker (milestone 4b) exists.
 
 use serde::{Deserialize, Deserializer};
 use std::collections::HashMap;

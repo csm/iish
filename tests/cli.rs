@@ -41,6 +41,33 @@ fn iish_raw(script: &str, args: &[&str]) -> Output {
     child.wait_with_output().unwrap()
 }
 
+/// Like `iish`, but with `$HOME` overridden to `home` — for env-file
+/// append tests, which must never touch the real invoking user's rc
+/// files.
+fn iish_with_home(script: &str, args: &[&str], home: &std::path::Path) -> Output {
+    let mut all_args = vec!["--no-config"];
+    all_args.extend_from_slice(args);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_iish"));
+    for var in ["http_proxy", "https_proxy", "all_proxy"] {
+        command.env_remove(var).env_remove(var.to_uppercase());
+    }
+    command.env("HOME", home);
+    let mut child = command
+        .args(&all_args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("iish should spawn");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
 fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
@@ -311,5 +338,120 @@ fn script_file_argument_is_supported() {
     let out = iish("", &[script_path.to_str().unwrap()]);
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     assert_eq!(stdout(&out), "from-a-file\n");
+    fs::remove_dir_all(&base).unwrap();
+}
+
+#[test]
+fn env_file_append_writes_restricted_grammar_with_yes() {
+    let home = scratch("env-home");
+    fs::create_dir_all(&home).unwrap();
+    let out = iish_with_home(
+        "echo 'export PATH=\"/opt/tool/bin:$PATH\"' >> ~/.bashrc\n",
+        &["--yes"],
+        &home,
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(
+        fs::read_to_string(home.join(".bashrc")).unwrap(),
+        "export PATH=\"/opt/tool/bin:$PATH\"\n"
+    );
+    fs::remove_dir_all(&home).unwrap();
+}
+
+#[test]
+fn env_file_append_declined_with_no_leaves_no_file() {
+    let home = scratch("env-home-no");
+    fs::create_dir_all(&home).unwrap();
+    let out = iish_with_home("echo 'export FOO=bar' >> ~/.bashrc\n", &["--no"], &home);
+    assert!(!out.status.success());
+    assert!(!home.join(".bashrc").exists());
+    fs::remove_dir_all(&home).unwrap();
+}
+
+#[test]
+fn env_file_append_rejects_lines_outside_the_grammar() {
+    let home = scratch("env-home-bad");
+    fs::create_dir_all(&home).unwrap();
+    let out = iish_with_home("echo 'rm -rf /' >> ~/.bashrc\n", &["--yes"], &home);
+    assert!(!out.status.success());
+    assert!(!home.join(".bashrc").exists());
+    fs::remove_dir_all(&home).unwrap();
+}
+
+#[test]
+fn env_file_append_rejects_files_outside_home() {
+    let base = scratch("env-outside");
+    fs::create_dir_all(&base).unwrap();
+    let target = base.join(".bashrc");
+    let out = iish(
+        &format!("echo 'export FOO=bar' >> {}\n", target.display()),
+        &["--yes"],
+    );
+    assert!(!out.status.success());
+    assert!(!target.exists());
+    fs::remove_dir_all(&base).unwrap();
+}
+
+#[test]
+fn sha256sum_check_verifies_a_downloaded_file_against_a_downloaded_checksum() {
+    let base = scratch("sha256-e2e");
+    fs::create_dir_all(&base).unwrap();
+    let target = base.join("payload.bin");
+    let checklist = base.join("payload.bin.sha256");
+
+    let payload_url = serve(b"hello-world", 1);
+    let checksum_line = format!(
+        "afa27b44d43b02a9fea41d13cedc2e4016cfcf87c5dbf990e593669aa8ce286d  {}",
+        target.display()
+    );
+    let checksum_body: &'static [u8] = Box::leak(checksum_line.into_bytes().into_boxed_slice());
+    let checksum_url = serve(checksum_body, 1);
+
+    let script = format!(
+        "curl -fsSLo {t} {payload_url}\ncurl -fsSLo {c} {checksum_url}\nsha256sum -c {c}\n",
+        t = target.display(),
+        c = checklist.display(),
+    );
+    let out = iish(&script, &[]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains(&format!("{}: OK", target.display())),
+        "stdout: {}",
+        stdout(&out)
+    );
+    fs::remove_dir_all(&base).unwrap();
+}
+
+#[test]
+fn sha256sum_check_fails_on_mismatch() {
+    let base = scratch("sha256-mismatch");
+    fs::create_dir_all(&base).unwrap();
+    let target = base.join("payload.bin");
+    let checklist = base.join("payload.bin.sha256");
+
+    let payload_url = serve(b"tampered-content", 1);
+    let checksum_line = format!("{}  {}", "0".repeat(64), target.display());
+    let checksum_body: &'static [u8] = Box::leak(checksum_line.into_bytes().into_boxed_slice());
+    let checksum_url = serve(checksum_body, 1);
+
+    let script = format!(
+        "curl -fsSLo {t} {payload_url}\ncurl -fsSLo {c} {checksum_url}\nsha256sum -c {c}\n",
+        t = target.display(),
+        c = checklist.display(),
+    );
+    let out = iish(&script, &[]);
+    assert!(!out.status.success());
+    assert!(stdout(&out).contains("FAILED"), "stdout: {}", stdout(&out));
+    fs::remove_dir_all(&base).unwrap();
+}
+
+#[test]
+fn sha256sum_refuses_files_this_script_did_not_create() {
+    let base = scratch("sha256-foreign");
+    fs::create_dir_all(&base).unwrap();
+    let foreign = base.join("existing.txt");
+    fs::write(&foreign, b"not ours").unwrap();
+    let out = iish(&format!("sha256sum {}\n", foreign.display()), &[]);
+    assert!(!out.status.success());
     fs::remove_dir_all(&base).unwrap();
 }

@@ -15,6 +15,7 @@ use crate::config::{Config, NetworkPolicy, Verb};
 use crate::exec::{Action, FetchOutput, Mode};
 use crate::parser::{ast, literal_word};
 use crate::state::{self, Session};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,6 +193,12 @@ fn evaluate_simple_command(
     };
 
     let mut args: Vec<String> = Vec::new();
+    // The only redirect shape iish understands at all: a single `>>`
+    // onto a plain filename. Anything else (fds, `<`, `>`, heredocs,
+    // process substitution as a redirect target, more than one
+    // redirect, ...) is denied below.
+    let mut append_target: Option<&ast::Word> = None;
+    let mut unsupported_redirect = false;
     if let Some(suffix) = &cmd.suffix {
         for item in &suffix.0 {
             match item {
@@ -202,9 +209,16 @@ fn evaluate_simple_command(
                 ast::CommandPrefixOrSuffixItem::AssignmentWord(..) => {
                     return deny("assignment arguments are not implemented yet");
                 }
-                ast::CommandPrefixOrSuffixItem::IoRedirect(_) => {
-                    return deny("redirection is not implemented yet");
-                }
+                ast::CommandPrefixOrSuffixItem::IoRedirect(r) => match r {
+                    ast::IoRedirect::File(
+                        None,
+                        ast::IoFileRedirectKind::Append,
+                        ast::IoFileRedirectTarget::Filename(target),
+                    ) if append_target.is_none() => {
+                        append_target = Some(target);
+                    }
+                    _ => unsupported_redirect = true,
+                },
                 ast::CommandPrefixOrSuffixItem::ProcessSubstitution(..) => {
                     return deny("process substitution is not implemented yet");
                 }
@@ -212,7 +226,22 @@ fn evaluate_simple_command(
         }
     }
 
-    evaluate_argv(&name, &args, session, config)
+    if unsupported_redirect {
+        return deny(
+            "redirection is only implemented for a single `>>` onto a plain filename \
+             (see the env-file append grammar)",
+        );
+    }
+
+    match append_target {
+        None => evaluate_argv(&name, &args, session, config),
+        Some(target) if matches!(name.as_str(), "echo" | "printf") => {
+            evaluate_env_file_append(&name, &args, target, session, config)
+        }
+        Some(_) => deny(format!(
+            "redirecting `{name}`'s output is not implemented yet"
+        )),
+    }
 }
 
 fn evaluate_argv(name: &str, args: &[String], session: &Session, config: &Config) -> Verdict {
@@ -229,6 +258,7 @@ fn evaluate_argv(name: &str, args: &[String], session: &Session, config: &Config
         "chmod" => evaluate_chmod(args, session),
         "curl" => evaluate_curl(args, session, config),
         "wget" => evaluate_wget(args, session, config),
+        "sha256sum" => evaluate_sha256sum(args, session),
 
         // A shell is exactly what iish exists to replace; no config
         // knob may reopen this escape hatch (see PLAN.md's "no pass
@@ -293,7 +323,292 @@ fn runs_a_created_path(name: &str, session: &Session) -> bool {
     name.contains('/') && session.owns(&state::normalize(Path::new(name)))
 }
 
+/// rc/profile files iish will append to, matching PLAN.md's "Append to
+/// shell env files" row. Only recognized when they sit directly in
+/// `$HOME` — a same-named file elsewhere is not a shell startup file.
+const ENV_FILE_NAMES: &[&str] = &[
+    ".bashrc",
+    ".bash_profile",
+    ".bash_login",
+    ".profile",
+    ".zshrc",
+    ".zprofile",
+    ".zshenv",
+    ".zlogin",
+];
+
+fn is_recognized_env_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    if !ENV_FILE_NAMES.contains(&name) {
+        return false;
+    }
+    match std::env::var("HOME") {
+        Ok(home) => path.parent() == Some(Path::new(&home)),
+        Err(_) => false,
+    }
+}
+
+/// `echo`/`printf ... >> rcfile`: appends are allowed only onto a
+/// recognized rc/profile file in `$HOME`, and only when every appended
+/// line matches PLAN's restricted grammar (`export VAR=...`, `PATH=...`,
+/// or `source`/`.` of a file this script created) — see
+/// `check_env_file_grammar`. Governed by `config.env_file_append`.
+fn evaluate_env_file_append(
+    name: &str,
+    args: &[String],
+    target: &ast::Word,
+    session: &Session,
+    config: &Config,
+) -> Verdict {
+    let text = match render_output(name, args) {
+        Ok(t) => t,
+        Err(reason) => return deny(reason),
+    };
+    let path_str = match literal_word(target) {
+        Ok(s) => s,
+        Err(reason) => return deny(reason),
+    };
+    let path = state::normalize(Path::new(&path_str));
+
+    if !is_recognized_env_file(&path) {
+        return deny(format!(
+            "`{}` is not a recognized shell rc/profile file in $HOME; env-file appends are \
+             restricted to {}",
+            path.display(),
+            ENV_FILE_NAMES.join(", ")
+        ));
+    }
+    if let Err(reason) = check_env_file_grammar(&text, session) {
+        return deny(format!("append to `{}` refused: {reason}", path.display()));
+    }
+
+    let action = Action::AppendFile {
+        path: path.clone(),
+        text,
+    };
+    match config.env_file_append {
+        Verb::Deny => deny(format!(
+            "appending to `{}` is disabled by configuration",
+            path.display()
+        )),
+        Verb::Ask => prompt(
+            format!(
+                "append to `{}` (matches the restricted env-file grammar)",
+                path.display()
+            ),
+            action,
+        ),
+        Verb::Allow => allow(
+            format!(
+                "appends only lines matching the restricted env-file grammar to `{}`",
+                path.display()
+            ),
+            action,
+        ),
+    }
+}
+
+/// Every non-blank line of an env-file append must be `export VAR=...`,
+/// a `PATH=...` assignment, or `source`/`.` of a single path this script
+/// already created — PLAN.md's restricted append grammar. Anything else
+/// (conditionals, command substitution, arbitrary commands, ...) is
+/// refused.
+fn check_env_file_grammar(text: &str, session: &Session) -> Result<(), String> {
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || is_export_assignment(line) || line.starts_with("PATH=") {
+            continue;
+        }
+        if let Some(rest) = line
+            .strip_prefix("source ")
+            .or_else(|| line.strip_prefix(". "))
+        {
+            let target = rest.trim();
+            if target.is_empty() || target.contains(char::is_whitespace) {
+                return Err(format!(
+                    "`{line}` is not a plain `source`/`.` of a single path"
+                ));
+            }
+            let path = state::normalize(Path::new(target));
+            if !session.owns(&path) {
+                return Err(format!("`{target}` was not created by this script"));
+            }
+            continue;
+        }
+        return Err(format!(
+            "`{line}` does not match the allowed grammar (export VAR=..., PATH=..., or \
+             source/. of a file this script created)"
+        ));
+    }
+    Ok(())
+}
+
+fn is_export_assignment(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("export ") else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    let Some((var_name, _value)) = rest.split_once('=') else {
+        return false;
+    };
+    !var_name.is_empty()
+        && var_name.starts_with(|c: char| c == '_' || c.is_ascii_alphabetic())
+        && var_name
+            .chars()
+            .all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+/// `sha256sum`: computes or verifies SHA-256 digests natively (PLAN.md's
+/// "checksum verification" value-add). Restricted, like `rm`/`chmod`, to
+/// paths this run created — installers use it to verify a download
+/// against a checksums file they just fetched, not to read arbitrary
+/// files on the system.
+fn evaluate_sha256sum(args: &[String], session: &Session) -> Verdict {
+    let mut check = false;
+    let mut paths: Vec<&str> = Vec::new();
+    for arg in args {
+        match arg.as_str() {
+            "-c" | "--check" => check = true,
+            a if a.starts_with('-') => {
+                return deny(format!("sha256sum option `{a}` is not supported"))
+            }
+            a => paths.push(a),
+        }
+    }
+
+    if check {
+        evaluate_sha256_check(&paths, session)
+    } else {
+        evaluate_sha256_compute(&paths, session)
+    }
+}
+
+fn evaluate_sha256_compute(paths: &[&str], session: &Session) -> Verdict {
+    if paths.is_empty() {
+        return deny("sha256sum with no file");
+    }
+    let mut resolved = Vec::with_capacity(paths.len());
+    for p in paths {
+        let path = state::normalize(Path::new(p));
+        if !session.owns(&path) {
+            return deny(format!(
+                "`{}` was not created by this script; sha256sum is limited to created paths",
+                path.display()
+            ));
+        }
+        resolved.push(path);
+    }
+    allow(
+        "prints checksums only for paths this script created",
+        Action::Sha256Sum { paths: resolved },
+    )
+}
+
+fn evaluate_sha256_check(paths: &[&str], session: &Session) -> Verdict {
+    let checklist = match paths {
+        [one] => *one,
+        [] => return deny("sha256sum -c with no checksums file"),
+        _ => return deny("sha256sum -c supports exactly one checksums file"),
+    };
+    let checklist_path = state::normalize(Path::new(checklist));
+    if !session.owns(&checklist_path) {
+        return deny(format!(
+            "`{}` was not created by this script; sha256sum -c is limited to created \
+             checksums files",
+            checklist_path.display()
+        ));
+    }
+    let text = match fs::read_to_string(&checklist_path) {
+        Ok(t) => t,
+        Err(e) => return deny(format!("cannot read `{}`: {e}", checklist_path.display())),
+    };
+    let mut entries = Vec::new();
+    for (lineno, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((hex, name)) = parse_checksum_line(line) else {
+            return deny(format!(
+                "`{}` line {}: not a `<sha256>  <path>` checksum line",
+                checklist_path.display(),
+                lineno + 1
+            ));
+        };
+        let path = state::normalize(Path::new(name));
+        if !session.owns(&path) {
+            return deny(format!(
+                "`{}` was not created by this script; sha256sum -c is limited to created paths",
+                path.display()
+            ));
+        }
+        entries.push((hex.to_string(), path));
+    }
+    if entries.is_empty() {
+        return deny(format!(
+            "`{}` contains no checksum lines",
+            checklist_path.display()
+        ));
+    }
+    allow(
+        "verifies checksums only for paths this script created",
+        Action::Sha256Check { entries },
+    )
+}
+
+/// Parse one `sha256sum -c` line: a 64-character hex digest, then two
+/// spaces (text mode) or a space and `*` (binary mode), then the path.
+fn parse_checksum_line(line: &str) -> Option<(&str, &str)> {
+    if line.len() < 66 {
+        return None;
+    }
+    let (hex, rest) = line.split_at(64);
+    if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let name = rest
+        .strip_prefix("  ")
+        .or_else(|| rest.strip_prefix(" *"))?;
+    if name.is_empty() {
+        return None;
+    }
+    Some((hex, name))
+}
+
 fn evaluate_echo(args: &[String]) -> Verdict {
+    match render_echo(args) {
+        Ok(text) => allow("prints output only", Action::Print { text }),
+        Err(reason) => deny(reason),
+    }
+}
+
+fn evaluate_printf(args: &[String]) -> Verdict {
+    match render_output("printf", args) {
+        Ok(text) => allow("prints output only", Action::Print { text }),
+        Err(reason) => deny(reason),
+    }
+}
+
+/// The text `echo`/`printf` would produce, shared between the plain
+/// (stdout) and env-file-append (`>>`) evaluators.
+fn render_output(name: &str, args: &[String]) -> Result<String, String> {
+    match name {
+        "echo" => render_echo(args),
+        "printf" => {
+            let (format, rest) = args
+                .split_first()
+                .ok_or_else(|| "printf with no format string".to_string())?;
+            render_printf(format, rest)
+        }
+        other => Err(format!(
+            "redirecting `{other}`'s output is not implemented yet"
+        )),
+    }
+}
+
+fn render_echo(args: &[String]) -> Result<String, String> {
     let mut newline = true;
     let mut rest = args;
     // Only leading flags count; after the first non-flag word, `-n` is
@@ -303,7 +618,7 @@ fn evaluate_echo(args: &[String]) -> Verdict {
             "-n" => newline = false,
             "-E" => {} // no escape processing — already our behavior
             "-e" | "-ne" | "-en" => {
-                return deny("echo -e escape processing is not implemented yet")
+                return Err("echo -e escape processing is not implemented yet".into())
             }
             _ => break,
         }
@@ -313,17 +628,7 @@ fn evaluate_echo(args: &[String]) -> Verdict {
     if newline {
         text.push('\n');
     }
-    allow("prints output only", Action::Print { text })
-}
-
-fn evaluate_printf(args: &[String]) -> Verdict {
-    let Some((format, rest)) = args.split_first() else {
-        return deny("printf with no format string");
-    };
-    match render_printf(format, rest) {
-        Ok(text) => allow("prints output only", Action::Print { text }),
-        Err(reason) => deny(reason),
-    }
+    Ok(text)
 }
 
 /// Render a printf invocation to the text it would output, supporting
@@ -1173,5 +1478,217 @@ mod tests {
     #[test]
     fn denies_background_jobs() {
         assert!(matches!(verdict("echo hi &"), Deny { .. }));
+    }
+
+    fn home_rc(name: &str) -> String {
+        let home = std::env::var("HOME").expect("test environment should have $HOME set");
+        format!("{home}/{name}")
+    }
+
+    #[test]
+    fn env_file_append_prompts_for_export_line() {
+        let rc = home_rc(".bashrc");
+        let script = format!("echo 'export PATH=\"/opt/tool/bin:$PATH\"' >> {rc}");
+        match verdict(&script) {
+            Prompt {
+                action: Action::AppendFile { path, text },
+                ..
+            } => {
+                assert_eq!(path, PathBuf::from(&rc));
+                assert_eq!(text, "export PATH=\"/opt/tool/bin:$PATH\"\n");
+            }
+            other => panic!("expected prompt/append, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn env_file_append_prompts_for_bare_path_assignment() {
+        let rc = home_rc(".zshrc");
+        match verdict(&format!("echo 'PATH=/opt/tool/bin:$PATH' >> {rc}")) {
+            Prompt {
+                action: Action::AppendFile { .. },
+                ..
+            } => {}
+            other => panic!("expected prompt/append, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn env_file_append_allows_source_of_owned_file_when_configured() {
+        let mut session = Session::new();
+        session.record_created("/opt/tool/env.sh");
+        let rc = home_rc(".profile");
+        let config = Config {
+            env_file_append: Verb::Allow,
+            ..Config::default()
+        };
+        match verdict_with_config(
+            &format!("echo 'source /opt/tool/env.sh' >> {rc}"),
+            &session,
+            &config,
+        ) {
+            Allow {
+                action: Action::AppendFile { .. },
+                ..
+            } => {}
+            other => panic!("expected allow/append, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn env_file_append_denies_source_of_unowned_file() {
+        let rc = home_rc(".profile");
+        assert!(matches!(
+            verdict(&format!("echo 'source /etc/evil.sh' >> {rc}")),
+            Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn env_file_append_denies_arbitrary_commands() {
+        let rc = home_rc(".bashrc");
+        assert!(matches!(
+            verdict(&format!("echo 'rm -rf /' >> {rc}")),
+            Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn env_file_append_denies_unrecognized_target() {
+        assert!(matches!(
+            verdict("echo 'export FOO=bar' >> /etc/passwd"),
+            Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn env_file_append_denies_second_redirect() {
+        let rc = home_rc(".bashrc");
+        assert!(matches!(
+            verdict(&format!("echo 'export FOO=bar' >> {rc} >> {rc}")),
+            Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn env_file_append_config_deny_refuses_even_valid_grammar() {
+        let rc = home_rc(".bashrc");
+        let config = Config {
+            env_file_append: Verb::Deny,
+            ..Config::default()
+        };
+        assert!(matches!(
+            verdict_with_config(
+                &format!("echo 'export FOO=bar' >> {rc}"),
+                &Session::new(),
+                &config
+            ),
+            Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn env_file_append_config_ask_prompts() {
+        let rc = home_rc(".bashrc");
+        let config = Config {
+            env_file_append: Verb::Ask,
+            ..Config::default()
+        };
+        assert!(matches!(
+            verdict_with_config(
+                &format!("echo 'export FOO=bar' >> {rc}"),
+                &Session::new(),
+                &config
+            ),
+            Prompt { .. }
+        ));
+    }
+
+    #[test]
+    fn other_redirects_are_still_denied() {
+        assert!(matches!(
+            verdict("echo hi > /tmp/iish-nonexistent"),
+            Deny { .. }
+        ));
+        assert!(matches!(verdict("mkdir /tmp/a 2> /tmp/err"), Deny { .. }));
+    }
+
+    #[test]
+    fn sha256sum_compute_denies_unowned_file() {
+        assert!(matches!(verdict("sha256sum /etc/passwd"), Deny { .. }));
+    }
+
+    #[test]
+    fn sha256sum_compute_allows_owned_file() {
+        let mut session = Session::new();
+        session.record_created("/tmp/iish-nonexistent-dl/tool.tar.gz");
+        match verdict_with("sha256sum /tmp/iish-nonexistent-dl/tool.tar.gz", &session) {
+            Allow {
+                action: Action::Sha256Sum { paths },
+                ..
+            } => assert_eq!(
+                paths,
+                vec![PathBuf::from("/tmp/iish-nonexistent-dl/tool.tar.gz")]
+            ),
+            other => panic!("expected allow/sha256sum, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sha256sum_check_denies_unowned_checksums_file() {
+        assert!(matches!(
+            verdict("sha256sum -c /etc/checksums.txt"),
+            Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn sha256sum_check_allows_owned_checklist_with_owned_entries() {
+        let dir = std::env::temp_dir().join(format!("iish-policy-sha256-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("tool.bin");
+        let checklist = dir.join("tool.bin.sha256");
+        std::fs::write(&target, b"payload").unwrap();
+        std::fs::write(
+            &checklist,
+            format!(
+                "{}  {}\n",
+                "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5",
+                target.display()
+            ),
+        )
+        .unwrap();
+        let mut session = Session::new();
+        session.record_created(&checklist);
+        session.record_created(&target);
+
+        match verdict_with(&format!("sha256sum -c {}", checklist.display()), &session) {
+            Allow {
+                action: Action::Sha256Check { entries },
+                ..
+            } => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].1, target);
+            }
+            other => panic!("expected allow/sha256check, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn sha256sum_check_denies_unowned_entry_path() {
+        let dir =
+            std::env::temp_dir().join(format!("iish-policy-sha256-foreign-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let checklist = dir.join("checksums.txt");
+        std::fs::write(&checklist, format!("{}  /etc/passwd\n", "0".repeat(64))).unwrap();
+        let mut session = Session::new();
+        session.record_created(&checklist);
+
+        assert!(matches!(
+            verdict_with(&format!("sha256sum -c {}", checklist.display()), &session),
+            Deny { .. }
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
