@@ -306,11 +306,16 @@ doubles as the integration-test corpus later.
    assigned value made only of literal text, `$VAR`/`${VAR}` reads, and
    `&&`/`||`/`test` now resolves completely — enough for real per-script
    progress (see the updated pins in `scripts/verify-installers.sh`) —
-   though most real installers still deny somewhere on `VAR=value cmd`
-   prefix assignment, a redirect shape beyond `>>`, a pipeline `!`
-   negation, a special/positional parameter (`$@`, `$1`, ...), a richer
-   parameter-expansion operator (`${VAR:-default}`, `${VAR#pattern}`,
-   ...), or command substitution — none of which are implemented yet.
+   `2> /dev/null` stderr redirects are implemented too (discarding
+   stderr writes nothing anywhere, so there is nothing to vet: the
+   subprocess tier nulls the child's stderr, native actions never
+   write the script's output there anyway) — though most real
+   installers still deny somewhere on `VAR=value cmd` prefix
+   assignment, a redirect shape beyond `>>` and `2> /dev/null`, a
+   pipeline `!` negation, a special/positional parameter (`$@`, `$1`,
+   ...), a richer parameter-expansion operator (`${VAR:-default}`,
+   `${VAR#pattern}`, ...), or command substitution — none of which are
+   implemented yet.
    The evaluator still denies `for`/`while`/`until` entirely, so none of
    the 17 real corpus scripts run to completion, but several now
    progress well past their own function/`set`/brace-group/`if`/`case`
@@ -332,8 +337,13 @@ doubles as the integration-test corpus later.
    (state.rs) is a lexical prefix match with no idea a path component
    could be a symlink; `exec.rs`'s `assert_no_symlink_escape` now
    refuses to operate through one for every native filesystem action
-   (`mkdir`, `rm`, `chmod`, fetch-to-file, env-file append,
-   `sha256sum`, and now `cp`). *(in progress — harness in place,
+   that *mutates or reads a policy-restricted path* (`mkdir`, `rm`,
+   `chmod`, fetch-to-file, env-file append, `sha256sum`, and `cp`'s
+   destination). `cp`'s *source* deliberately follows symlinks like
+   real `cp`: the policy places no restriction on what a source may
+   name (copying only reads), so a symlink there guards nothing — and
+   refusing it broke `cp /bin/true ...` on merged-usr systems where
+   `/bin` itself is a symlink to `usr/bin`. *(in progress — harness in place,
    functions/brace-groups/`set`/native `cp`/`if`/`case`/`test`/`&&`/`||`/
    bare assignment landed, corpus still 0/17 to completion)*
 8. **Sandboxing investigation** — Landlock/seccomp/Seatbelt for second

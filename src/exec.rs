@@ -55,8 +55,14 @@ pub enum Action {
     /// the "subprocess" policy tier (milestone 5, see policy.rs): the
     /// literal, already-parsed argv, exec'd directly — never through a
     /// shell, so no word splitting, globbing, or expansion happens
-    /// that the parser didn't already vet.
-    Subprocess { name: String, args: Vec<String> },
+    /// that the parser didn't already vet. `discard_stderr` is a
+    /// `2> /dev/null` on the command: the child's stderr goes to the
+    /// null device instead of being inherited.
+    Subprocess {
+        name: String,
+        args: Vec<String>,
+        discard_stderr: bool,
+    },
     /// `name() { ... }`: register `name` so a later call to it runs
     /// `body` (a brace-group's statement list) — see policy.rs's
     /// `Verdict::Group`. Defining a function has no effect beyond this;
@@ -127,7 +133,11 @@ pub fn execute(action: &Action, session: &mut Session) -> Result<(), String> {
         Action::AppendFile { path, text } => append_file(path, text, session),
         Action::Sha256Sum { paths } => paths.iter().try_for_each(|path| print_sha256(path)),
         Action::Sha256Check { entries } => verify_sha256(entries),
-        Action::Subprocess { name, args } => run_subprocess(name, args),
+        Action::Subprocess {
+            name,
+            args,
+            discard_stderr,
+        } => run_subprocess(name, args, *discard_stderr),
         Action::DefineFunction { name, body } => {
             session.define_function(name.clone(), body.clone());
             Ok(())
@@ -165,7 +175,11 @@ pub fn execute(action: &Action, session: &mut Session) -> Result<(), String> {
 pub fn execute_returning_status(action: &Action, session: &mut Session) -> Result<bool, String> {
     match action {
         Action::Test { result } => Ok(*result),
-        Action::Subprocess { name, args } => run_subprocess_status(name, args),
+        Action::Subprocess {
+            name,
+            args,
+            discard_stderr,
+        } => run_subprocess_status(name, args, *discard_stderr),
         other => execute(other, session).map(|()| true),
     }
 }
@@ -325,24 +339,28 @@ fn chmod(path: &Path, mode: Mode) -> Result<(), String> {
 
 /// `cp`: copy `src` to `dest`, recursing into a directory only when
 /// `recursive` was given (matching real `cp`'s `-r`/`-R` requirement).
-/// Both ends are checked for a symlink planted between the filesystem
-/// root and the leaf, same as every other native filesystem action
-/// here — a source symlink would let the script read a file it was
-/// never granted access to, and a destination symlink would let it
-/// write through to an arbitrary target. Only a new destination enters
-/// the ledger; overwriting a pre-existing one leaves it exactly as
-/// unowned as it was before (matching `fetch`'s rule).
+/// Only the *destination* is checked for a symlink planted between the
+/// filesystem root and the leaf: a destination symlink would let the
+/// script write through to a target the overwrite/ownership checks
+/// never looked at. The source side follows symlinks like real `cp`
+/// does — the policy places no restriction on what a source may name
+/// (copying only reads, and the script could name the link's target
+/// directly), so refusing them would only break legitimate sources
+/// like `/bin/true` on merged-usr systems where `/bin` itself is a
+/// symlink to `usr/bin`. Only a new destination enters the ledger;
+/// overwriting a pre-existing one leaves it exactly as unowned as it
+/// was before (matching `fetch`'s rule).
 fn copy_path(
     src: &Path,
     dest: &Path,
     recursive: bool,
     session: &mut Session,
 ) -> Result<(), String> {
-    assert_no_symlink_escape(src, false).map_err(|e| format!("cp: {e}"))?;
     assert_no_symlink_escape(dest, false).map_err(|e| format!("cp: {e}"))?;
     let existed = dest.exists();
-    let metadata =
-        fs::symlink_metadata(src).map_err(|e| format!("cp: `{}`: {e}", src.display()))?;
+    // Follows a symlink source (leaf or intermediate) to what it
+    // actually points at, exactly like `fs::copy`/`read_dir` below will.
+    let metadata = fs::metadata(src).map_err(|e| format!("cp: `{}`: {e}", src.display()))?;
     if metadata.is_dir() {
         if !recursive {
             return Err(format!(
@@ -351,11 +369,6 @@ fn copy_path(
             ));
         }
         copy_dir_recursive(src, dest)?;
-    } else if metadata.file_type().is_symlink() {
-        return Err(format!(
-            "cp: `{}` is a symlink; refusing to copy through it",
-            src.display()
-        ));
     } else {
         fs::copy(src, dest)
             .map_err(|e| format!("cp: `{}` -> `{}`: {e}", src.display(), dest.display()))?;
@@ -366,9 +379,11 @@ fn copy_path(
     Ok(())
 }
 
-/// Recursive directory copy for `cp -r`: descends `src`, refusing to
-/// follow any symlink it finds along the way rather than silently
-/// copying whatever it points at.
+/// Recursive directory copy for `cp -r`: descends `src`, refusing any
+/// symlink it finds *inside* the tree — unlike the top-level source
+/// path, a nested link was never named by the script (so following it
+/// copies something the statement didn't say), and a link cycle would
+/// recurse forever.
 fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<(), String> {
     fs::create_dir_all(dest).map_err(|e| format!("cp: `{}`: {e}", dest.display()))?;
     for entry in fs::read_dir(src).map_err(|e| format!("cp: `{}`: {e}", src.display()))? {
@@ -504,9 +519,11 @@ fn verify_sha256(entries: &[(String, PathBuf)]) -> Result<(), String> {
 
 /// Exec `name` with `args` directly (no shell in between: `Command`
 /// does its own fork/exec, it does not consult `$SHELL`), inheriting
-/// this process's stdio so the child can prompt or stream output.
-fn run_subprocess(name: &str, args: &[String]) -> Result<(), String> {
-    let status = spawn(name, args)?;
+/// this process's stdio so the child can prompt or stream output —
+/// except stderr when the script's own `2> /dev/null` asked for it to
+/// be discarded.
+fn run_subprocess(name: &str, args: &[String], discard_stderr: bool) -> Result<(), String> {
+    let status = spawn(name, args, discard_stderr)?;
     if status.success() {
         Ok(())
     } else {
@@ -521,15 +538,25 @@ fn run_subprocess(name: &str, args: &[String]) -> Result<(), String> {
 /// Same fork/exec as [`run_subprocess`], but reports success as a `bool`
 /// rather than turning a non-zero exit into an `Err` — a real spawn
 /// failure (missing binary, ...) still is one.
-fn run_subprocess_status(name: &str, args: &[String]) -> Result<bool, String> {
-    Ok(spawn(name, args)?.success())
+fn run_subprocess_status(
+    name: &str,
+    args: &[String],
+    discard_stderr: bool,
+) -> Result<bool, String> {
+    Ok(spawn(name, args, discard_stderr)?.success())
 }
 
-fn spawn(name: &str, args: &[String]) -> Result<std::process::ExitStatus, String> {
-    std::process::Command::new(name)
-        .args(args)
-        .status()
-        .map_err(|e| format!("{name}: {e}"))
+fn spawn(
+    name: &str,
+    args: &[String],
+    discard_stderr: bool,
+) -> Result<std::process::ExitStatus, String> {
+    let mut command = std::process::Command::new(name);
+    command.args(args);
+    if discard_stderr {
+        command.stderr(std::process::Stdio::null());
+    }
+    command.status().map_err(|e| format!("{name}: {e}"))
 }
 
 #[cfg(test)]
@@ -652,6 +679,7 @@ mod tests {
             &Action::Subprocess {
                 name: "mkdir".to_string(),
                 args: vec![base.to_str().unwrap().to_string()],
+                discard_stderr: false,
             },
             &mut session,
         )
@@ -667,6 +695,7 @@ mod tests {
             &Action::Subprocess {
                 name: "false".to_string(),
                 args: vec![],
+                discard_stderr: false,
             },
             &mut session,
         )
@@ -681,6 +710,7 @@ mod tests {
             &Action::Subprocess {
                 name: "iish-definitely-not-a-real-binary".to_string(),
                 args: vec![],
+                discard_stderr: false,
             },
             &mut session,
         )
@@ -801,6 +831,87 @@ mod tests {
         assert_eq!(
             fs::metadata(&target).unwrap().permissions().mode() & 0o777,
             0o644
+        );
+        fs::remove_dir_all(&base).unwrap();
+        fs::remove_dir_all(&outside).unwrap();
+    }
+
+    // `cp`'s source side is unrestricted by policy (it only reads), so
+    // unlike every mutating action it must tolerate symlinks on the way
+    // to the source — most importantly `/bin -> usr/bin` on merged-usr
+    // systems, where `cp /bin/true ...` is a completely ordinary
+    // installer operation. The destination stays strict.
+
+    #[test]
+    fn copy_follows_a_symlinked_source_directory() {
+        let base = scratch("cp-src-intermediate-symlink");
+        fs::create_dir_all(base.join("usr/bin")).unwrap();
+        fs::write(base.join("usr/bin/tool"), b"tool bytes").unwrap();
+        // The merged-usr shape: bin -> usr/bin.
+        std::os::unix::fs::symlink("usr/bin", base.join("bin")).unwrap();
+        let dest = base.join("copied-tool");
+        let mut session = Session::new();
+
+        execute(
+            &Action::Copy {
+                pairs: vec![(base.join("bin/tool"), dest.clone())],
+                recursive: false,
+            },
+            &mut session,
+        )
+        .unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"tool bytes");
+        assert!(session.owns(&dest), "a new destination enters the ledger");
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn copy_follows_a_symlink_leaf_source() {
+        let base = scratch("cp-src-leaf-symlink");
+        fs::create_dir_all(&base).unwrap();
+        fs::write(base.join("real"), b"real bytes").unwrap();
+        std::os::unix::fs::symlink("real", base.join("link")).unwrap();
+        let dest = base.join("copied");
+        let mut session = Session::new();
+
+        execute(
+            &Action::Copy {
+                pairs: vec![(base.join("link"), dest.clone())],
+                recursive: false,
+            },
+            &mut session,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(&dest).unwrap(),
+            b"real bytes",
+            "cp follows a symlink source to its content, like real cp"
+        );
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn copy_refuses_a_symlinked_destination() {
+        let base = scratch("cp-dest-symlink");
+        let outside = scratch("cp-dest-symlink-outside");
+        fs::create_dir_all(&base).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(base.join("src"), b"payload").unwrap();
+        std::os::unix::fs::symlink(&outside, base.join("escape")).unwrap();
+        let mut session = Session::new();
+
+        let err = execute(
+            &Action::Copy {
+                pairs: vec![(base.join("src"), base.join("escape").join("victim"))],
+                recursive: false,
+            },
+            &mut session,
+        )
+        .unwrap_err();
+        assert!(err.contains("symlink"), "{err}");
+        assert!(
+            !outside.join("victim").exists(),
+            "nothing may be written through the destination symlink"
         );
         fs::remove_dir_all(&base).unwrap();
         fs::remove_dir_all(&outside).unwrap();
