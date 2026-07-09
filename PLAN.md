@@ -125,10 +125,10 @@ src/
   parser.rs    bash → AST. Currently a minimal hand-rolled parser for
                simple commands; anything it can't parse becomes an
                explicit Unsupported node (which policy denies).
-               To be replaced by a real shell-grammar crate
-               (yash-syntax / brush-parser): the corpus shows 17/17
-               scripts need functions, conditionals, loops, and
-               command substitution (see corpus/ANALYSIS.md §1).
+               To be replaced by **brush-parser** (decided — parses
+               17/17 corpus scripts vs yash-syntax's 13/17, MIT vs
+               GPL; see docs/parser-eval.md). The Unsupported→deny
+               posture moves into the evaluator.
   policy.rs    command → Verdict { Allow, Ask(reason), Deny(reason) }
   config.rs    (planned) layered policy: builtins ← config file ← CLI
   exec.rs      Native implementations of allowed operations
@@ -159,8 +159,9 @@ doubles as the integration-test corpus later.
    policy stub, report mode. *(done)*
 2. ~~**Corpus**~~ — fetch + empirical analysis of real installers.
    *(done — see corpus/ANALYSIS.md)*
-3. **Real parser** — adopt a shell-grammar crate, walk its AST with an
-   interleaved evaluator; Unsupported→deny posture preserved.
+3. **Real parser** — adopt brush-parser (decided, docs/parser-eval.md),
+   walk its AST with an interleaved evaluator; Unsupported→deny
+   posture preserved.
 4. **Execution + ledger** — native implementations of the allowed
    tiers, session ledger, `/dev/tty` prompting, and the sudo broker
    (unprivileged path first; broker can trail as 4b).
