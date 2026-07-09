@@ -58,14 +58,17 @@ fi
 
 pass_count=0
 fail_count=0
+results=()
 
 pass() {
     pass_count=$((pass_count + 1))
+    results+=("PASS|$1")
     printf '  \033[32mPASS\033[0m  %s\n' "$1"
 }
 
 fail() {
     fail_count=$((fail_count + 1))
+    results+=("FAIL|$1")
     printf '  \033[31mFAIL\033[0m  %s\n' "$1"
 }
 
@@ -138,7 +141,10 @@ fi
 # corpus to completion"; today is 0/17). So for each of these we pin
 # *why* it currently stops, as a regression guard: if the reason changes
 # without this file being updated, either iish's behavior regressed, or
-# it progressed -- both are worth a human looking at. If a script ever
+# it progressed -- both are worth a human looking at. Stopping for the
+# pinned reason is still reported as a FAIL, not a pass: the installer
+# genuinely did not install anything, and a test suite that calls that
+# a pass isn't telling the truth. If a script ever
 # runs to completion, the paired verify command decides pass/fail for
 # real, exactly as it eventually should for the whole corpus.
 # ---------------------------------------------------------------------
@@ -232,8 +238,14 @@ for name in $corpus_names; do
                 ;;
             1)
                 if grep -qF "$expected_reason" "$log"; then
-                    pass "$name: stopped as pinned (\"$expected_reason\")"
-                    [ "$verbose" -eq 1 ] && show_log "$log"
+                    # It stopped for exactly the reason we've pinned, but
+                    # that still means the installer did NOT actually
+                    # install anything -- a known, tracked failure, not a
+                    # pass. Reporting this as a pass would hide that the
+                    # corpus doesn't run to completion yet (milestone 7);
+                    # tests should say what actually happened.
+                    fail "$name: stopped as pinned (\"$expected_reason\") -- installation did not complete (known, tracked failure)"
+                    show_log "$log"
                 else
                     fail "$name: stopped for an UNEXPECTED reason (expected \"$expected_reason\") -- update or investigate the pin"
                     show_log "$log"
@@ -317,6 +329,18 @@ for name in $adversarial_names; do
             fi
             rm -f "$log"
         done
+    fi
+done
+
+echo
+echo "==> Summary"
+for r in "${results[@]}"; do
+    status="${r%%|*}"
+    name="${r#*|}"
+    if [ "$status" = PASS ]; then
+        printf '  \033[32mPASS\033[0m  %s\n' "$name"
+    else
+        printf '  \033[31mFAIL\033[0m  %s\n' "$name"
     fi
 done
 
