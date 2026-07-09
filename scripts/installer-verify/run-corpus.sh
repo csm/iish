@@ -21,7 +21,10 @@ shift
 script="$1"
 shift
 
-if ! /usr/local/bin/iish --no-config --"$ask_mode" "$script"; then
+# Extra iish flags (e.g. --subprocess=allow for the live-install job) come
+# in via the environment so the positional contract stays unchanged.
+# shellcheck disable=SC2086  # deliberate word-splitting of the flag list
+if ! /usr/local/bin/iish --no-config ${IISH_EXTRA_FLAGS:-} --"$ask_mode" "$script"; then
     echo "run-corpus: iish did not run '$script' to completion"
     exit 1
 fi

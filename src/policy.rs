@@ -1579,9 +1579,15 @@ fn expand_percent_b(arg: &str) -> Result<String, String> {
 
 fn evaluate_mkdir(args: &[String]) -> Verdict {
     let mut parents = false;
+    let mut end_of_flags = false;
     let mut paths: Vec<PathBuf> = Vec::new();
     for arg in args {
+        if end_of_flags {
+            paths.push(state::normalize(Path::new(arg)));
+            continue;
+        }
         match arg.as_str() {
+            "--" => end_of_flags = true,
             "-p" | "--parents" => parents = true,
             a if a.starts_with('-') => return deny(format!("mkdir option `{a}` is not supported")),
             a => paths.push(state::normalize(Path::new(a))),
@@ -1617,9 +1623,14 @@ fn evaluate_mkdir(args: &[String]) -> Verdict {
 fn evaluate_rm(args: &[String], ctx: &ExpandCtx) -> Verdict {
     let mut recursive = false;
     let mut force = false;
+    let mut end_of_flags = false;
     let mut paths: Vec<PathBuf> = Vec::new();
     for arg in args {
-        if let Some(long) = arg.strip_prefix("--") {
+        if end_of_flags {
+            paths.push(state::normalize(Path::new(arg)));
+        } else if arg == "--" {
+            end_of_flags = true;
+        } else if let Some(long) = arg.strip_prefix("--") {
             match long {
                 "recursive" => recursive = true,
                 "force" => force = true,
@@ -1662,6 +1673,11 @@ fn evaluate_rm(args: &[String], ctx: &ExpandCtx) -> Verdict {
 }
 
 fn evaluate_chmod(args: &[String], ctx: &ExpandCtx) -> Verdict {
+    // An optional leading `--` ends option parsing; the mode follows.
+    let args = match args.split_first() {
+        Some((first, rest)) if first == "--" => rest,
+        _ => args,
+    };
     let Some((mode_str, path_args)) = args.split_first() else {
         return deny("chmod with no mode");
     };
@@ -1677,6 +1693,11 @@ fn evaluate_chmod(args: &[String], ctx: &ExpandCtx) -> Verdict {
     }
     let mut paths: Vec<PathBuf> = Vec::new();
     for arg in path_args {
+        // A `--` here ends any remaining option parsing; a bare `-…`
+        // that isn't past a `--` is an unsupported option.
+        if arg == "--" {
+            continue;
+        }
         if arg.starts_with('-') {
             return deny(format!("chmod option `{arg}` is not supported"));
         }

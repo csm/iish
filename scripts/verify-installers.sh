@@ -18,11 +18,19 @@
 # nothing newer than the bash 3.2 macOS still ships as /bin/bash.
 #
 # Usage:
-#   scripts/verify-installers.sh                 # everything
+#   scripts/verify-installers.sh                 # the hermetic, offline suite
 #   scripts/verify-installers.sh --only rustup    # one corpus installer
 #   scripts/verify-installers.sh --only adversarial:root-wipe
 #   scripts/verify-installers.sh --verbose        # always show container output
 #   scripts/verify-installers.sh --keep-image     # skip the final `docker rmi`
+#   scripts/verify-installers.sh --live           # ONLY the live-install job
+#
+# By default this runs entirely offline (`docker run --network none`): a
+# self-check, the corpus regression pins, and the adversarial corpus,
+# none of which touch the network. `--live` instead runs the separate
+# live-install job, which DOES reach the real internet to install a
+# curated, trustworthy, user-space installer end to end and verify the
+# program it produces actually runs -- see the "Live installs" section.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -30,17 +38,19 @@ image_tag="iish-verify:local"
 verbose=0
 keep_image=0
 only=""
+live=0
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --verbose | -v) verbose=1 ;;
         --keep-image) keep_image=1 ;;
+        --live) live=1 ;;
         --only)
             shift
             only="${1:-}"
             ;;
         -h | --help)
-            sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         *)
@@ -120,6 +130,94 @@ cleanup() {
     fi
 }
 trap cleanup EXIT
+
+# ---------------------------------------------------------------------
+# Live installs (opt-in, --live): the one place this harness reaches the
+# real internet. Each installer here is a curated, trustworthy, entirely
+# user-space one that iish can drive to *completion* -- it downloads a
+# real release, installs it under $HOME, and then we run the installed
+# program to prove it actually works. This is the genuine "green" the
+# offline corpus can only gesture at: a real installer, installed for
+# real, verified by running it.
+#
+# It is deliberately a SEPARATE job (its own workflow, not a PR gate):
+# it depends on live upstreams (GitHub releases, their API rate limits),
+# so an upstream hiccup must never red the hermetic suite that guards
+# iish's own behavior. iish runs with --subprocess=allow here (the
+# unattended-provisioning posture: approve the tar/grep/... an installer
+# shells out to), still never handing anything to a shell.
+# ---------------------------------------------------------------------
+live_names="zoxide starship"
+
+set_live_expectation() {
+    # Per-installer: the docker env that makes it non-interactive and
+    # user-space, and the command that proves the install worked.
+    verify_cmd=()
+    live_env=(-e "HOME=/home/tester"
+        -e "PATH=/home/tester/.local/bin:/usr/local/bin:/usr/bin:/bin"
+        -e "IISH_EXTRA_FLAGS=--subprocess=allow")
+    case "$1" in
+        zoxide)
+            # Installs to ~/.local/bin by default, no prompt.
+            verify_cmd=(zoxide --version)
+            ;;
+        starship)
+            # FORCE skips its y/n prompt; BIN_DIR makes it user-space.
+            live_env+=(-e "FORCE=1" -e "BIN_DIR=/home/tester/.local/bin")
+            verify_cmd=(starship --version)
+            ;;
+        *)
+            echo "verify-installers: no live expectation for '$1'" >&2
+            exit 1
+            ;;
+    esac
+}
+
+if [ "$live" -eq 1 ]; then
+    echo "==> Live installs (real network, real upstreams)"
+    for name in $live_names; do
+        if want live "$name"; then
+            set_live_expectation "$name"
+            log="$(mktemp)"
+            status=0
+            # NOTE: no `--network none` here -- this job needs the internet.
+            docker run --rm \
+                "${live_env[@]}" \
+                -v "$repo_root/corpus/cache:/corpus:ro" \
+                "$image_tag" corpus yes "/corpus/$name.sh" "${verify_cmd[@]}" >"$log" 2>&1 || status=$?
+            case "$status" in
+                0)
+                    pass "$name: real end-to-end install completed AND \`${verify_cmd[*]}\` works"
+                    [ "$verbose" -eq 1 ] && show_log "$log"
+                    ;;
+                2)
+                    fail "$name: iish ran it to completion but \`${verify_cmd[*]}\` FAILED -- the installed program isn't usable"
+                    show_log "$log"
+                    ;;
+                *)
+                    fail "$name: did not complete a live install (container exit $status) -- an upstream/network issue, or a real iish gap"
+                    show_log "$log"
+                    ;;
+            esac
+            rm -f "$log"
+        fi
+    done
+
+    echo
+    echo "==> Summary"
+    for r in ${results[@]+"${results[@]}"}; do
+        status="${r%%|*}"
+        name="${r#*|}"
+        case "$status" in
+            PASS) printf '  \033[32mPASS\033[0m  %s\n' "$name" ;;
+            *) printf '  \033[31mFAIL\033[0m  %s\n' "$name" ;;
+        esac
+    done
+    echo
+    echo "==> $pass_count passed, $fail_count failed"
+    [ "$fail_count" -eq 0 ]
+    exit
+fi
 
 # ---------------------------------------------------------------------
 # Harness self-check: a synthetic, offline "installer" built entirely

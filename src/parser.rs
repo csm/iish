@@ -169,7 +169,22 @@ pub fn word_fields(word: &ast::Word, ctx: &mut ExpandCtx) -> Result<Vec<String>,
         }
     }
 
-    Ok(vec![literal_word(word, ctx)?])
+    // General case: render the word to a glob *pattern* (unquoted `*`/`?`
+    // from the script's own text stay wildcards; quoted text, escapes,
+    // and — deliberately — the values of any expansion are `\`-escaped
+    // so runtime data can never smuggle in a wildcard). If the pattern
+    // has an active wildcard that matches paths on disk, expand to the
+    // sorted matches (bash pathname expansion); if it matches nothing,
+    // the literal pattern stands (nullglob off); with no wildcard at all
+    // it's just the literal word.
+    let pattern = render_pattern_text(&word.value, ctx)?;
+    if pattern_has_active_wildcard(&pattern) {
+        let matches = glob_expand(&pattern);
+        if !matches.is_empty() {
+            return Ok(matches);
+        }
+    }
+    Ok(vec![unescape_pattern(&pattern)])
 }
 
 /// True if `s` contains a character that would undergo bash pathname
@@ -503,6 +518,113 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
     let pattern_chars: Vec<char> = pattern.chars().collect();
     let text_chars: Vec<char> = text.chars().collect();
     matches(&pattern_chars, &text_chars)
+}
+
+/// True if `pattern` (rendered by `render_pattern_text`, so literal
+/// metacharacters are `\`-escaped) contains a wildcard that is still
+/// active — an unescaped `*` or `?`. Bracket classes aren't treated as
+/// active: `glob_match` doesn't implement them, so a `[...]` word is
+/// left literal rather than half-expanded.
+fn pattern_has_active_wildcard(pattern: &str) -> bool {
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                chars.next();
+            }
+            '*' | '?' => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Turn a rendered glob pattern back into its literal text by dropping
+/// the `\` before each escaped character — the value a word takes when
+/// its wildcards matched nothing (nullglob off) or it had none.
+fn unescape_pattern(pattern: &str) -> String {
+    let mut out = String::new();
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(next) = chars.next() {
+                out.push(next);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Bash pathname expansion for a rendered glob `pattern`: walk it one
+/// `/`-separated component at a time, descending literal components and
+/// matching wildcard components against real directory entries
+/// (`glob_match`), and return every existing path that matches, sorted.
+/// A leading-dot entry is matched only by a pattern whose component
+/// starts with a literal dot, as in bash. An empty result means "no
+/// match" and the caller keeps the literal pattern.
+fn glob_expand(pattern: &str) -> Vec<String> {
+    use std::path::PathBuf;
+    let absolute = pattern.starts_with('/');
+    // Split on unescaped `/`. A `\/` never occurs here (paths don't
+    // escape their separators), so a plain split is correct.
+    let components: Vec<&str> = pattern.split('/').filter(|c| !c.is_empty()).collect();
+    if components.is_empty() {
+        return Vec::new();
+    }
+
+    // Each frontier entry is (filesystem path to read from, display
+    // prefix accumulated so far).
+    let start = if absolute {
+        (PathBuf::from("/"), String::from("/"))
+    } else {
+        (PathBuf::from("."), String::new())
+    };
+    let mut frontier = vec![start];
+
+    for component in &components {
+        let mut next = Vec::new();
+        for (dir, prefix) in &frontier {
+            if pattern_has_active_wildcard(component) {
+                let Ok(entries) = std::fs::read_dir(dir) else {
+                    continue;
+                };
+                let mut names: Vec<String> = entries
+                    .filter_map(|e| e.ok())
+                    .filter_map(|e| e.file_name().into_string().ok())
+                    .filter(|name| {
+                        // Leading-dot files need an explicit leading dot.
+                        if name.starts_with('.') && !component.starts_with('.') {
+                            return false;
+                        }
+                        glob_match(component, name)
+                    })
+                    .collect();
+                names.sort();
+                for name in names {
+                    next.push((dir.join(&name), format!("{prefix}{name}/")));
+                }
+            } else {
+                // Literal component: descend if it exists on disk.
+                let literal = unescape_pattern(component);
+                let candidate = dir.join(&literal);
+                if candidate.exists() {
+                    next.push((candidate, format!("{prefix}{literal}/")));
+                }
+            }
+        }
+        frontier = next;
+    }
+
+    // Strip the trailing `/` each display prefix accumulated.
+    let mut out: Vec<String> = frontier
+        .into_iter()
+        .map(|(_, prefix)| prefix.trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    out.sort();
+    out
 }
 
 /// Render a shell [`ast::Word`] as a `case` pattern: like [`literal_word`],
@@ -861,6 +983,49 @@ mod tests {
             fields_in("cmd \"$NAME\"", &mut session).unwrap(),
             vec!["two words"]
         );
+    }
+
+    #[test]
+    fn unquoted_wildcard_expands_against_the_filesystem() {
+        let dir = std::env::temp_dir().join(format!("iish-glob-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("man/man1")).unwrap();
+        std::fs::write(dir.join("man/man1/zoxide.1"), b"x").unwrap();
+        std::fs::write(dir.join("man/man1/zoxide-add.1"), b"x").unwrap();
+        std::fs::write(dir.join("other.txt"), b"x").unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+
+        let mut session = Session::new();
+        // A quoted prefix plus an unquoted `*`, exactly zoxide's
+        // `cp -- "man/man1/"*` shape: expands to the two manpages, sorted.
+        let got = fields_in("cp \"man/man1/\"*", &mut session).unwrap();
+        assert_eq!(got, vec!["man/man1/zoxide-add.1", "man/man1/zoxide.1"]);
+
+        // A wildcard that matches nothing keeps the literal pattern.
+        let got = fields_in("cp nomatch-*.zzz", &mut session).unwrap();
+        assert_eq!(got, vec!["nomatch-*.zzz"]);
+
+        std::env::set_current_dir(&prev).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn quoted_wildcard_stays_literal() {
+        // A `*` inside quotes is not a wildcard: it must not glob, even
+        // if it would match something on disk.
+        let mut session = Session::new();
+        assert_eq!(fields_in("echo \"*\"", &mut session).unwrap(), vec!["*"]);
+    }
+
+    #[test]
+    fn an_expansions_value_never_globs() {
+        // A `*` that arrives via a variable's value is data, not a
+        // wildcard: it stays literal (no filesystem expansion), so
+        // runtime data can't smuggle in a glob.
+        let mut session = Session::new();
+        session.set_variable("STAR", "*");
+        assert_eq!(fields_in("echo $STAR", &mut session).unwrap(), vec!["*"]);
     }
 
     #[test]
