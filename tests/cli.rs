@@ -7,8 +7,19 @@ use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 
-/// Run iish with `args`, feeding `script` on stdin.
+/// Run iish with `args`, feeding `script` on stdin. Always passes
+/// `--no-config` so tests are hermetic regardless of whatever real
+/// config file the host running them happens to have; tests that
+/// exercise config-file loading itself use `iish_raw`.
 fn iish(script: &str, args: &[&str]) -> Output {
+    let mut all_args = vec!["--no-config"];
+    all_args.extend_from_slice(args);
+    iish_raw(script, &all_args)
+}
+
+/// Like `iish`, but without forcing `--no-config` — for tests that
+/// exercise config-file loading.
+fn iish_raw(script: &str, args: &[&str]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_iish"));
     // Tests fetch from 127.0.0.1; don't let an ambient proxy intercept.
     for var in ["http_proxy", "https_proxy", "all_proxy"] {
@@ -107,12 +118,75 @@ fn rm_of_preexisting_dir_is_refused() {
 fn deny_aborts_before_later_statements() {
     let base = scratch("abort");
     let script = format!("sudo make install\nmkdir {}\n", base.display());
-    let out = iish(&script, &[]);
+    let out = iish(&script, &["--deny", "sudo"]);
     assert!(!out.status.success());
     assert!(
         !base.exists(),
         "statements after a refusal must not execute"
     );
+}
+
+#[test]
+fn unknown_command_prompts_and_runs_as_a_subprocess_when_allowed() {
+    let base = scratch("subprocess");
+    let out = iish(
+        &format!("mkdir-and-touch {}\n", base.display()),
+        &["--allow", "mkdir-and-touch"],
+    );
+    // No such binary exists, so the subprocess itself fails, but the
+    // point is that it was actually attempted (not silently denied).
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("mkdir-and-touch"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn subprocess_tier_runs_a_real_binary_when_allowed() {
+    let base = scratch("cp-subprocess");
+    fs::create_dir_all(&base).unwrap();
+    let src = base.join("src.txt");
+    let dst = base.join("dst.txt");
+    fs::write(&src, b"hello").unwrap();
+    let out = iish(
+        &format!("cp {} {}\n", src.display(), dst.display()),
+        &["--allow", "cp"],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(fs::read(&dst).unwrap(), b"hello");
+    fs::remove_dir_all(&base).unwrap();
+}
+
+#[test]
+fn subprocess_tier_denied_by_default_with_no() {
+    let out = iish("uname -a\n", &["--no"]);
+    assert!(!out.status.success());
+}
+
+#[test]
+fn config_file_subprocess_allow_is_honored() {
+    let dir = scratch("config-file");
+    fs::create_dir_all(&dir).unwrap();
+    let config_path = dir.join("config.toml");
+    fs::write(&config_path, "[defaults]\nsubprocess = \"allow\"\n").unwrap();
+    let target = dir.join("stamped");
+
+    let out = iish_raw(
+        &format!("touch {}\n", target.display()),
+        &["--config", config_path.to_str().unwrap()],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(target.is_file());
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn cli_deny_overrides_a_natively_implemented_command() {
+    let out = iish("curl https://example.com\n", &["--deny", "curl"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("denied"), "stderr: {}", stderr(&out));
 }
 
 #[test]

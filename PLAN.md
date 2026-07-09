@@ -32,7 +32,8 @@ no "pass through to bash" escape hatch.
 | Network | HTTP(S) GET only, performed by iish itself (no arbitrary curl flags); no other protocols |
 | chmod / chown | `chmod` allowed on files the script created; `chown` ⇒ ask |
 | sudo | Not a command — an **execution context**. See "Privilege: the sudo broker" below |
-| Everything else (eval, exec, arbitrary binaries, pipes to sh, …) | Denied |
+| Shells (`sh`/`bash`/`zsh`/`dash`/`ksh`), shell builtins (`cd`, `export`, `source`, `.`), pipelines, control flow, `eval` | Denied — no config knob reopens these; see "Core principle" |
+| Everything else — external binaries iish has no native implementation for (`cp`, `tar`, `apt-get`, `systemctl`, `sudo <cmd>` pre-broker, …) | **ask** by default (the "subprocess" tier); allow/ask/deny, globally or per command, in config — see "Configuration" |
 
 Policy verbs are **allow / ask / deny**. `ask` is load-bearing: the
 corpus shows sudo (10/17), package managers, systemctl, and running a
@@ -79,15 +80,13 @@ Caveats accepted with the design:
 - Existence/overwrite checks for root-only-readable paths must happen
   broker-side (`Stat`), not in the unprivileged parent.
 
-## Configuration
+## Configuration (done — milestone 5)
 
 Layered policy, later layers win:
 
 1. Built-in defaults (the table above; unlisted subprocesses ⇒ ask).
-2. User config file (`~/.config/iish/config.toml`).
+2. User config file (`~/.config/iish/config.toml`, or `--config path`).
 3. Command-line overrides.
-
-Sketch:
 
 ```toml
 [defaults]
@@ -104,8 +103,20 @@ systemctl = "deny"
 uname = "allow"
 ```
 
-CLI: `iish --allow sudo --deny curl --subprocess=deny --dry-run …`,
-plus `--yes`/`--no` to resolve every `ask` non-interactively.
+`subprocess`, `overwrite`, `network`, `run-created`, and `[commands]` are
+live: they change what policy.rs's evaluator does today, including a
+new **subprocess tier** for any external binary iish has no native
+implementation for (`cp`, `tar`, `apt-get`, `sudo <cmd>` pre-broker,
+…) — the literal, already-parsed argv is exec'd directly, never through
+a shell, once allowed or confirmed. Shells and shell builtins (`cd`,
+`export`, `source`, `.`) stay hard-denied regardless of config — see the
+"Core principle" above. `env-file-append` and `elevate` parse
+successfully (so this file round-trips) but aren't consulted until
+milestone 6 (env-file grammar) and 4b (sudo broker) exist.
+
+CLI: `iish --allow sudo --deny curl --subprocess=deny --overwrite=allow
+--network=deny --config path.toml --no-config --dry-run …`, plus
+`--yes`/`--no` to resolve every `ask` non-interactively.
 
 ## Open questions
 
@@ -134,15 +145,21 @@ src/
                (pipelines, control flow, functions, redirects,
                expansions, ...) is denied here — the Unsupported→deny
                posture now lives in the evaluator, not the parser.
-  config.rs    (planned) layered policy: builtins ← config file ← CLI
+  config.rs    Layered policy (milestone 5): builtin `Config::default()`
+               ← config file (TOML via serde) ← CLI overrides. Exposes
+               `Verb` (allow/ask/deny) and `NetworkPolicy` per PLAN's
+               sketch below; unconsumed knobs (`env-file-append`,
+               `elevate`) still parse, for forward compatibility with
+               the documented schema.
   exec.rs      Native implementations of allowed operations. The policy
                compiles each allowed statement into a closed `Action`
-               enum (Print, MkDir, Remove, Chmod, Fetch, Noop); exec
-               runs actions in Rust — echo/printf rendering, dir
-               creation, ledger-checked rm/chmod, and GET fetches via
-               an in-process HTTP client (ureq) — and records created
-               paths in the ledger. Env-file appends land in
-               milestone 6.
+               enum (Print, MkDir, Remove, Chmod, Fetch, Subprocess,
+               Noop); exec runs actions in Rust — echo/printf
+               rendering, dir creation, ledger-checked rm/chmod, GET
+               fetches via an in-process HTTP client (ureq), and
+               direct fork/exec (never a shell) of the subprocess
+               tier's literal argv — and records created paths in the
+               ledger. Env-file appends land in milestone 6.
   prompt.rs    /dev/tty confirmation for `ask` verdicts (stdin carries
                the script); `--yes`/`--no` resolve asks without a tty
   broker.rs    (planned) privileged worker: `sudo iish --broker`,
@@ -187,7 +204,13 @@ doubles as the integration-test corpus later.
    keeping the static report (with simulated ledger). *(done)*
    - 4b. **Sudo broker** — the privileged worker described above; not
      started.
-5. **Configuration** — config-file policy + CLI overrides (see above).
+5. ~~**Configuration**~~ — config-file policy + CLI overrides (see
+   above); a new **subprocess tier** governed by it (allow/ask/deny,
+   globally or per command) for external binaries iish has no native
+   implementation for, exec'd directly and never through a shell.
+   Built-in default for that tier flipped from a hard deny to `ask`,
+   matching PLAN's "unlisted subprocesses ⇒ ask". Shells and shell
+   builtins remain hard-denied, not configurable. *(done)*
 6. **Harden** — redirects, env-file append grammar, GET-only HTTP
    client, checksum verification.
 7. **Corpus as test suite** — iish should run the majority of the
