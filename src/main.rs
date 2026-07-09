@@ -156,78 +156,103 @@ fn usage_error(message: &str) -> ExitCode {
     ExitCode::FAILURE
 }
 
+/// How deep `Verdict::Group` (a brace group, or a call into a
+/// previously defined function) may nest before `run`/`report` give up
+/// instead of recursing further. Real installers nest a handful of
+/// levels deep at most; this exists to turn a script that tries to
+/// blow the stack (e.g. `f() { f; }; f`, a self-recursive function
+/// with no base case iish can evaluate, since it doesn't implement
+/// `if`) into a clean refusal instead of a crash.
+const MAX_GROUP_DEPTH: usize = 200;
+
 /// Execute the script statement by statement (interleaved model, see
 /// PLAN.md): evaluate against the live ledger and configuration,
 /// confirm any ask, run the compiled action natively, and abort on the
-/// first refusal or failure.
-fn run(
-    items: &[&parser::ast::CompoundListItem],
+/// first refusal or failure. A `Verdict::Group` (brace group or
+/// function call) recurses into its own statement list against the
+/// same live session, rather than compiling to a single `Action`.
+fn run(items: &[parser::ast::CompoundListItem], ask: prompt::AskMode, config: &Config) -> ExitCode {
+    let mut session = state::Session::new();
+    match run_items(items, ask, config, &mut session, 0) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(code) => code,
+    }
+}
+
+/// `Ok(())` once every statement in `items` ran; `Err(code)` the moment
+/// one is refused, declined, or fails — the caller (possibly a
+/// recursive call for an enclosing group) must stop at exactly that
+/// point too, so no later statement runs after an abort.
+fn run_items(
+    items: &[parser::ast::CompoundListItem],
     ask: prompt::AskMode,
     config: &Config,
-) -> ExitCode {
-    let mut session = state::Session::new();
+    session: &mut state::Session,
+    depth: usize,
+) -> Result<(), ExitCode> {
+    if depth > MAX_GROUP_DEPTH {
+        eprintln!(
+            "iish: nested groups/function calls are more than {MAX_GROUP_DEPTH} deep; aborting."
+        );
+        return Err(ExitCode::FAILURE);
+    }
 
     for item in items {
-        let statement = policy::evaluate_item(item, &session, config);
+        let statement = policy::evaluate_item(item, session, config);
         let raw = &statement.raw;
-        let action = match statement.verdict {
+        match statement.verdict {
             Verdict::Deny { reason } => {
                 eprintln!("iish: refusing `{raw}`: {reason}");
                 eprintln!("iish: aborting; no later statement was run.");
-                return ExitCode::FAILURE;
+                return Err(ExitCode::FAILURE);
             }
-            Verdict::Prompt { reason, action } => match prompt::confirm(ask, raw, &reason) {
-                Ok(true) => action,
-                Ok(false) => {
-                    eprintln!("iish: `{raw}` declined ({reason}); aborting.");
-                    return ExitCode::FAILURE;
+            Verdict::Group { statements } => {
+                eprintln!("iish> {raw}");
+                run_items(&statements, ask, config, session, depth + 1)?;
+            }
+            Verdict::Prompt { reason, action } => {
+                let action = match prompt::confirm(ask, raw, &reason) {
+                    Ok(true) => action,
+                    Ok(false) => {
+                        eprintln!("iish: `{raw}` declined ({reason}); aborting.");
+                        return Err(ExitCode::FAILURE);
+                    }
+                    Err(e) => {
+                        eprintln!("iish: cannot confirm `{raw}`: {e}");
+                        return Err(ExitCode::FAILURE);
+                    }
+                };
+                eprintln!("iish> {raw}");
+                if let Err(e) = exec::execute(&action, session) {
+                    eprintln!("iish: `{raw}` failed: {e}");
+                    return Err(ExitCode::FAILURE);
                 }
-                Err(e) => {
-                    eprintln!("iish: cannot confirm `{raw}`: {e}");
-                    return ExitCode::FAILURE;
+            }
+            Verdict::Allow { action, .. } => {
+                eprintln!("iish> {raw}");
+                if let Err(e) = exec::execute(&action, session) {
+                    eprintln!("iish: `{raw}` failed: {e}");
+                    return Err(ExitCode::FAILURE);
                 }
-            },
-            Verdict::Allow { action, .. } => action,
-        };
-        eprintln!("iish> {raw}");
-        if let Err(e) = exec::execute(&action, &mut session) {
-            eprintln!("iish: `{raw}` failed: {e}");
-            return ExitCode::FAILURE;
+            }
         }
     }
 
-    ExitCode::SUCCESS
+    Ok(())
 }
 
 /// `--dry-run`: print every statement's verdict without executing.
-/// Creations are simulated in the ledger so that later statements are
-/// judged as they would be in a live run.
-fn report(items: &[&parser::ast::CompoundListItem], config: &Config) -> ExitCode {
+/// Creations (and function definitions) are simulated in the ledger so
+/// that later statements — including ones nested in a brace group or a
+/// function call reached below — are judged as they would be in a live
+/// run.
+fn report(items: &[parser::ast::CompoundListItem], config: &Config) -> ExitCode {
     let mut session = state::Session::new();
     let mut denied = 0usize;
     let mut asks = 0usize;
 
-    println!("iish plan ({} statements):", items.len());
-    for item in items {
-        let statement = policy::evaluate_item(item, &session, config);
-        let (tag, detail) = match &statement.verdict {
-            Verdict::Allow { reason, action } => {
-                exec::record_would_create(action, &mut session);
-                ("ALLOW ", reason.clone())
-            }
-            Verdict::Prompt { reason, action } => {
-                asks += 1;
-                exec::record_would_create(action, &mut session);
-                ("PROMPT", reason.clone())
-            }
-            Verdict::Deny { reason } => {
-                denied += 1;
-                ("DENY  ", reason.clone())
-            }
-        };
-        println!("  [{tag}] {}", statement.raw);
-        println!("           {detail}");
-    }
+    println!("iish plan ({} top-level statement(s)):", items.len());
+    report_items(items, config, &mut session, 0, &mut denied, &mut asks);
 
     if denied > 0 {
         println!("\n{denied} statement(s) would be refused; nothing was executed.");
@@ -238,5 +263,47 @@ fn report(items: &[&parser::ast::CompoundListItem], config: &Config) -> ExitCode
     } else {
         println!("\nAll statements pass policy.");
         ExitCode::SUCCESS
+    }
+}
+
+fn report_items(
+    items: &[parser::ast::CompoundListItem],
+    config: &Config,
+    session: &mut state::Session,
+    depth: usize,
+    denied: &mut usize,
+    asks: &mut usize,
+) {
+    if depth > MAX_GROUP_DEPTH {
+        println!("  [DENY  ] (nested groups/function calls are more than {MAX_GROUP_DEPTH} deep)");
+        *denied += 1;
+        return;
+    }
+    let indent = "  ".repeat(depth);
+
+    for item in items {
+        let statement = policy::evaluate_item(item, session, config);
+        match statement.verdict {
+            Verdict::Allow { reason, action } => {
+                exec::record_would_create(&action, session);
+                println!("{indent}  [ALLOW ] {}", statement.raw);
+                println!("{indent}           {reason}");
+            }
+            Verdict::Prompt { reason, action } => {
+                *asks += 1;
+                exec::record_would_create(&action, session);
+                println!("{indent}  [PROMPT] {}", statement.raw);
+                println!("{indent}           {reason}");
+            }
+            Verdict::Deny { reason } => {
+                *denied += 1;
+                println!("{indent}  [DENY  ] {}", statement.raw);
+                println!("{indent}           {reason}");
+            }
+            Verdict::Group { statements } => {
+                println!("{indent}  [GROUP ] {}", statement.raw);
+                report_items(&statements, config, session, depth + 1, denied, asks);
+            }
+        }
     }
 }

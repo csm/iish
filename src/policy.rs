@@ -18,7 +18,10 @@ use crate::state::{self, Session};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Not `PartialEq`/`Eq`: `Group` carries `brush_parser::ast` nodes,
+/// which only derive those outside of brush-parser's own test build.
+/// Nothing here ever compares two `Verdict`s, so this costs nothing.
+#[derive(Debug, Clone)]
 pub enum Verdict {
     /// Safe to execute; `action` is the compiled operation.
     Allow { reason: String, action: Action },
@@ -27,6 +30,15 @@ pub enum Verdict {
     Prompt { reason: String, action: Action },
     /// Refused.
     Deny { reason: String },
+    /// A brace group, or a call to a function defined earlier in the
+    /// run: not a single compiled `Action`, but a nested statement list
+    /// that the runner must evaluate and execute one statement at a
+    /// time against the *same* live session — exactly like top-level
+    /// statements — because a later statement's verdict can depend on
+    /// ledger changes an earlier one in the same group made.
+    Group {
+        statements: Vec<ast::CompoundListItem>,
+    },
 }
 
 fn allow(reason: impl Into<String>, action: Action) -> Verdict {
@@ -59,12 +71,16 @@ pub struct Statement {
 /// The top-level statements of a parsed program, in source order. Each
 /// must be evaluated against the ledger as it stands when execution
 /// reaches it, so callers iterate these and call [`evaluate_item`] one
-/// statement at a time.
-pub fn items(program: &ast::Program) -> Vec<&ast::CompoundListItem> {
+/// statement at a time. Owned (cloned out of `program`) so the runner
+/// can walk this list with the exact same recursive helper it uses for
+/// a `Verdict::Group`'s nested statements, which have no `program` of
+/// their own to borrow from (they come from a brace-group node or a
+/// stored function body).
+pub fn items(program: &ast::Program) -> Vec<ast::CompoundListItem> {
     program
         .complete_commands
         .iter()
-        .flat_map(|list| list.0.iter())
+        .flat_map(|list| list.0.iter().cloned())
         .collect()
 }
 
@@ -135,7 +151,7 @@ fn is_shell_name(name: &str) -> bool {
 fn evaluate_command(cmd: &ast::Command, session: &Session, config: &Config) -> Verdict {
     match cmd {
         ast::Command::Simple(sc) => evaluate_simple_command(sc, session, config),
-        ast::Command::Function(_) => deny("function definitions are not implemented yet"),
+        ast::Command::Function(def) => evaluate_function_definition(def),
         ast::Command::ExtendedTest(_, redirects) => {
             if redirects.is_some() {
                 return deny("redirection is not implemented yet");
@@ -146,12 +162,48 @@ fn evaluate_command(cmd: &ast::Command, session: &Session, config: &Config) -> V
             if redirects.is_some() {
                 return deny("redirection is not implemented yet");
             }
-            deny(format!(
-                "{} are not implemented yet",
-                compound_kind(compound)
-            ))
+            match compound {
+                // `{ ...; }`: not a policy-gated operation in itself —
+                // it just sequences the statements inside it, which the
+                // runner evaluates one at a time against the same live
+                // session a top-level statement would see.
+                ast::CompoundCommand::BraceGroup(group) => Verdict::Group {
+                    statements: group.list.0.clone(),
+                },
+                other => deny(format!("{} are not implemented yet", compound_kind(other))),
+            }
         }
     }
+}
+
+/// `name() { ... }` / `function name { ... }`: registers `name` so a
+/// later call runs the body — nothing in the body runs now. Only a
+/// plain brace-group body with no redirects is supported; a subshell
+/// body (`name() ( ... )`) or one with its own redirects would need
+/// machinery (subshell isolation, redirect handling) iish doesn't have.
+fn evaluate_function_definition(def: &ast::FunctionDefinition) -> Verdict {
+    let name = match literal_word(&def.fname) {
+        Ok(n) => n,
+        Err(reason) => return deny(reason),
+    };
+    let ast::FunctionBody(compound, redirects) = &def.body;
+    if redirects.is_some() {
+        return deny("redirection on a function body is not implemented yet");
+    }
+    let ast::CompoundCommand::BraceGroup(group) = compound else {
+        return deny(format!(
+            "a function body that is {} (rather than a `{{ ... }}` brace group) is not \
+             implemented yet",
+            compound_kind(compound)
+        ));
+    };
+    allow(
+        format!("registers `{name}`; its body is only as safe as what it does, checked statement by statement when called"),
+        Action::DefineFunction {
+            name,
+            body: group.list.clone(),
+        },
+    )
 }
 
 fn compound_kind(compound: &ast::CompoundCommand) -> &'static str {
@@ -245,6 +297,19 @@ fn evaluate_simple_command(
 }
 
 fn evaluate_argv(name: &str, args: &[String], session: &Session, config: &Config) -> Verdict {
+    // A function defined earlier in the run shadows everything below,
+    // exactly as it would in bash (function lookup happens before
+    // builtins or a $PATH search). The call's own arguments are not
+    // bound to `$1`/`$@` inside the body — positional-parameter
+    // expansion isn't implemented — so a body that actually needs them
+    // will simply deny at that specific statement, same as any other
+    // script that references an unsupported expansion.
+    if let Some(body) = session.lookup_function(name) {
+        return Verdict::Group {
+            statements: body.0.clone(),
+        };
+    }
+
     if config.command_override(name) == Some(Verb::Deny) {
         return deny(format!("`{name}` is denied by configuration"));
     }
@@ -256,9 +321,11 @@ fn evaluate_argv(name: &str, args: &[String], session: &Session, config: &Config
         "mkdir" => evaluate_mkdir(args),
         "rm" => evaluate_rm(args, session),
         "chmod" => evaluate_chmod(args, session),
+        "cp" => evaluate_cp(args, session, config),
         "curl" => evaluate_curl(args, session, config),
         "wget" => evaluate_wget(args, session, config),
         "sha256sum" => evaluate_sha256sum(args, session),
+        "set" => evaluate_set(args),
 
         // A shell is exactly what iish exists to replace; no config
         // knob may reopen this escape hatch (see PLAN.md's "no pass
@@ -820,6 +887,162 @@ fn parse_chmod_mode(s: &str) -> Result<Mode, String> {
     Err(format!("chmod mode `{s}` is not supported yet"))
 }
 
+/// `cp`: implemented natively (PLAN.md's "filesystem mutation" tier)
+/// rather than falling into the generic subprocess tier. The source
+/// side is unrestricted — copying only reads — but each destination is
+/// governed by the same overwrite policy as `curl -o`/`wget -O`: a new
+/// path is always fine, one this run already owns is fine to
+/// overwrite, and a pre-existing foreign path is `config.overwrite`
+/// (ask by default).
+fn evaluate_cp(args: &[String], session: &Session, config: &Config) -> Verdict {
+    let mut recursive = false;
+    let mut end_of_flags = false;
+    let mut positional: Vec<&str> = Vec::new();
+    for arg in args {
+        if end_of_flags || arg == "-" {
+            positional.push(arg);
+        } else if arg == "--" {
+            end_of_flags = true;
+        } else if let Some(long) = arg.strip_prefix("--") {
+            match long {
+                "recursive" => recursive = true,
+                "force" => {} // no interactive-overwrite behavior to suppress
+                _ => return deny(format!("cp option `{arg}` is not supported")),
+            }
+        } else if let Some(cluster) = arg.strip_prefix('-') {
+            for c in cluster.chars() {
+                match c {
+                    'r' | 'R' => recursive = true,
+                    'f' => {}
+                    other => return deny(format!("cp option `-{other}` is not supported")),
+                }
+            }
+        } else {
+            positional.push(arg);
+        }
+    }
+
+    let Some((dest, sources)) = positional.split_last() else {
+        return deny("cp with no destination");
+    };
+    if sources.is_empty() {
+        return deny("cp with no source");
+    }
+
+    let dest_path = state::normalize(Path::new(dest));
+    let dest_is_dir = dest_path.is_dir();
+    if sources.len() > 1 && !dest_is_dir {
+        return deny(format!(
+            "cp with multiple sources requires `{}` to be an existing directory",
+            dest_path.display()
+        ));
+    }
+
+    let mut pairs: Vec<(PathBuf, PathBuf)> = Vec::with_capacity(sources.len());
+    for src in sources {
+        let src_path = state::normalize(Path::new(src));
+        if !src_path.exists() {
+            return deny(format!("cp: `{}` does not exist", src_path.display()));
+        }
+        if src_path.is_dir() && !recursive {
+            return deny(format!(
+                "cp: `{}` is a directory (missing -r)",
+                src_path.display()
+            ));
+        }
+        let target = if dest_is_dir {
+            let Some(file_name) = src_path.file_name() else {
+                return deny(format!("cp: `{}` has no file name", src_path.display()));
+            };
+            dest_path.join(file_name)
+        } else {
+            dest_path.clone()
+        };
+        pairs.push((src_path, target));
+    }
+
+    let foreign_overwrites = pairs
+        .iter()
+        .filter(|(_, dest)| dest.exists() && !session.owns(dest))
+        .count();
+    let action = Action::Copy { pairs, recursive };
+    if foreign_overwrites == 0 {
+        return allow(
+            "copies only to new paths, or paths this run already created",
+            action,
+        );
+    }
+    match config.overwrite {
+        Verb::Deny => deny(format!(
+            "cp would overwrite {foreign_overwrites} pre-existing path(s) it didn't create; \
+             overwriting is disabled by configuration"
+        )),
+        Verb::Ask => prompt(
+            format!(
+                "cp would overwrite {foreign_overwrites} pre-existing path(s) it didn't create"
+            ),
+            action,
+        ),
+        Verb::Allow => allow(
+            "overwrites pre-existing destination path(s) (allowed by configuration)",
+            action,
+        ),
+    }
+}
+
+/// `set`: iish only recognizes the option-flag form (`-e`/`-u`/`-x`,
+/// their `+` counterparts, and `-o`/`+o NAME`) — every one of them is a
+/// no-op here because iish's execution model already behaves as if
+/// `errexit`/`nounset` were always on: any failure or unsupported
+/// expansion aborts the run immediately (see `main.rs::run`), and
+/// referencing an unset variable is denied the moment it's attempted
+/// (parser.rs's `literal_word`). `set --` (rewriting the positional
+/// parameters) is not implemented, since positional-parameter
+/// expansion isn't either.
+fn evaluate_set(args: &[String]) -> Verdict {
+    const KNOWN_OPTION_NAMES: &[&str] = &[
+        "errexit",
+        "nounset",
+        "xtrace",
+        "pipefail",
+        "noglob",
+        "verbose",
+        "noclobber",
+    ];
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--" {
+            return deny("`set --` (rewriting positional parameters) is not implemented yet");
+        }
+        let (sign, rest) = match arg.strip_prefix('-').map(|r| ('-', r)) {
+            Some(pair) => pair,
+            None => match arg.strip_prefix('+') {
+                Some(r) => ('+', r),
+                None => return deny(format!("`set {arg}` is not supported")),
+            },
+        };
+        if rest.is_empty() {
+            return deny(format!("`set {sign}` with no options is not supported"));
+        }
+        if rest == "o" {
+            match iter.next() {
+                None => {} // bare `set -o`/`set +o` only prints current options
+                Some(name) if KNOWN_OPTION_NAMES.contains(&name.as_str()) => {}
+                Some(name) => return deny(format!("`set -o {name}` is not supported")),
+            }
+            continue;
+        }
+        if !rest.chars().all(|c| "eux".contains(c)) {
+            return deny(format!("set option `{sign}{rest}` is not supported"));
+        }
+    }
+    allow(
+        "recognizes only -e/-u/-x/-o <option> style flags, which iish's execution model \
+         already enforces (fail-fast, no expansion of unset variables)",
+        Action::Noop,
+    )
+}
+
 /// curl: only plain GET shapes are permitted, and iish performs the
 /// fetch itself with its own HTTP client rather than invoking the real
 /// binary. Every flag must be on the allowlist below; anything else —
@@ -1040,11 +1263,12 @@ mod tests {
 
     fn verdict_with_config(line: &str, session: &Session, config: &Config) -> Verdict {
         let program = parse(line).expect("should parse");
-        let item = *items(&program).first().expect("should have one statement");
+        let program_items = items(&program);
+        let item = program_items.first().expect("should have one statement");
         evaluate_item(item, session, config).verdict
     }
 
-    use Verdict::{Allow, Deny, Prompt};
+    use Verdict::{Allow, Deny, Group, Prompt};
 
     #[test]
     fn allows_echo() {
@@ -1183,7 +1407,7 @@ mod tests {
             ..Config::default()
         };
         assert!(matches!(
-            verdict_with_config("cp a b", &Session::new(), &config),
+            verdict_with_config("mv a b", &Session::new(), &config),
             Allow {
                 action: Action::Subprocess { .. },
                 ..
@@ -1690,5 +1914,192 @@ mod tests {
             Deny { .. }
         ));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("iish-policy-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn cp_to_new_destination_is_allowed() {
+        let dir = scratch_dir("cp-new");
+        let src = dir.join("src.txt");
+        std::fs::write(&src, b"payload").unwrap();
+        match verdict(&format!(
+            "cp {} {}",
+            src.display(),
+            dir.join("dest.txt").display()
+        )) {
+            Allow {
+                action: Action::Copy { pairs, recursive },
+                ..
+            } => {
+                assert!(!recursive);
+                assert_eq!(pairs, vec![(src.clone(), dir.join("dest.txt"))]);
+            }
+            other => panic!("expected allow/copy, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cp_overwriting_a_foreign_file_prompts() {
+        let dir = scratch_dir("cp-overwrite");
+        let src = dir.join("src.txt");
+        let dest = dir.join("dest.txt");
+        std::fs::write(&src, b"new").unwrap();
+        std::fs::write(&dest, b"old").unwrap();
+        assert!(matches!(
+            verdict(&format!("cp {} {}", src.display(), dest.display())),
+            Prompt {
+                action: Action::Copy { .. },
+                ..
+            }
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cp_overwriting_an_owned_file_is_allowed() {
+        let dir = scratch_dir("cp-overwrite-owned");
+        let src = dir.join("src.txt");
+        let dest = dir.join("dest.txt");
+        std::fs::write(&src, b"new").unwrap();
+        std::fs::write(&dest, b"old").unwrap();
+        let mut session = Session::new();
+        session.record_created(&dest);
+        assert!(matches!(
+            verdict_with(
+                &format!("cp {} {}", src.display(), dest.display()),
+                &session
+            ),
+            Allow {
+                action: Action::Copy { .. },
+                ..
+            }
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cp_denies_missing_source() {
+        assert!(matches!(
+            verdict("cp /tmp/iish-nonexistent-source.txt /tmp/iish-dest.txt"),
+            Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn cp_denies_directory_without_recursive() {
+        let dir = scratch_dir("cp-dir-no-r");
+        let src_dir = dir.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        assert!(matches!(
+            verdict(&format!(
+                "cp {} {}",
+                src_dir.display(),
+                dir.join("dest").display()
+            )),
+            Deny { .. }
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cp_recursive_of_directory_is_allowed() {
+        let dir = scratch_dir("cp-dir-r");
+        let src_dir = dir.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        match verdict(&format!(
+            "cp -r {} {}",
+            src_dir.display(),
+            dir.join("dest").display()
+        )) {
+            Allow {
+                action: Action::Copy { recursive, .. },
+                ..
+            } => assert!(recursive),
+            other => panic!("expected allow/copy, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn set_known_flags_are_allowed() {
+        for line in ["set -e", "set -eu", "set +x", "set -o pipefail", "set -o"] {
+            assert!(
+                matches!(
+                    verdict(line),
+                    Allow {
+                        action: Action::Noop,
+                        ..
+                    }
+                ),
+                "expected `{line}` to be allowed as a no-op"
+            );
+        }
+    }
+
+    #[test]
+    fn set_unknown_flag_is_denied() {
+        assert!(matches!(verdict("set -k"), Deny { .. }));
+        assert!(matches!(verdict("set -o nonexistent-option"), Deny { .. }));
+    }
+
+    #[test]
+    fn set_double_dash_is_denied() {
+        assert!(matches!(verdict("set -- a b c"), Deny { .. }));
+    }
+
+    #[test]
+    fn function_definition_is_allowed_and_registers_nothing_until_called() {
+        match verdict("greet() { echo hi; }") {
+            Allow {
+                action: Action::DefineFunction { name, body },
+                ..
+            } => {
+                assert_eq!(name, "greet");
+                assert_eq!(body.0.len(), 1);
+            }
+            other => panic!("expected allow/define-function, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn function_body_that_is_not_a_brace_group_is_denied() {
+        assert!(matches!(verdict("greet() ( echo hi )"), Deny { .. }));
+    }
+
+    #[test]
+    fn top_level_brace_group_produces_a_group_verdict() {
+        match verdict("{ echo hi; echo bye; }") {
+            Group { statements } => assert_eq!(statements.len(), 2),
+            other => panic!("expected a group verdict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn calling_a_defined_function_produces_a_group_verdict() {
+        // Reuse evaluate_function_definition's own compiled action to
+        // get a real function body, rather than constructing a
+        // brush-parser AST node by hand.
+        let def_verdict = verdict("greet() { echo hi; echo bye; }");
+        let Allow {
+            action: Action::DefineFunction { body, .. },
+            ..
+        } = def_verdict
+        else {
+            panic!("expected the definition to compile to DefineFunction");
+        };
+        let mut session = Session::new();
+        session.define_function("greet", body);
+
+        match verdict_with("greet", &session) {
+            Group { statements } => assert_eq!(statements.len(), 2),
+            other => panic!("expected a group verdict, got {other:?}"),
+        }
     }
 }

@@ -1,15 +1,21 @@
-//! Session ledger: what this script run has created so far.
+//! Session ledger: what this script run has created so far, and the
+//! functions it has defined.
 //!
 //! The ledger is the source of truth for "the script owns this path".
 //! Deletion and mode changes are only permitted on owned paths.
 
-use std::collections::HashSet;
+use crate::parser::ast;
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Default)]
 pub struct Session {
     /// Paths (files and directories) created by this run.
     created: HashSet<PathBuf>,
+    /// Functions defined by this run so far, by name, keyed to the
+    /// brace-group body that a call should run (see policy.rs's
+    /// `Verdict::Group`).
+    functions: HashMap<String, ast::CompoundList>,
 }
 
 impl Session {
@@ -29,6 +35,19 @@ impl Session {
         normalize(path)
             .ancestors()
             .any(|p| self.created.contains(p))
+    }
+
+    /// Record a function definition (`name() { ... }`), overwriting any
+    /// earlier definition of the same name — matching bash, where a
+    /// later definition replaces an earlier one.
+    pub fn define_function(&mut self, name: impl Into<String>, body: ast::CompoundList) {
+        self.functions.insert(name.into(), body);
+    }
+
+    /// The body to run for a call to `name`, if it was defined earlier
+    /// in this run.
+    pub fn lookup_function(&self, name: &str) -> Option<&ast::CompoundList> {
+        self.functions.get(name)
     }
 }
 
