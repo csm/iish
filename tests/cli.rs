@@ -1297,3 +1297,60 @@ fn sh_dash_c_after_a_pipe_is_not_treated_as_sub_iish() {
         stderr(&out)
     );
 }
+
+// ---------------------------------------------------------------------
+// Subshells, native touch, and the empty-command-word idiom -- the
+// remaining constructs real installers (zoxide, starship) need to run
+// their download/install paths to completion.
+// ---------------------------------------------------------------------
+#[test]
+fn subshell_isolates_scope_and_yields_status_to_and_or() {
+    let out = iish(
+        concat!(
+            "X=outer\n",
+            "( X=inner; echo \"in:$X\" )\n",
+            "echo \"out:$X\"\n",
+            // zoxide's `(echo | grep -q PATTERN) && err` shape:
+            "( echo 'normal' | grep -q 'rate limit' ) && echo NOPE || echo ok\n",
+        ),
+        &["--yes", "--allow", "grep"],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "in:inner\nout:outer\nok\n");
+}
+
+#[test]
+fn touch_then_rm_writability_probe_works() {
+    // starship's test_writable: create a probe file, remove it. Because
+    // native touch records ownership, iish's own rm is allowed to
+    // delete it -- no subprocess/ledger mismatch.
+    let base = scratch("touch-probe");
+    fs::create_dir_all(&base).unwrap();
+    let probe = base.join("test.txt");
+    let out = iish(
+        &format!(
+            "if touch {0} && rm {0}; then echo writable; fi\n",
+            probe.display()
+        ),
+        &[],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "writable\n");
+    assert!(!probe.exists(), "the probe file should have been removed");
+    fs::remove_dir_all(&base).unwrap();
+}
+
+#[test]
+fn empty_leading_word_runs_the_following_command() {
+    // `${sudo} touch f` with an empty $sudo installs to `touch f`.
+    let base = scratch("empty-word");
+    fs::create_dir_all(&base).unwrap();
+    let target = base.join("made");
+    let out = iish(
+        &format!("sudo=\n$sudo touch {}\n", target.display()),
+        &["--yes"],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(target.is_file(), "touch should have created the file");
+    fs::remove_dir_all(&base).unwrap();
+}

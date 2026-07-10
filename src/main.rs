@@ -471,6 +471,15 @@ fn run_statement(
             }
             status
         }
+        Verdict::Subshell { statements } => {
+            eprintln!("iish> {raw}");
+            let status = run_subshell(&statements, ask, config, session, depth, out)?;
+            if !status && !in_condition {
+                eprintln!("iish: `{raw}` exited with a non-zero status; aborting.");
+                return Err(fail());
+            }
+            status
+        }
         Verdict::ControlFlow(flow) => {
             eprintln!("iish> {raw}");
             return Err(match flow {
@@ -669,6 +678,52 @@ fn run_pipe(
         };
     }
     Ok(status)
+}
+
+/// `producer … | sh`: the `curl … | sh` pattern, handled as a
+/// `( ... )`: run `statements` in a subshell — against a snapshot of
+/// the session's scope (variables, functions, frames, `set -u`) and the
+/// working directory, both restored on the way out so the subshell's
+/// changes don't leak (bash subshell isolation). Real filesystem effects
+/// (created files) persist, since the ledger is not part of the
+/// snapshot. The subshell's own `exit` ends only the subshell, becoming
+/// its status; a refusal inside still aborts the whole run.
+fn run_subshell(
+    statements: &[parser::ast::CompoundListItem],
+    ask: prompt::AskMode,
+    config: &Config,
+    session: &mut state::Session,
+    depth: usize,
+    out: &mut Out,
+) -> Result<bool, Abort> {
+    let scope = session.snapshot_scope();
+    let cwd = std::env::current_dir().ok();
+    // Run the body in status-computing mode: an ordinary non-zero exit
+    // becomes the subshell's status (so `( … ) && x` / `( … ) || x`
+    // behave), while a refusal still aborts. Whether the subshell's own
+    // failure then aborts the parent is decided by the subshell's
+    // context back in `run_statement`, matching bash's errexit rules.
+    let result = run_items_inner(statements, ask, config, session, depth + 1, true, out);
+    session.restore_scope(scope);
+    if let Some(dir) = cwd {
+        let _ = std::env::set_current_dir(dir);
+    }
+    match result {
+        Ok(status) => Ok(status),
+        // The subshell's own `exit N` ends only the subshell.
+        Err(Abort::Exit(n)) => Ok(n == 0),
+        // A refusal/error propagates to the top, as everywhere.
+        Err(Abort::Fatal(code)) => Err(Abort::Fatal(code)),
+        // `return`/`break`/`continue` can't cross a subshell boundary in
+        // bash (it's a separate process); treat reaching here as a stop.
+        Err(Abort::Return(_) | Abort::Break(_) | Abort::Continue(_)) => {
+            eprintln!(
+                "iish: a subshell used `return`/`break`/`continue` with nothing inside it to \
+                 unwind to; aborting."
+            );
+            Err(fail())
+        }
+    }
 }
 
 /// `producer … | sh`: the `curl … | sh` pattern, handled as a
@@ -1245,6 +1300,10 @@ fn report_verdict(
                     asks,
                 );
             }
+        }
+        Verdict::Subshell { statements } => {
+            println!("{indent}  [SUBSHELL] {}", statement.raw);
+            report_items(&statements, config, session, depth + 1, denied, asks);
         }
         Verdict::ControlFlow(_) => {
             println!("{indent}  [ALLOW ] {}", statement.raw);

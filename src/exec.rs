@@ -107,6 +107,9 @@ pub enum Action {
     Print { text: String, dest: StdoutDest },
     /// `mkdir`: every path in `paths` was verified not to exist yet.
     MkDir { paths: Vec<PathBuf>, parents: bool },
+    /// `touch`: create each path if absent (recording ownership) or
+    /// bump its mtime if present. Vetted by policy.rs's `evaluate_touch`.
+    Touch { paths: Vec<PathBuf> },
     /// `rm` restricted to ledger-owned paths.
     Remove {
         paths: Vec<PathBuf>,
@@ -224,6 +227,7 @@ pub const NATIVE_COMMAND_NAMES: &[&str] = &[
     "echo",
     "printf",
     "mkdir",
+    "touch",
     "rm",
     "chmod",
     "cp",
@@ -251,6 +255,7 @@ pub fn execute(action: &Action, session: &mut Session, out: &mut Out) -> Result<
         Action::MkDir { paths, parents } => paths
             .iter()
             .try_for_each(|path| mkdir(path, *parents, session)),
+        Action::Touch { paths } => paths.iter().try_for_each(|path| touch(path, session)),
         Action::Remove {
             paths,
             recursive,
@@ -425,6 +430,13 @@ pub fn record_would_create(action: &Action, session: &mut Session) {
                 session.record_created(path);
             }
         }
+        Action::Touch { paths } => {
+            for path in paths {
+                if !path.exists() {
+                    session.record_created(path);
+                }
+            }
+        }
         Action::Fetch {
             output: FetchOutput::File(path),
             ..
@@ -595,6 +607,25 @@ fn mkdir(path: &Path, parents: bool, session: &mut Session) -> Result<(), String
     };
     result.map_err(|e| format!("mkdir: `{}`: {e}", path.display()))?;
     session.record_created(topmost);
+    Ok(())
+}
+
+/// `touch`: create `path` empty if it doesn't exist (recording
+/// ownership so a later `rm` of it is permitted), or open it to bump its
+/// mtime if it does. Refuses to act through a symlink like every other
+/// native write.
+fn touch(path: &Path, session: &mut Session) -> Result<(), String> {
+    assert_no_symlink_escape(path, false).map_err(|e| format!("touch: {e}"))?;
+    let existed = path.exists();
+    fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|e| format!("touch: `{}`: {e}", path.display()))?;
+    if !existed {
+        session.record_created(path);
+    }
     Ok(())
 }
 

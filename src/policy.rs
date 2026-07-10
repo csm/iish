@@ -142,6 +142,14 @@ pub enum Verdict {
     },
     /// `return`/`exit`/`break`/`continue`.
     ControlFlow(Flow),
+    /// `( ... )`: a subshell. The runner evaluates and runs `statements`
+    /// against a snapshot of the session, discarding their
+    /// variable/function/frame/`set -u` and working-directory changes on
+    /// exit (bash subshell isolation) but keeping real filesystem
+    /// effects. Its own `exit` ends only the subshell.
+    Subshell {
+        statements: Vec<ast::CompoundListItem>,
+    },
 }
 
 fn allow(reason: impl Into<String>, action: Action) -> Verdict {
@@ -407,6 +415,14 @@ fn evaluate_command(cmd: &ast::Command, ctx: &mut ExpandCtx, config: &Config) ->
                     body: clause.1.list.0.clone(),
                     until: true,
                 },
+                // `( ... )`: a subshell. Like a brace group, but the
+                // runner brackets it so variable/function/frame/`set -u`
+                // changes inside don't leak out (bash subshell semantics)
+                // and its own `exit` ends only the subshell. Real
+                // filesystem effects persist, exactly as in bash.
+                ast::CompoundCommand::Subshell(subshell) => Verdict::Subshell {
+                    statements: subshell.list.0.clone(),
+                },
                 other => deny(format!("{} are not implemented yet", compound_kind(other))),
             }
         }
@@ -611,17 +627,19 @@ fn evaluate_simple_command(
     // The command word is field-expanded too: `"$@"` (or a
     // whitespace-separated `$CMD`) as the command position — rustup's
     // `ensure mktemp -d` runs `"$@"` — yields the command name *and*
-    // its leading arguments.
+    // its leading arguments. It can also expand to *nothing* (an empty
+    // `${sudo}` in starship's `${sudo} tar …`), in which case bash skips
+    // it and the command comes from the first following word — so the
+    // command name is only resolved once every word is expanded.
     let name_word = cmd.word_or_name.as_ref().unwrap();
-    let mut name_fields = match word_fields(name_word, ctx) {
-        Ok(fields) => fields.into_iter(),
+    let mut words: Vec<String> = match word_fields(name_word, ctx) {
+        Ok(fields) => fields,
         Err(reason) => return deny(reason),
     };
-    let Some(name) = name_fields.next() else {
-        return deny("the command word expanded to nothing");
-    };
-
-    let mut args: Vec<String> = name_fields.collect();
+    // Assignment-shaped suffix items (`local x=1`) are collected
+    // separately; they're only meaningful for `local`, resolved below
+    // once the command name is known.
+    let mut assignment_args: Vec<(String, String)> = Vec::new();
     // The redirect shapes iish understands: a single `>>` onto a plain
     // filename (the env-file append grammar), `> /dev/null` and
     // `2> /dev/null` (discarding writes nothing anywhere, so there is
@@ -637,20 +655,13 @@ fn evaluate_simple_command(
         for item in &suffix.0 {
             match item {
                 ast::CommandPrefixOrSuffixItem::Word(w) => match word_fields(w, ctx) {
-                    Ok(fields) => args.extend(fields),
+                    Ok(fields) => words.extend(fields),
                     Err(reason) => return deny(reason),
                 },
                 ast::CommandPrefixOrSuffixItem::AssignmentWord(assignment, _) => {
-                    // Only `local` takes assignment-shaped arguments
-                    // meaningfully; hand it the rendered `NAME=value`
-                    // text and let `evaluate_local` take it apart.
-                    if name == "local" {
-                        match assignment_name_and_value(assignment, ctx) {
-                            Ok((n, v)) => args.push(format!("{n}={v}")),
-                            Err(reason) => return deny(reason),
-                        }
-                    } else {
-                        return deny("assignment arguments are not implemented yet");
+                    match assignment_name_and_value(assignment, ctx) {
+                        Ok(pair) => assignment_args.push(pair),
+                        Err(reason) => return deny(reason),
                     }
                 }
                 ast::CommandPrefixOrSuffixItem::IoRedirect(ast::IoRedirect::HereDocument(
@@ -668,6 +679,31 @@ fn evaluate_simple_command(
                     return deny("process substitution is not implemented yet");
                 }
             }
+        }
+    }
+
+    // With every word expanded, the first field is the command name. If
+    // there is none, the whole line expanded to nothing (e.g. an empty
+    // `${x}`) — bash runs nothing and succeeds.
+    let Some((name, arg_words)) = words.split_first() else {
+        if assignment_args.is_empty() {
+            return allow("expanded to no command; nothing to run", Action::Noop);
+        }
+        return deny("`VAR=value` prefix assignments are not implemented yet");
+    };
+    let name = name.clone();
+    let mut args: Vec<String> = arg_words.to_vec();
+    // Assignment-shaped arguments are only meaningful for `local`; hand
+    // it the rendered `NAME=value` text and let `evaluate_local` take it
+    // apart. For anything else they'd be a prefix assignment iish
+    // doesn't implement.
+    if !assignment_args.is_empty() {
+        if name == "local" {
+            for (n, v) in assignment_args {
+                args.push(format!("{n}={v}"));
+            }
+        } else {
+            return deny("assignment arguments are not implemented yet");
         }
     }
 
@@ -863,6 +899,7 @@ fn evaluate_argv(
         "echo" => evaluate_echo(args, redirects.stdout),
         "printf" => evaluate_printf(args, redirects.stdout),
         "mkdir" => evaluate_mkdir(args),
+        "touch" => evaluate_touch(args, ctx, config),
         "rm" => evaluate_rm(args, ctx),
         "chmod" => evaluate_chmod(args, ctx),
         "cp" => evaluate_cp(args, ctx, config),
@@ -1689,6 +1726,58 @@ fn evaluate_mkdir(args: &[String]) -> Verdict {
             parents,
         },
     )
+}
+
+/// `touch`: implemented natively (PLAN's filesystem-mutation tier)
+/// rather than as a subprocess so a file it creates is recorded in the
+/// ledger — installers `touch f && rm f` to probe writability
+/// (starship's `test_writable`), and a subprocess `touch` would leave
+/// iish's later native `rm` refusing a file it didn't know it created.
+/// Creating a new file is always fine; touching a *pre-existing* one
+/// this run doesn't own only bumps its mtime, governed by `overwrite`
+/// (it mutates a foreign path, if only its timestamp).
+fn evaluate_touch(args: &[String], ctx: &ExpandCtx, config: &Config) -> Verdict {
+    let mut end_of_flags = false;
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for arg in args {
+        if end_of_flags {
+            paths.push(state::normalize(Path::new(arg)));
+        } else if arg == "--" {
+            end_of_flags = true;
+        } else if arg.starts_with('-') && arg.len() > 1 {
+            return deny(format!("touch option `{arg}` is not supported"));
+        } else {
+            paths.push(state::normalize(Path::new(arg)));
+        }
+    }
+    if paths.is_empty() {
+        return deny("touch with no path");
+    }
+    let foreign = paths
+        .iter()
+        .filter(|p| p.exists() && !ctx.session.owns(p))
+        .count();
+    let action = Action::Touch { paths };
+    if foreign == 0 {
+        return allow(
+            "creates new files, or updates the timestamp of paths this run created",
+            action,
+        );
+    }
+    match config.overwrite {
+        Verb::Deny => deny(format!(
+            "touch would update the timestamp of {foreign} pre-existing path(s) it didn't \
+             create; disabled by configuration"
+        )),
+        Verb::Ask => prompt(
+            format!("touch would update the timestamp of {foreign} pre-existing path(s) it didn't create"),
+            action,
+        ),
+        Verb::Allow => allow(
+            "updates timestamps of pre-existing path(s) (allowed by configuration)",
+            action,
+        ),
+    }
 }
 
 fn evaluate_rm(args: &[String], ctx: &ExpandCtx) -> Verdict {
@@ -3035,11 +3124,52 @@ mod tests {
     }
 
     #[test]
-    fn subshells_are_still_denied() {
-        match verdict("( echo hi )") {
-            Deny { reason } => assert!(reason.contains("subshells"), "{reason}"),
-            other => panic!("expected deny, got {other:?}"),
+    fn subshell_produces_a_subshell_verdict() {
+        match verdict("( echo hi; echo bye )") {
+            Verdict::Subshell { statements } => assert_eq!(statements.len(), 2),
+            other => panic!("expected a subshell verdict, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn empty_command_word_takes_the_command_from_the_next_field() {
+        // `${sudo} tar …` with an empty `$sudo`: bash skips the empty
+        // leading word and `tar` becomes the command (here the
+        // subprocess tier, since tar has no native impl).
+        match verdict("$EMPTY_IISH_VAR uname -a") {
+            Prompt {
+                action: Action::Subprocess { name, args, .. },
+                ..
+            } => {
+                assert_eq!(name, "uname");
+                assert_eq!(args, vec!["-a"]);
+            }
+            other => panic!("expected prompt/subprocess for uname, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_line_expanding_to_nothing_is_a_noop() {
+        assert!(matches!(
+            verdict("$EMPTY_IISH_VAR"),
+            Allow {
+                action: Action::Noop,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn touch_of_a_new_file_is_allowed_and_recorded() {
+        let dir = scratch_dir("touch-new");
+        match verdict(&format!("touch {}", dir.join("marker").display())) {
+            Allow {
+                action: Action::Touch { paths },
+                ..
+            } => assert_eq!(paths, vec![dir.join("marker")]),
+            other => panic!("expected allow/touch, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -3763,13 +3893,14 @@ mod tests {
             Allow {
                 action: Action::DeclareLocal { assignments },
                 ..
-            } => assert_eq!(
-                assignments,
-                vec![
-                    ("x".to_string(), "1".to_string()),
-                    ("name".to_string(), String::new())
-                ]
-            ),
+            } => {
+                // Both are declared; plain names are collected before
+                // `NAME=value` assignment words (order is irrelevant for
+                // `local`, which declares each independently).
+                assert!(assignments.contains(&("x".to_string(), "1".to_string())));
+                assert!(assignments.contains(&("name".to_string(), String::new())));
+                assert_eq!(assignments.len(), 2);
+            }
             other => panic!("expected allow/declare-local, got {other:?}"),
         }
     }
