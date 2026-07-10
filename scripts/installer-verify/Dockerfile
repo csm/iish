@@ -12,6 +12,14 @@ COPY src ./src
 RUN cargo build --release
 
 FROM mirror.gcr.io/library/debian:bookworm-slim
+# bookworm-slim ships without a CA trust store, so iish's HTTPS client
+# (correctly) refuses every TLS certificate as UnknownIssuer -- which
+# blocks the live-install job's real downloads. ca-certificates gives
+# it the standard roots any real system has; the offline suite runs
+# with --network none and never uses them, so this only helps `--live`.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 RUN useradd --create-home --home-dir /home/tester --shell /bin/bash tester
 
 COPY --from=builder /src/target/release/iish /usr/local/bin/iish

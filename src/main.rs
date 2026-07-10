@@ -172,21 +172,29 @@ const MAX_GROUP_DEPTH: usize = 200;
 /// (`while true; do :; done`) or something iish shouldn't be babysitting.
 const MAX_LOOP_ITERATIONS: usize = 10_000;
 
-/// Why execution stopped early: the whole run is over (a refusal, a
-/// failure, or the script's own `exit`), or a control-flow builtin is
-/// unwinding to its boundary — `return` to the innermost function call,
-/// `break`/`continue` to the right enclosing loop. The runner functions
-/// propagate these up; `Verdict::Call` and the loop runners intercept
-/// what belongs to them.
+/// Why execution stopped early. Two of these end the whole run; the
+/// rest unwind to a boundary the runner intercepts:
+///
+/// * `Fatal` — a refusal, a declined prompt, or a genuine execution
+///   error. Always propagates all the way to the top: iish's
+///   "if we don't understand it, stop" posture. A sub-context (a
+///   `$(…)` substitution, a `… | sh` sub-interpret) re-raises it.
+/// * `Exit` — the script's *own* `exit N`. A sub-context absorbs it
+///   (bash subshell semantics: the child's `exit` ends only the child)
+///   and turns it into a status; at the top level it sets the run's
+///   exit code.
+/// * `Return`/`Break`/`Continue` — intercepted by `Verdict::Call` and
+///   the loop runners respectively.
 enum Abort {
-    Exit(ExitCode),
+    Fatal(ExitCode),
+    Exit(u8),
     Return(i32),
     Break(u32),
     Continue(u32),
 }
 
 fn fail() -> Abort {
-    Abort::Exit(ExitCode::FAILURE)
+    Abort::Fatal(ExitCode::FAILURE)
 }
 
 /// Runs `$(command)` substitutions for word expansion (parser.rs's
@@ -226,7 +234,7 @@ impl parser::Substituter for LiveSubstituter<'_> {
             // The script's own `exit N` inside a substitution ends just
             // the substitution, like bash's subshell semantics; its
             // status lands in `$?`.
-            Err(Abort::Exit(_)) if command_called_exit(&items) => session.set_last_status(1),
+            Err(Abort::Exit(n)) => session.set_last_status(n as i32),
             Err(_) => {
                 return Err(format!(
                     "command substitution `$({command})` was refused or failed; \
@@ -237,23 +245,6 @@ impl parser::Substituter for LiveSubstituter<'_> {
         String::from_utf8(buf)
             .map_err(|_| format!("command substitution `$({command})` produced non-UTF-8 output"))
     }
-}
-
-/// Whether a substitution's statement list is literally a bare
-/// `exit`/`exit N` — the only `Abort::Exit` a substitution absorbs
-/// (bash subshell semantics). Any other Exit reaching the substituter
-/// is a refusal or failure and stays fatal.
-fn command_called_exit(items: &[parser::ast::CompoundListItem]) -> bool {
-    items.iter().all(|item| {
-        let pipeline = &item.0.first;
-        item.0.additional.is_empty()
-            && pipeline.seq.len() == 1
-            && matches!(
-                &pipeline.seq[0],
-                parser::ast::Command::Simple(sc)
-                    if sc.word_or_name.as_ref().map(|w| w.value.as_str()) == Some("exit")
-            )
-    })
 }
 
 /// Execute the script statement by statement (interleaved model, see
@@ -272,7 +263,8 @@ fn run(items: &[parser::ast::CompoundListItem], ask: prompt::AskMode, config: &C
         &mut Out::inherit(),
     ) {
         Ok(_) => ExitCode::SUCCESS,
-        Err(Abort::Exit(code)) => code,
+        Err(Abort::Fatal(code)) => code,
+        Err(Abort::Exit(n)) => ExitCode::from(n),
         Err(Abort::Return(_)) => {
             eprintln!("iish: `return` reached the top level with no function call to return from; aborting.");
             ExitCode::FAILURE
@@ -469,11 +461,30 @@ fn run_statement(
             }
             status
         }
+        Verdict::PipeToShell { producer, shell } => {
+            eprintln!("iish> {raw}");
+            let status =
+                run_pipe_to_shell(&producer, &shell, raw, ask, config, session, depth, out)?;
+            if !status && !in_condition {
+                eprintln!("iish: `{raw}` exited with a non-zero status; aborting.");
+                return Err(fail());
+            }
+            status
+        }
+        Verdict::Subshell { statements } => {
+            eprintln!("iish> {raw}");
+            let status = run_subshell(&statements, ask, config, session, depth, out)?;
+            if !status && !in_condition {
+                eprintln!("iish: `{raw}` exited with a non-zero status; aborting.");
+                return Err(fail());
+            }
+            status
+        }
         Verdict::ControlFlow(flow) => {
             eprintln!("iish> {raw}");
             return Err(match flow {
                 Flow::Return(n) => Abort::Return(n),
-                Flow::Exit(n) => Abort::Exit(ExitCode::from(n)),
+                Flow::Exit(n) => Abort::Exit(n),
                 Flow::Break(n) => Abort::Break(n),
                 Flow::Continue(n) => Abort::Continue(n),
             });
@@ -667,6 +678,136 @@ fn run_pipe(
         };
     }
     Ok(status)
+}
+
+/// `producer … | sh`: the `curl … | sh` pattern, handled as a
+/// `( ... )`: run `statements` in a subshell — against a snapshot of
+/// the session's scope (variables, functions, frames, `set -u`) and the
+/// working directory, both restored on the way out so the subshell's
+/// changes don't leak (bash subshell isolation). Real filesystem effects
+/// (created files) persist, since the ledger is not part of the
+/// snapshot. The subshell's own `exit` ends only the subshell, becoming
+/// its status; a refusal inside still aborts the whole run.
+fn run_subshell(
+    statements: &[parser::ast::CompoundListItem],
+    ask: prompt::AskMode,
+    config: &Config,
+    session: &mut state::Session,
+    depth: usize,
+    out: &mut Out,
+) -> Result<bool, Abort> {
+    let scope = session.snapshot_scope();
+    let cwd = std::env::current_dir().ok();
+    // Run the body in status-computing mode: an ordinary non-zero exit
+    // becomes the subshell's status (so `( … ) && x` / `( … ) || x`
+    // behave), while a refusal still aborts. Whether the subshell's own
+    // failure then aborts the parent is decided by the subshell's
+    // context back in `run_statement`, matching bash's errexit rules.
+    let result = run_items_inner(statements, ask, config, session, depth + 1, true, out);
+    session.restore_scope(scope);
+    if let Some(dir) = cwd {
+        let _ = std::env::set_current_dir(dir);
+    }
+    match result {
+        Ok(status) => Ok(status),
+        // The subshell's own `exit N` ends only the subshell.
+        Err(Abort::Exit(n)) => Ok(n == 0),
+        // A refusal/error propagates to the top, as everywhere.
+        Err(Abort::Fatal(code)) => Err(Abort::Fatal(code)),
+        // `return`/`break`/`continue` can't cross a subshell boundary in
+        // bash (it's a separate process); treat reaching here as a stop.
+        Err(Abort::Return(_) | Abort::Break(_) | Abort::Continue(_)) => {
+            eprintln!(
+                "iish: a subshell used `return`/`break`/`continue` with nothing inside it to \
+                 unwind to; aborting."
+            );
+            Err(fail())
+        }
+    }
+}
+
+/// `producer … | sh`: the `curl … | sh` pattern, handled as a
+/// sub-context ("sub-iish") instead of refused — run `producer`,
+/// capture its combined stdout, then parse that text and interpret it
+/// through iish's own policy/runner in the same session. See
+/// `Verdict::PipeToShell`. The sub-script's own `exit` ends only the
+/// sub-context (subshell semantics: it becomes this pipeline's status);
+/// a refusal inside it still aborts the whole run.
+#[allow(clippy::too_many_arguments)]
+fn run_pipe_to_shell(
+    producer: &[parser::ast::Command],
+    shell: &str,
+    raw: &str,
+    ask: prompt::AskMode,
+    config: &Config,
+    session: &mut state::Session,
+    depth: usize,
+    out: &mut Out,
+) -> Result<bool, Abort> {
+    if depth > MAX_GROUP_DEPTH {
+        eprintln!(
+            "iish: `{shell}`-fed sub-interpreters are nested more than {MAX_GROUP_DEPTH} deep; \
+             aborting."
+        );
+        return Err(fail());
+    }
+
+    // Run the producer stages, capturing everything they emit: that is
+    // the script the shell would have run. A producer failure (a failed
+    // download, a refused stage) propagates and aborts, exactly as it
+    // would for any pipeline.
+    let mut script_bytes = Vec::new();
+    run_pipe(
+        producer,
+        raw,
+        ask,
+        config,
+        session,
+        depth,
+        &mut Out::capture(&mut script_bytes),
+    )?;
+
+    let script = match String::from_utf8(script_bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln!("iish: the script piped into `{shell}` is not valid UTF-8; aborting.");
+            return Err(fail());
+        }
+    };
+
+    let program = match parser::parse(&script) {
+        Ok(p) => p,
+        Err(reason) => {
+            eprintln!("iish: cannot parse the script piped into `{shell}`: {reason}");
+            eprintln!("iish: aborting; no later statement was run.");
+            return Err(fail());
+        }
+    };
+    let items = policy::items(&program);
+    if items.is_empty() {
+        // An empty download (or a producer that printed nothing): the
+        // shell would run nothing and succeed. So does iish.
+        return Ok(true);
+    }
+
+    eprintln!(
+        "iish: interpreting the script piped into `{shell}` myself (sub-iish); every statement \
+         is vetted under the same policy"
+    );
+    match run_items_inner(&items, ask, config, session, depth + 1, false, out) {
+        Ok(status) => Ok(status),
+        // The second stage's own `exit N` ends only this sub-context.
+        Err(Abort::Exit(n)) => Ok(n == 0),
+        // A refusal or execution error still stops the whole run.
+        Err(Abort::Fatal(code)) => Err(Abort::Fatal(code)),
+        Err(Abort::Return(_) | Abort::Break(_) | Abort::Continue(_)) => {
+            eprintln!(
+                "iish: the script piped into `{shell}` used `return`/`break`/`continue` at its \
+                 top level with nothing to unwind to; aborting."
+            );
+            Err(fail())
+        }
+    }
 }
 
 /// Run one resolved pipeline stage against `stage_out` (see `run_pipe`).
@@ -1128,6 +1269,41 @@ fn report_verdict(
                     asks,
                 );
             }
+        }
+        Verdict::PipeToShell { producer, shell } => {
+            // Which statements the second stage actually contains is only
+            // known once the producer really runs to fetch them, which
+            // dry-run never does — so report the producer and note that
+            // its output would be interpreted by iish (never handed to a
+            // real `shell`), each statement vetted then.
+            println!("{indent}  [PIPE→iish] {}", statement.raw);
+            println!(
+                "{indent}           the producer's output would be interpreted by iish itself \
+                 (not `{shell}`), each statement vetted under this same policy:"
+            );
+            for stage in producer {
+                let stage_statement = {
+                    let mut subst = parser::RefuseSubstituter(DRY_RUN_SUBSTITUTION);
+                    let mut ctx = parser::ExpandCtx {
+                        session,
+                        subst: &mut subst,
+                    };
+                    policy::evaluate_pipe_stage(&stage, &mut ctx, config)
+                };
+                report_verdict(
+                    stage_statement,
+                    indent,
+                    config,
+                    session,
+                    depth,
+                    denied,
+                    asks,
+                );
+            }
+        }
+        Verdict::Subshell { statements } => {
+            println!("{indent}  [SUBSHELL] {}", statement.raw);
+            report_items(&statements, config, session, depth + 1, denied, asks);
         }
         Verdict::ControlFlow(_) => {
             println!("{indent}  [ALLOW ] {}", statement.raw);

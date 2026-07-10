@@ -123,8 +123,33 @@ pub enum Verdict {
     /// policy decision strictly ordered. The pipeline's status is the
     /// last stage's, as in bash without `pipefail`.
     Pipe { stages: Vec<ast::Command> },
+    /// `producer … | sh` — the `curl … | sh` pattern. Its whole reason
+    /// to exist is to hand a downloaded script to a shell; iish's whole
+    /// reason to exist is to *be* that safe target. So instead of
+    /// refusing, the runner runs `producer` (the stages before the
+    /// shell), captures their combined stdout, and feeds that text back
+    /// into iish's own interpreter as a sub-context — every statement
+    /// vetted by the same policy, prompts and refusals intact. It is not
+    /// a pass-through to a real shell (there is none); it is recursion
+    /// into iish, the same recursive transparency command substitution
+    /// and `sudo sh -c` already have. The sub-script runs in the same
+    /// session but with subshell-style `exit` semantics: its own `exit`
+    /// ends only the sub-context (becoming the pipeline's status), while
+    /// a refusal inside it still aborts the whole run.
+    PipeToShell {
+        producer: Vec<ast::Command>,
+        shell: String,
+    },
     /// `return`/`exit`/`break`/`continue`.
     ControlFlow(Flow),
+    /// `( ... )`: a subshell. The runner evaluates and runs `statements`
+    /// against a snapshot of the session, discarding their
+    /// variable/function/frame/`set -u` and working-directory changes on
+    /// exit (bash subshell isolation) but keeping real filesystem
+    /// effects. Its own `exit` ends only the subshell.
+    Subshell {
+        statements: Vec<ast::CompoundListItem>,
+    },
 }
 
 fn allow(reason: impl Into<String>, action: Action) -> Verdict {
@@ -240,15 +265,69 @@ fn evaluate_pipeline(pipeline: &ast::Pipeline, ctx: &mut ExpandCtx, config: &Con
         [] => deny("empty pipeline"),
         [only] => evaluate_command(only, ctx, config),
         stages => {
-            if stages.iter().any(is_shell_invocation) {
-                deny("piping into a shell is exactly what iish exists to replace; refusing")
-            } else {
-                Verdict::Pipe {
+            // A shell as the *last* stage is `curl … | sh`: rather than
+            // refuse, iish runs the producer stages, captures their
+            // output, and interprets that script itself — the "sub-iish"
+            // (see `Verdict::PipeToShell`). A shell anywhere *earlier* in
+            // the chain would be reading another command's output as its
+            // program mid-pipeline, which iish has no coherent handling
+            // for; refuse that.
+            let (last, producer) = stages.split_last().expect("stages is non-empty");
+            if producer.iter().any(is_shell_invocation) {
+                return deny("piping through a shell in the middle of a pipeline is not supported");
+            }
+            match shell_stdin_target(last) {
+                Some(Ok(shell)) => Verdict::PipeToShell {
+                    producer: producer.to_vec(),
+                    shell,
+                },
+                Some(Err(reason)) => deny(reason),
+                None => Verdict::Pipe {
                     stages: stages.to_vec(),
+                },
+            }
+        }
+    }
+}
+
+/// If `cmd` is a shell reading its program from stdin — the receiving
+/// end of `curl … | sh` — return `Some(Ok(shell_name))`. A shell with
+/// arguments beyond the stdin flag (`-s`) is a different shape iish
+/// doesn't map cleanly yet, so it returns `Some(Err(reason))`. A
+/// non-shell command returns `None`.
+fn shell_stdin_target(cmd: &ast::Command) -> Option<Result<String, String>> {
+    let ast::Command::Simple(sc) = cmd else {
+        return None;
+    };
+    let name = sc.word_or_name.as_ref()?;
+    if !is_shell_name(&name.value) {
+        return None;
+    }
+    // Any suffix word other than `-s` (read from stdin) means the shell
+    // is being told to do something more specific (`-c 'cmd'`, a script
+    // path, positional args) that "interpret the piped script" doesn't
+    // capture. Only a redirect-free bare/`-s` invocation is handled.
+    if let Some(suffix) = &sc.suffix {
+        for item in &suffix.0 {
+            match item {
+                ast::CommandPrefixOrSuffixItem::Word(w) if w.value == "-s" => {}
+                ast::CommandPrefixOrSuffixItem::Word(w) => {
+                    return Some(Err(format!(
+                        "`{} {}` after a pipe is not supported; only a bare `{}` (or `{} -s`) \
+                         that runs the piped script is",
+                        name.value, w.value, name.value, name.value
+                    )));
+                }
+                _ => {
+                    return Some(Err(format!(
+                        "`{}` with a redirect or assignment after a pipe is not supported",
+                        name.value
+                    )));
                 }
             }
         }
     }
+    Some(Ok(name.value.clone()))
 }
 
 /// Evaluate one stage of a multi-stage pipeline at the moment the
@@ -335,6 +414,14 @@ fn evaluate_command(cmd: &ast::Command, ctx: &mut ExpandCtx, config: &Config) ->
                     condition: clause.0 .0.clone(),
                     body: clause.1.list.0.clone(),
                     until: true,
+                },
+                // `( ... )`: a subshell. Like a brace group, but the
+                // runner brackets it so variable/function/frame/`set -u`
+                // changes inside don't leak out (bash subshell semantics)
+                // and its own `exit` ends only the subshell. Real
+                // filesystem effects persist, exactly as in bash.
+                ast::CompoundCommand::Subshell(subshell) => Verdict::Subshell {
+                    statements: subshell.list.0.clone(),
                 },
                 other => deny(format!("{} are not implemented yet", compound_kind(other))),
             }
@@ -540,17 +627,19 @@ fn evaluate_simple_command(
     // The command word is field-expanded too: `"$@"` (or a
     // whitespace-separated `$CMD`) as the command position — rustup's
     // `ensure mktemp -d` runs `"$@"` — yields the command name *and*
-    // its leading arguments.
+    // its leading arguments. It can also expand to *nothing* (an empty
+    // `${sudo}` in starship's `${sudo} tar …`), in which case bash skips
+    // it and the command comes from the first following word — so the
+    // command name is only resolved once every word is expanded.
     let name_word = cmd.word_or_name.as_ref().unwrap();
-    let mut name_fields = match word_fields(name_word, ctx) {
-        Ok(fields) => fields.into_iter(),
+    let mut words: Vec<String> = match word_fields(name_word, ctx) {
+        Ok(fields) => fields,
         Err(reason) => return deny(reason),
     };
-    let Some(name) = name_fields.next() else {
-        return deny("the command word expanded to nothing");
-    };
-
-    let mut args: Vec<String> = name_fields.collect();
+    // Assignment-shaped suffix items (`local x=1`) are collected
+    // separately; they're only meaningful for `local`, resolved below
+    // once the command name is known.
+    let mut assignment_args: Vec<(String, String)> = Vec::new();
     // The redirect shapes iish understands: a single `>>` onto a plain
     // filename (the env-file append grammar), `> /dev/null` and
     // `2> /dev/null` (discarding writes nothing anywhere, so there is
@@ -566,20 +655,13 @@ fn evaluate_simple_command(
         for item in &suffix.0 {
             match item {
                 ast::CommandPrefixOrSuffixItem::Word(w) => match word_fields(w, ctx) {
-                    Ok(fields) => args.extend(fields),
+                    Ok(fields) => words.extend(fields),
                     Err(reason) => return deny(reason),
                 },
                 ast::CommandPrefixOrSuffixItem::AssignmentWord(assignment, _) => {
-                    // Only `local` takes assignment-shaped arguments
-                    // meaningfully; hand it the rendered `NAME=value`
-                    // text and let `evaluate_local` take it apart.
-                    if name == "local" {
-                        match assignment_name_and_value(assignment, ctx) {
-                            Ok((n, v)) => args.push(format!("{n}={v}")),
-                            Err(reason) => return deny(reason),
-                        }
-                    } else {
-                        return deny("assignment arguments are not implemented yet");
+                    match assignment_name_and_value(assignment, ctx) {
+                        Ok(pair) => assignment_args.push(pair),
+                        Err(reason) => return deny(reason),
                     }
                 }
                 ast::CommandPrefixOrSuffixItem::IoRedirect(ast::IoRedirect::HereDocument(
@@ -597,6 +679,31 @@ fn evaluate_simple_command(
                     return deny("process substitution is not implemented yet");
                 }
             }
+        }
+    }
+
+    // With every word expanded, the first field is the command name. If
+    // there is none, the whole line expanded to nothing (e.g. an empty
+    // `${x}`) — bash runs nothing and succeeds.
+    let Some((name, arg_words)) = words.split_first() else {
+        if assignment_args.is_empty() {
+            return allow("expanded to no command; nothing to run", Action::Noop);
+        }
+        return deny("`VAR=value` prefix assignments are not implemented yet");
+    };
+    let name = name.clone();
+    let mut args: Vec<String> = arg_words.to_vec();
+    // Assignment-shaped arguments are only meaningful for `local`; hand
+    // it the rendered `NAME=value` text and let `evaluate_local` take it
+    // apart. For anything else they'd be a prefix assignment iish
+    // doesn't implement.
+    if !assignment_args.is_empty() {
+        if name == "local" {
+            for (n, v) in assignment_args {
+                args.push(format!("{n}={v}"));
+            }
+        } else {
+            return deny("assignment arguments are not implemented yet");
         }
     }
 
@@ -792,6 +899,7 @@ fn evaluate_argv(
         "echo" => evaluate_echo(args, redirects.stdout),
         "printf" => evaluate_printf(args, redirects.stdout),
         "mkdir" => evaluate_mkdir(args),
+        "touch" => evaluate_touch(args, ctx, config),
         "rm" => evaluate_rm(args, ctx),
         "chmod" => evaluate_chmod(args, ctx),
         "cp" => evaluate_cp(args, ctx, config),
@@ -1618,6 +1726,58 @@ fn evaluate_mkdir(args: &[String]) -> Verdict {
             parents,
         },
     )
+}
+
+/// `touch`: implemented natively (PLAN's filesystem-mutation tier)
+/// rather than as a subprocess so a file it creates is recorded in the
+/// ledger — installers `touch f && rm f` to probe writability
+/// (starship's `test_writable`), and a subprocess `touch` would leave
+/// iish's later native `rm` refusing a file it didn't know it created.
+/// Creating a new file is always fine; touching a *pre-existing* one
+/// this run doesn't own only bumps its mtime, governed by `overwrite`
+/// (it mutates a foreign path, if only its timestamp).
+fn evaluate_touch(args: &[String], ctx: &ExpandCtx, config: &Config) -> Verdict {
+    let mut end_of_flags = false;
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for arg in args {
+        if end_of_flags {
+            paths.push(state::normalize(Path::new(arg)));
+        } else if arg == "--" {
+            end_of_flags = true;
+        } else if arg.starts_with('-') && arg.len() > 1 {
+            return deny(format!("touch option `{arg}` is not supported"));
+        } else {
+            paths.push(state::normalize(Path::new(arg)));
+        }
+    }
+    if paths.is_empty() {
+        return deny("touch with no path");
+    }
+    let foreign = paths
+        .iter()
+        .filter(|p| p.exists() && !ctx.session.owns(p))
+        .count();
+    let action = Action::Touch { paths };
+    if foreign == 0 {
+        return allow(
+            "creates new files, or updates the timestamp of paths this run created",
+            action,
+        );
+    }
+    match config.overwrite {
+        Verb::Deny => deny(format!(
+            "touch would update the timestamp of {foreign} pre-existing path(s) it didn't \
+             create; disabled by configuration"
+        )),
+        Verb::Ask => prompt(
+            format!("touch would update the timestamp of {foreign} pre-existing path(s) it didn't create"),
+            action,
+        ),
+        Verb::Allow => allow(
+            "updates timestamps of pre-existing path(s) (allowed by configuration)",
+            action,
+        ),
+    }
 }
 
 fn evaluate_rm(args: &[String], ctx: &ExpandCtx) -> Verdict {
@@ -2744,11 +2904,33 @@ mod tests {
     }
 
     #[test]
-    fn denies_piping_to_shell() {
+    fn piping_into_a_shell_becomes_a_sub_iish_verdict() {
+        // `curl … | sh` is handled, not refused: the producer (`curl`)
+        // is captured and the downloaded script interpreted by iish.
+        match verdict("curl https://x.io/i.sh | sh") {
+            Verdict::PipeToShell { producer, shell } => {
+                assert_eq!(producer.len(), 1);
+                assert_eq!(shell, "sh");
+            }
+            other => panic!("expected a PipeToShell verdict, got {other:?}"),
+        }
+        // `sh -s` (read the script from stdin) is the same shape.
         assert!(matches!(
-            verdict("curl https://x.io/i.sh | sh"),
+            verdict("curl https://x.io/i.sh | bash -s"),
+            Verdict::PipeToShell { .. }
+        ));
+    }
+
+    #[test]
+    fn a_shell_with_args_or_mid_pipeline_is_still_refused() {
+        // `sh -c '…'` after a pipe is a different shape (an inline
+        // command, not "run the piped script"): refused.
+        assert!(matches!(
+            verdict("curl https://x.io/i.sh | sh -c 'echo hi'"),
             Deny { .. }
         ));
+        // A shell that is not the last stage has no coherent handling.
+        assert!(matches!(verdict("echo hi | sh | grep x"), Deny { .. }));
     }
 
     #[test]
@@ -2942,11 +3124,52 @@ mod tests {
     }
 
     #[test]
-    fn subshells_are_still_denied() {
-        match verdict("( echo hi )") {
-            Deny { reason } => assert!(reason.contains("subshells"), "{reason}"),
-            other => panic!("expected deny, got {other:?}"),
+    fn subshell_produces_a_subshell_verdict() {
+        match verdict("( echo hi; echo bye )") {
+            Verdict::Subshell { statements } => assert_eq!(statements.len(), 2),
+            other => panic!("expected a subshell verdict, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn empty_command_word_takes_the_command_from_the_next_field() {
+        // `${sudo} tar …` with an empty `$sudo`: bash skips the empty
+        // leading word and `tar` becomes the command (here the
+        // subprocess tier, since tar has no native impl).
+        match verdict("$EMPTY_IISH_VAR uname -a") {
+            Prompt {
+                action: Action::Subprocess { name, args, .. },
+                ..
+            } => {
+                assert_eq!(name, "uname");
+                assert_eq!(args, vec!["-a"]);
+            }
+            other => panic!("expected prompt/subprocess for uname, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_line_expanding_to_nothing_is_a_noop() {
+        assert!(matches!(
+            verdict("$EMPTY_IISH_VAR"),
+            Allow {
+                action: Action::Noop,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn touch_of_a_new_file_is_allowed_and_recorded() {
+        let dir = scratch_dir("touch-new");
+        match verdict(&format!("touch {}", dir.join("marker").display())) {
+            Allow {
+                action: Action::Touch { paths },
+                ..
+            } => assert_eq!(paths, vec![dir.join("marker")]),
+            other => panic!("expected allow/touch, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -3670,13 +3893,14 @@ mod tests {
             Allow {
                 action: Action::DeclareLocal { assignments },
                 ..
-            } => assert_eq!(
-                assignments,
-                vec![
-                    ("x".to_string(), "1".to_string()),
-                    ("name".to_string(), String::new())
-                ]
-            ),
+            } => {
+                // Both are declared; plain names are collected before
+                // `NAME=value` assignment words (order is irrelevant for
+                // `local`, which declares each independently).
+                assert!(assignments.contains(&("x".to_string(), "1".to_string())));
+                assert!(assignments.contains(&("name".to_string(), String::new())));
+                assert_eq!(assignments.len(), 2);
+            }
             other => panic!("expected allow/declare-local, got {other:?}"),
         }
     }

@@ -13,11 +13,26 @@ use std::path::{Component, Path, PathBuf};
 /// (its `$1`/`$@`/`$#`) and the variables `local` has declared in it so
 /// far. Frames stack — bash scopes `local` dynamically, so a callee
 /// sees (and may assign) its caller's locals too.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Frame {
     function_name: String,
     positional: Vec<String>,
     locals: HashMap<String, String>,
+}
+
+/// The isolatable part of a [`Session`] — everything a subshell may
+/// change without those changes leaking back to its parent (bash's
+/// subshell semantics): variables, function definitions, the call
+/// frames, `$?`, and the `set -u` flag. The created-paths ledger is
+/// deliberately *not* captured: files a subshell creates on disk really
+/// are created, exactly as in bash, so ownership records must persist.
+#[derive(Debug, Clone)]
+pub struct ScopeSnapshot {
+    functions: HashMap<String, ast::CompoundList>,
+    variables: HashMap<String, String>,
+    frames: Vec<Frame>,
+    last_status: i32,
+    nounset: bool,
 }
 
 #[derive(Debug, Default)]
@@ -52,6 +67,30 @@ pub struct Session {
 impl Session {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Capture the isolatable scope before entering a subshell, so it
+    /// can be restored afterward (see [`ScopeSnapshot`]).
+    pub fn snapshot_scope(&self) -> ScopeSnapshot {
+        ScopeSnapshot {
+            functions: self.functions.clone(),
+            variables: self.variables.clone(),
+            frames: self.frames.clone(),
+            last_status: self.last_status,
+            nounset: self.nounset,
+        }
+    }
+
+    /// Restore the scope captured by [`Self::snapshot_scope`] when a
+    /// subshell exits, discarding its variable/function/frame changes
+    /// (but keeping any real filesystem effects, which live in the
+    /// separate created-paths ledger).
+    pub fn restore_scope(&mut self, snapshot: ScopeSnapshot) {
+        self.functions = snapshot.functions;
+        self.variables = snapshot.variables;
+        self.frames = snapshot.frames;
+        self.last_status = snapshot.last_status;
+        self.nounset = snapshot.nounset;
     }
 
     /// Record that the script created `path`. Recording a directory

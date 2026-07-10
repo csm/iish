@@ -147,24 +147,31 @@ trap cleanup EXIT
 # unattended-provisioning posture: approve the tar/grep/... an installer
 # shells out to), still never handing anything to a shell.
 # ---------------------------------------------------------------------
-live_names="zoxide starship"
+# starship first: it downloads a release *asset* from GitHub (not the
+# rate-limited API), so it's the most reliable end-to-end proof.
+# zoxide runs last (and hits api.github.com, which shared CI runners can
+# rate-limit) so its transcript is what a failing tail shows.
+live_names="starship zoxide"
 
 set_live_expectation() {
     # Per-installer: the docker env that makes it non-interactive and
-    # user-space, and the command that proves the install worked.
+    # user-space, and the command that proves the install worked. Every
+    # one gets ~/.local/bin pre-created (IISH_PREMAKE_DIR) -- ordinary
+    # provisioning; starship in particular refuses to create it itself.
     verify_cmd=()
     live_env=(-e "HOME=/home/tester"
         -e "PATH=/home/tester/.local/bin:/usr/local/bin:/usr/bin:/bin"
+        -e "IISH_PREMAKE_DIR=/home/tester/.local/bin"
         -e "IISH_EXTRA_FLAGS=--subprocess=allow")
     case "$1" in
-        zoxide)
-            # Installs to ~/.local/bin by default, no prompt.
-            verify_cmd=(zoxide --version)
-            ;;
         starship)
             # FORCE skips its y/n prompt; BIN_DIR makes it user-space.
             live_env+=(-e "FORCE=1" -e "BIN_DIR=/home/tester/.local/bin")
             verify_cmd=(starship --version)
+            ;;
+        zoxide)
+            # Installs to ~/.local/bin by default, no prompt.
+            verify_cmd=(zoxide --version)
             ;;
         *)
             echo "verify-installers: no live expectation for '$1'" >&2
@@ -258,13 +265,15 @@ fi
 #     past this point;
 #   * an interactive prompt -- starship reads a y/n confirmation from
 #     /dev/tty, which an unattended container does not have;
-#   * `curl ... | sh` -- atuin's real installer is a tiny bootstrap that
-#     pipes a second stage straight into a shell, the exact anti-pattern
-#     iish exists to refuse; it can never proceed under iish, by design;
 #   * a still-unimplemented shell construct -- nvm parallelizes its
 #     downloads with background jobs (`&`), which iish doesn't implement
 #     yet, and deno bails out itself when neither `unzip` nor `7z` is on
 #     the slim image.
+#
+# (atuin's `curl ... | sh` bootstrap is no longer a special case: iish
+# runs the curl, captures the piped second-stage script, and interprets
+# it itself -- "sub-iish" -- so atuin stops at the same network boundary
+# as the rest.)
 #
 # So for each we pin *where* it stops as a regression guard: if the
 # reason changes without this file being updated, either iish regressed
@@ -324,10 +333,13 @@ set_corpus_expectation() {
             ;;
         atuin)
             # atuin's real one-liner installer is `curl ... | sh`: it
-            # downloads a second-stage script and pipes it straight into
-            # a shell. iish refuses that categorically (its whole reason
-            # to exist), so atuin can never proceed under iish by design.
-            expected_reason="piping into a shell is exactly what iish exists to replace"
+            # fetches a second-stage script and pipes it into a shell.
+            # iish no longer refuses that -- it runs the curl, captures
+            # the script, and interprets the second stage itself
+            # ("sub-iish", recursively transparent). So atuin now stops
+            # at the same network boundary as the others: the fetch of
+            # its own second stage, which --network none blocks.
+            expected_reason="atuin-installer.sh"
             verify_cmd=(atuin --version)
             ;;
         deno)

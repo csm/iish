@@ -22,6 +22,19 @@ cannot parse, or parses but does not recognize as a safe installer
 operation, is refused (individually skippable / fatal — TBD). There is
 no "pass through to bash" escape hatch.
 
+This is *why* `curl … | sh` is not a dead end: piping a downloaded
+script into a shell is the whole thing iish exists to make safe, so
+instead of refusing the pipe, iish runs the producer (`curl`), captures
+the script, and interprets it *itself* as a sub-context — every
+statement vetted under the same policy. That is recursion into iish, not
+a pass-through to bash (there is no shell in the loop); it is the same
+recursive transparency `sudo sh -c '…'` and command substitution already
+have. A refusal inside the second stage aborts the run exactly as it
+would at the top level; the second stage's own `exit` ends only the
+sub-context (bash subshell semantics). Only a stdin-reading shell
+(`sh`/`bash -s`) is handled this way; `sh -c '…'` and a shell mid-pipeline
+stay refused.
+
 ## Safety policy (initial rules)
 
 | Operation | Policy |
@@ -173,7 +186,10 @@ src/
                tripping abort-on-failure), `Not` (`! pipeline`, exempt from
                errexit), `Pipe` (a real multi-stage pipeline, stages run
                sequentially with each one's stdout buffered as the next's
-               stdin), and `ControlFlow` (`return`/`exit`/`break`/
+               stdin), `PipeToShell` (`curl … | sh`: run the producer,
+               capture its output, and interpret that script through
+               iish itself — the sub-iish recursion of the Core
+               principle), and `ControlFlow` (`return`/`exit`/`break`/
                `continue`, which the runner unwinds to the right
                boundary). `test`/`[ ]` and `case` matching are evaluated
                natively with no side effects. The native builtins live
@@ -331,12 +347,16 @@ doubles as the integration-test corpus later.
    `2>&1`/`>&2` redirects, and the `%b`/octal `printf` escapes. `set -u`
    is honored as a real toggle (unset expands to empty by default, bash's
    behavior, and is refused only after the script itself opts in).
-   With those in place every one of the seven curated corpus installers
-   now runs its *entire* platform-detection and setup logic and stops
-   only at a genuine external boundary — the network (downloads, under
-   `--network none`), an interactive `/dev/tty` prompt, `curl … | sh`
-   (refused by design), or the one still-unimplemented construct
-   (background jobs, `&`, which nvm uses to parallelize its downloads).
+   `curl … | sh` is handled as a sub-context ("sub-iish", see the Core
+   principle above) rather than refused, so even atuin's pipe-into-a-shell
+   bootstrap runs its producer and would interpret the fetched second
+   stage. With all of that in place every one of the seven curated corpus
+   installers now runs its *entire* platform-detection and setup logic
+   and stops only at a genuine external boundary — the network (downloads,
+   under `--network none` — including the second-stage fetch atuin's
+   `curl … | sh` now reaches), an interactive `/dev/tty` prompt, or the
+   one still-unimplemented construct (background jobs, `&`, which nvm uses
+   to parallelize its downloads).
    `scripts/verify-installers.sh` (Docker-isolated,
    network-disabled, runnable in CI or by hand — see
    `.github/workflows/installer-verify.yml`) runs a curated,
