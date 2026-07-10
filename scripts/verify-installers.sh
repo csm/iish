@@ -18,11 +18,19 @@
 # nothing newer than the bash 3.2 macOS still ships as /bin/bash.
 #
 # Usage:
-#   scripts/verify-installers.sh                 # everything
+#   scripts/verify-installers.sh                 # the hermetic, offline suite
 #   scripts/verify-installers.sh --only rustup    # one corpus installer
 #   scripts/verify-installers.sh --only adversarial:root-wipe
 #   scripts/verify-installers.sh --verbose        # always show container output
 #   scripts/verify-installers.sh --keep-image     # skip the final `docker rmi`
+#   scripts/verify-installers.sh --live           # ONLY the live-install job
+#
+# By default this runs entirely offline (`docker run --network none`): a
+# self-check, the corpus regression pins, and the adversarial corpus,
+# none of which touch the network. `--live` instead runs the separate
+# live-install job, which DOES reach the real internet to install a
+# curated, trustworthy, user-space installer end to end and verify the
+# program it produces actually runs -- see the "Live installs" section.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -30,17 +38,19 @@ image_tag="iish-verify:local"
 verbose=0
 keep_image=0
 only=""
+live=0
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --verbose | -v) verbose=1 ;;
         --keep-image) keep_image=1 ;;
+        --live) live=1 ;;
         --only)
             shift
             only="${1:-}"
             ;;
         -h | --help)
-            sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         *)
@@ -58,6 +68,7 @@ fi
 
 pass_count=0
 fail_count=0
+xfail_count=0
 results=()
 
 pass() {
@@ -70,6 +81,17 @@ fail() {
     fail_count=$((fail_count + 1))
     results+=("FAIL|$1")
     printf '  \033[31mFAIL\033[0m  %s\n' "$1"
+}
+
+xfail() {
+    # Expected failure: the run stopped exactly where we've pinned it.
+    # Reported honestly as a failure to install (never as a PASS), but
+    # it doesn't fail the suite -- only a pin *breaking* does. This is
+    # what keeps the suite green-by-default while the corpus can't yet
+    # run to completion (milestone 7), without hiding that fact.
+    xfail_count=$((xfail_count + 1))
+    results+=("XFAIL|$1")
+    printf '  \033[33mXFAIL\033[0m %s\n' "$1"
 }
 
 show_log() {
@@ -110,6 +132,94 @@ cleanup() {
 trap cleanup EXIT
 
 # ---------------------------------------------------------------------
+# Live installs (opt-in, --live): the one place this harness reaches the
+# real internet. Each installer here is a curated, trustworthy, entirely
+# user-space one that iish can drive to *completion* -- it downloads a
+# real release, installs it under $HOME, and then we run the installed
+# program to prove it actually works. This is the genuine "green" the
+# offline corpus can only gesture at: a real installer, installed for
+# real, verified by running it.
+#
+# It is deliberately a SEPARATE job (its own workflow, not a PR gate):
+# it depends on live upstreams (GitHub releases, their API rate limits),
+# so an upstream hiccup must never red the hermetic suite that guards
+# iish's own behavior. iish runs with --subprocess=allow here (the
+# unattended-provisioning posture: approve the tar/grep/... an installer
+# shells out to), still never handing anything to a shell.
+# ---------------------------------------------------------------------
+live_names="zoxide starship"
+
+set_live_expectation() {
+    # Per-installer: the docker env that makes it non-interactive and
+    # user-space, and the command that proves the install worked.
+    verify_cmd=()
+    live_env=(-e "HOME=/home/tester"
+        -e "PATH=/home/tester/.local/bin:/usr/local/bin:/usr/bin:/bin"
+        -e "IISH_EXTRA_FLAGS=--subprocess=allow")
+    case "$1" in
+        zoxide)
+            # Installs to ~/.local/bin by default, no prompt.
+            verify_cmd=(zoxide --version)
+            ;;
+        starship)
+            # FORCE skips its y/n prompt; BIN_DIR makes it user-space.
+            live_env+=(-e "FORCE=1" -e "BIN_DIR=/home/tester/.local/bin")
+            verify_cmd=(starship --version)
+            ;;
+        *)
+            echo "verify-installers: no live expectation for '$1'" >&2
+            exit 1
+            ;;
+    esac
+}
+
+if [ "$live" -eq 1 ]; then
+    echo "==> Live installs (real network, real upstreams)"
+    for name in $live_names; do
+        if want live "$name"; then
+            set_live_expectation "$name"
+            log="$(mktemp)"
+            status=0
+            # NOTE: no `--network none` here -- this job needs the internet.
+            docker run --rm \
+                "${live_env[@]}" \
+                -v "$repo_root/corpus/cache:/corpus:ro" \
+                "$image_tag" corpus yes "/corpus/$name.sh" "${verify_cmd[@]}" >"$log" 2>&1 || status=$?
+            case "$status" in
+                0)
+                    pass "$name: real end-to-end install completed AND \`${verify_cmd[*]}\` works"
+                    [ "$verbose" -eq 1 ] && show_log "$log"
+                    ;;
+                2)
+                    fail "$name: iish ran it to completion but \`${verify_cmd[*]}\` FAILED -- the installed program isn't usable"
+                    show_log "$log"
+                    ;;
+                *)
+                    fail "$name: did not complete a live install (container exit $status) -- an upstream/network issue, or a real iish gap"
+                    show_log "$log"
+                    ;;
+            esac
+            rm -f "$log"
+        fi
+    done
+
+    echo
+    echo "==> Summary"
+    for r in ${results[@]+"${results[@]}"}; do
+        status="${r%%|*}"
+        name="${r#*|}"
+        case "$status" in
+            PASS) printf '  \033[32mPASS\033[0m  %s\n' "$name" ;;
+            *) printf '  \033[31mFAIL\033[0m  %s\n' "$name" ;;
+        esac
+    done
+    echo
+    echo "==> $pass_count passed, $fail_count failed"
+    [ "$fail_count" -eq 0 ]
+    exit
+fi
+
+# ---------------------------------------------------------------------
 # Harness self-check: a synthetic, offline "installer" built entirely
 # from iish's currently-supported grammar, which really does run to
 # completion today. Its only job is to prove the "iish finished; now
@@ -135,18 +245,38 @@ fi
 # Corpus: real installer scripts, run for real (not --dry-run) through
 # iish, non-interactively (--yes: approve every ask, the posture a CI
 # gate or unattended provisioning run would take). None of the 17
-# scripts in corpus/cache/ run to completion through iish today --
-# iish's evaluator still denies control flow and several expansions
-# outright (PLAN.md milestone 7 is "should run the majority of the
-# corpus to completion"; today is 0/17). So for each of these we pin
-# *why* it currently stops, as a regression guard: if the reason changes
-# without this file being updated, either iish's behavior regressed, or
-# it progressed -- both are worth a human looking at. Stopping for the
-# pinned reason is still reported as a FAIL, not a pass: the installer
-# genuinely did not install anything, and a test suite that calls that
-# a pass isn't telling the truth. If a script ever
-# runs to completion, the paired verify command decides pass/fail for
-# real, exactly as it eventually should for the whole corpus.
+# scripts in corpus/cache/ run to *completion* through iish today, but
+# not because iish can't follow their logic anymore -- with functions,
+# loops, command substitution, pipelines, parameter expansion, `local`,
+# `read`, `cd`, and the rest of milestone 7 landed, every one of these
+# now runs its full platform-detection and setup logic and stops only
+# at a genuine *external* boundary:
+#
+#   * the network -- these containers run with --network none, so the
+#     moment an installer reaches its actual download it fails to
+#     connect (rustup, zoxide, pnpm). With a network they would proceed
+#     past this point;
+#   * an interactive prompt -- starship reads a y/n confirmation from
+#     /dev/tty, which an unattended container does not have;
+#   * `curl ... | sh` -- atuin's real installer is a tiny bootstrap that
+#     pipes a second stage straight into a shell, the exact anti-pattern
+#     iish exists to refuse; it can never proceed under iish, by design;
+#   * a still-unimplemented shell construct -- nvm parallelizes its
+#     downloads with background jobs (`&`), which iish doesn't implement
+#     yet, and deno bails out itself when neither `unzip` nor `7z` is on
+#     the slim image.
+#
+# So for each we pin *where* it stops as a regression guard: if the
+# reason changes without this file being updated, either iish regressed
+# or it progressed further -- both worth a human looking at, and both
+# FAIL the suite. Stopping at the pinned boundary is reported as XFAIL
+# (an expected, known-tracked non-completion -- the installer did not
+# actually install anything, so calling it a PASS would be a lie), which
+# does not fail the suite. If a script ever runs to completion (e.g. the
+# offline-completable ones, once the harness grows a local payload
+# mirror), the paired verify command decides pass/fail for real -- and
+# the self-check above already exercises that completed-install path
+# end to end today.
 # ---------------------------------------------------------------------
 corpus_names="rustup starship zoxide atuin deno pnpm nvm"
 
@@ -154,60 +284,58 @@ set_corpus_expectation() {
     verify_cmd=()
     case "$1" in
         rustup)
-            # `2> /dev/null` stderr redirects are implemented now (so
-            # the redirect that used to stop this one no longer does):
-            # `has_local 2>/dev/null` actually calls into has_local's
-            # body, which trips on `local`, a shell builtin iish has no
-            # binary to exec and doesn't implement.
-            expected_reason="\`local\` is a shell builtin; iish does not implement it"
+            # Runs the whole downloader/arch/bitness probe, then reaches
+            # its real download: `_err=$(curl ... --output "$2" 2>&1)`.
+            # iish performs the GET with its own client, which can't
+            # connect under --network none, so the substitution fails
+            # here. With a network, rustup would continue.
+            expected_reason='_err=$(curl $_retry'
             verify_cmd=(rustc --version)
             ;;
         zoxide)
-            # Reached from inside a call to zoxide's own \`main\`
-            # function (a real function call, not just its definition)
-            # -- see the indented DENY in \`iish --dry-run\`'s output.
-            # `&&`/`||` are implemented now; this trips on `main`'s own
-            # `"$@"`, a special parameter (only plain `$VAR`/`${VAR}` is
-            # implemented).
-            expected_reason="special parameters (\`\$?\`, \`\$#\`, \`\$@\`, \`\$*\`, ...) are not supported yet"
+            # Full arch detection and release lookup run; stops inside
+            # `_package="$(download_zoxide "${_arch}")"`, i.e. its actual
+            # binary download -- a network boundary, not a syntax gap.
+            expected_reason='$(download_zoxide'
             verify_cmd=(zoxide --version)
             ;;
         pnpm)
-            # `if`/`test`/`[` (including `-t`) and bare `VAR=value`
-            # assignment are all implemented now; this trips on the next
-            # unimplemented construct, a command substitution
-            # (`$(tty_mkbold 34)`) as the assigned value.
-            expected_reason="command substitution is not supported yet"
+            # Runs its platform detection, then stops fetching the
+            # version manifest: `version_json="$(download
+            # "https://registry.npmjs.org/@pnpm/exe")"` -- network.
+            expected_reason='$(download "https://registry.npmjs.org'
             verify_cmd=(pnpm --version)
             ;;
         nvm)
-            # Reached from inside a brace group actually running now,
-            # into the very first `if` -- `if`/`[`/`||` are implemented;
-            # this trips on `$BASH_VERSION`, a real environment variable
-            # that's genuinely unset in iish's own process (iish isn't
-            # bash), matching what a real, non-bash `sh` would see too.
-            expected_reason="\`\$BASH_VERSION\` is unset"
+            # Runs profile detection, the install-dir setup, and the
+            # git-vs-script method choice, reaching the download step --
+            # which nvm backgrounds with `&` to parallelize. Background
+            # jobs are the one construct still unimplemented here.
+            expected_reason="background jobs (\`&\`) are not implemented yet"
             verify_cmd=(bash -lc 'source "$HOME/.nvm/nvm.sh" 2>/dev/null; command -v nvm')
             ;;
         starship)
-            # `set -eu` and bare `VAR=value` assignment are implemented
-            # now; this trips on the next unimplemented construct, a
-            # command substitution (`$(tput bold ...)`) as the assigned
-            # value.
-            expected_reason="command substitution is not supported yet"
+            # Runs platform/arch detection and prints its install
+            # summary, then asks to confirm: `read -r yn < /dev/tty`.
+            # An unattended container has no controlling terminal, so
+            # the read fails -- an interactive boundary, not a syntax gap.
+            expected_reason="read: could not read a line from"
             verify_cmd=(starship --version)
             ;;
         atuin)
-            # Bare `VAR=value` assignment is implemented now; this trips
-            # on the next unimplemented construct, a `for` loop.
-            expected_reason="for-loops are not implemented yet"
+            # atuin's real one-liner installer is `curl ... | sh`: it
+            # downloads a second-stage script and pipes it straight into
+            # a shell. iish refuses that categorically (its whole reason
+            # to exist), so atuin can never proceed under iish by design.
+            expected_reason="piping into a shell is exactly what iish exists to replace"
             verify_cmd=(atuin --version)
             ;;
         deno)
-            # `if`/`test`/`[` and `&&`/`||` are implemented now; this
-            # trips on the condition's `!` pipeline negation, the next
-            # unimplemented construct.
-            expected_reason="\`!\` pipeline negation is not implemented yet"
+            # Runs its full arch/OS detection, then bails out on its own
+            # (`exit 1`) because neither `unzip` nor `7z` is present on
+            # the slim image -- deno's own precondition check, reached
+            # only because iish ran everything up to it.
+            expected_reason="either unzip or 7z is required"
             verify_cmd=(deno --version)
             ;;
         *)
@@ -238,14 +366,13 @@ for name in $corpus_names; do
                 ;;
             1)
                 if grep -qF "$expected_reason" "$log"; then
-                    # It stopped for exactly the reason we've pinned, but
-                    # that still means the installer did NOT actually
-                    # install anything -- a known, tracked failure, not a
-                    # pass. Reporting this as a pass would hide that the
-                    # corpus doesn't run to completion yet (milestone 7);
-                    # tests should say what actually happened.
-                    fail "$name: stopped as pinned (\"$expected_reason\") -- installation did not complete (known, tracked failure)"
-                    show_log "$log"
+                    # It stopped for exactly the reason we've pinned.
+                    # That still means the installer did NOT actually
+                    # install anything, so it's reported as an expected
+                    # failure, never a pass -- but only an unexpected
+                    # outcome (the pin breaking) fails the suite.
+                    xfail "$name: stopped as pinned (\"$expected_reason\") -- installation did not complete (known, tracked failure)"
+                    [ "$verbose" -eq 1 ] && show_log "$log"
                 else
                     fail "$name: stopped for an UNEXPECTED reason (expected \"$expected_reason\") -- update or investigate the pin"
                     show_log "$log"
@@ -337,13 +464,13 @@ echo "==> Summary"
 for r in "${results[@]}"; do
     status="${r%%|*}"
     name="${r#*|}"
-    if [ "$status" = PASS ]; then
-        printf '  \033[32mPASS\033[0m  %s\n' "$name"
-    else
-        printf '  \033[31mFAIL\033[0m  %s\n' "$name"
-    fi
+    case "$status" in
+        PASS) printf '  \033[32mPASS\033[0m  %s\n' "$name" ;;
+        XFAIL) printf '  \033[33mXFAIL\033[0m %s\n' "$name" ;;
+        *) printf '  \033[31mFAIL\033[0m  %s\n' "$name" ;;
+    esac
 done
 
 echo
-echo "==> $pass_count passed, $fail_count failed"
+echo "==> $pass_count passed, $xfail_count expected failures (known, tracked), $fail_count failed"
 [ "$fail_count" -eq 0 ]

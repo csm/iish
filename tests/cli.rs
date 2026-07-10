@@ -859,8 +859,365 @@ fn assigned_variable_can_drive_a_case_value() {
 }
 
 #[test]
-fn referencing_an_unset_variable_aborts_the_run() {
-    let out = iish("echo $NOT_ASSIGNED_ANYWHERE_IISH\n", &[]);
+fn unset_variable_expands_empty_unless_the_script_sets_nounset() {
+    // bash's default: an unset variable expands to empty.
+    let out = iish("echo one$NOT_ASSIGNED_ANYWHERE_IISH.two\n", &[]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "one.two\n");
+
+    // The script's own `set -u` makes the same reference fatal.
+    let out = iish("set -u\necho $NOT_ASSIGNED_ANYWHERE_IISH\n", &[]);
     assert!(!out.status.success());
     assert_eq!(stdout(&out), "");
+}
+
+// ---------------------------------------------------------------------
+// Milestone 7 features: functions with arguments, `local`, loops,
+// command substitution, pipelines, `!`, control flow, `cd`, and the
+// expansions installers lean on.
+// ---------------------------------------------------------------------
+
+#[test]
+fn function_arguments_bind_positional_parameters() {
+    let out = iish(
+        "greet() { echo \"hello $1 (of $#)\"; }\ngreet world extra\n",
+        &[],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "hello world (of 2)\n");
+}
+
+#[test]
+fn at_expansion_forwards_argument_boundaries() {
+    let out = iish(
+        "inner() { echo \"$#:$1|$2\"; }\nouter() { inner \"$@\"; }\nouter one 'two words'\n",
+        &[],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "2:one|two words\n");
+}
+
+#[test]
+fn local_scopes_to_the_call_and_return_sets_the_status() {
+    let out = iish(
+        concat!(
+            "X=global\n",
+            "f() { local X=inner; echo \"in: $X\"; return 3; }\n",
+            "if f; then echo returned-true; else echo returned-false; fi\n",
+            "echo \"out: $X\"\n",
+        ),
+        &[],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "in: inner\nreturned-false\nout: global\n");
+}
+
+#[test]
+fn local_outside_a_function_is_refused() {
+    let out = iish("local X=1\n", &[]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("outside a function"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn for_loop_iterates_with_break_and_continue() {
+    let out = iish(
+        concat!(
+            "for x in a b c d; do\n",
+            "  if [ \"$x\" = b ]; then continue; fi\n",
+            "  if [ \"$x\" = d ]; then break; fi\n",
+            "  echo \"got $x\"\n",
+            "done\n",
+        ),
+        &[],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "got a\ngot c\n");
+}
+
+#[test]
+fn while_loop_with_shift_walks_arguments() {
+    let out = iish(
+        "args() { while [ \"$#\" -gt 0 ]; do echo \"arg $1\"; shift; done; }\nargs x y\n",
+        &[],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "arg x\narg y\n");
+}
+
+#[test]
+fn until_loop_runs_until_the_condition_holds() {
+    let out = iish(
+        "V=start\nuntil [ \"$V\" = done ]; do echo tick; V=done; done\necho after\n",
+        &[],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "tick\nafter\n");
+}
+
+#[test]
+fn command_substitution_captures_native_output() {
+    let out = iish("GREETING=$(echo hello)\necho \"got: ${GREETING}\"\n", &[]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "got: hello\n");
+}
+
+#[test]
+fn command_substitution_captures_a_subprocess_and_a_function() {
+    let out = iish(
+        concat!(
+            "os=$(uname -s)\n",
+            "shout() { echo \"OS=$os\"; }\n",
+            "LINE=$(shout)\n",
+            "echo \"$LINE\"\n",
+        ),
+        &["--allow", "uname"],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "OS=Linux\n");
+}
+
+#[test]
+fn command_substitution_inside_dry_run_is_reported_not_run() {
+    let out = iish("V=$(echo hi)\n", &["--dry-run"]);
+    assert!(!out.status.success());
+    assert!(
+        stdout(&out).contains("--dry-run"),
+        "stdout: {}",
+        stdout(&out)
+    );
+}
+
+#[test]
+fn pipeline_feeds_captured_output_between_stages() {
+    let out = iish(
+        "echo HELLO | tr '[:upper:]' '[:lower:]'\n",
+        &["--allow", "tr"],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "hello\n");
+}
+
+#[test]
+fn pipeline_with_a_function_stage_works() {
+    let out = iish(
+        "produce() { echo ABC; }\nX=$(produce | tr '[:upper:]' '[:lower:]')\necho \"$X\"\n",
+        &["--allow", "tr"],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "abc\n");
+}
+
+#[test]
+fn piping_into_a_shell_is_still_refused() {
+    let out = iish("echo 'rm -rf /' | sh\n", &["--yes"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("piping into a shell"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn bang_negates_a_condition_without_aborting() {
+    let out = iish(
+        "if ! [ -d /definitely-not-a-real-dir-iish ]; then echo absent; fi\n! true\necho survived\n",
+        &[],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "absent\nsurvived\n");
+}
+
+#[test]
+fn exit_ends_the_run_with_the_given_status() {
+    let out = iish("echo before\nexit 7\necho after\n", &[]);
+    assert_eq!(out.status.code(), Some(7));
+    assert_eq!(stdout(&out), "before\n");
+}
+
+#[test]
+fn cd_changes_the_directory_for_later_statements() {
+    let dir = scratch("cd-target");
+    fs::create_dir_all(&dir).unwrap();
+    let out = iish(
+        &format!(
+            "cd {}\necho \"now in $PWD\" > /dev/null\npwd\n",
+            dir.display()
+        ),
+        &["--allow", "pwd"],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        stdout(&out)
+            .trim_end()
+            .ends_with(dir.file_name().unwrap().to_str().unwrap()),
+        "stdout: {}",
+        stdout(&out)
+    );
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn default_value_and_pattern_removal_expansions() {
+    let out = iish(
+        concat!(
+            "V=${UNSET_IISH_X:-fallback}\n",
+            "P=/usr/local/bin/tool\n",
+            "echo \"$V ${P##*/} ${P%/*}\"\n",
+        ),
+        &[],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "fallback tool /usr/local/bin\n");
+}
+
+#[test]
+fn command_v_reports_functions_and_missing_commands() {
+    let out = iish(
+        concat!(
+            "mine() { echo x; }\n",
+            "if command -v mine > /dev/null; then echo have-mine; fi\n",
+            "if ! command -v iish-not-a-real-cmd > /dev/null; then echo missing; fi\n",
+        ),
+        &[],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "have-mine\nmissing\n");
+}
+
+#[test]
+fn cat_heredoc_prints_its_banner() {
+    let out = iish(
+        "cat << EOF\nbanner line one\n  line two\nEOF\necho after\n",
+        &[],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "banner line one\n  line two\nafter\n");
+}
+
+#[test]
+fn read_from_dev_null_fails_like_bash() {
+    let out = iish(
+        "if read -r answer < /dev/null; then echo read-ok; else echo no-input; fi\n",
+        &[],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "no-input\n");
+}
+
+#[test]
+fn question_mark_tracks_the_last_status() {
+    let out = iish(
+        "false || true\nif [ \"$?\" -eq 0 ]; then echo zero; fi\n",
+        &[],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "zero\n");
+}
+
+#[test]
+fn unset_removes_a_variable_and_a_function() {
+    let out = iish(
+        concat!(
+            "f() { echo from-function; }\n",
+            "unset -f f\n",
+            "V=set\nunset V\n",
+            "echo \"v=${V:-gone}\"\n",
+        ),
+        &[],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "v=gone\n");
+}
+
+#[test]
+fn runaway_recursion_via_substitution_is_refused() {
+    let out = iish("f() { X=$(f); }\nf\n", &[]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("deep"), "stderr: {}", stderr(&out));
+}
+
+// ---------------------------------------------------------------------
+// The "green path" for a realistic installer: a script shaped like a
+// real one — function definitions and calls, `case`-based platform
+// detection, `local`, a real HTTP download, `chmod +x`, and a PATH
+// export into an rc file — runs to completion through iish and leaves
+// behind a working program. This is the end state the whole corpus is
+// working toward (PLAN.md milestone 7); proving it here, through the
+// real binary against a real (local) HTTP server, shows the harness
+// and iish can actually reach a completed, verified install.
+// ---------------------------------------------------------------------
+#[test]
+fn a_realistic_download_installer_runs_to_completion_and_installs_a_working_tool() {
+    let base = scratch("realistic-install");
+    let home = base.join("home");
+    let prefix = base.join("opt/mytool");
+    fs::create_dir_all(&home).unwrap();
+
+    // The payload is a tiny shell program the "installer" downloads,
+    // marks executable, and puts on PATH — standing in for a real
+    // downloaded binary.
+    let payload = b"#!/bin/sh\necho mytool-1.0\n";
+    let url = serve(payload, 1);
+
+    let script = format!(
+        r#"
+set -eu
+
+detect_platform() {{
+    case "$(uname -s)" in
+        Linux*) echo linux ;;
+        Darwin*) echo darwin ;;
+        *) echo unknown ;;
+    esac
+}}
+
+install() {{
+    local prefix="$1"
+    local plat
+    plat="$(detect_platform)"
+    echo "installing for ${{plat}}"
+    mkdir -p "${{prefix}}/bin"
+    curl -fsSL "{url}" -o "${{prefix}}/bin/mytool"
+    chmod +x "${{prefix}}/bin/mytool"
+    echo "export PATH=\"${{prefix}}/bin:$PATH\"" >> "$HOME/.profile"
+}}
+
+for candidate in "{prefix_disp}"; do
+    install "$candidate"
+done
+echo done
+"#,
+        url = url,
+        prefix_disp = prefix.display(),
+    );
+
+    let out = iish_with_home(&script, &["--yes", "--allow", "uname"], &home);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+
+    // The install completed: the tool is on disk, executable, and runs.
+    let tool = prefix.join("bin/mytool");
+    assert!(tool.is_file(), "the downloaded tool should exist");
+    use std::os::unix::fs::PermissionsExt;
+    assert_ne!(
+        fs::metadata(&tool).unwrap().permissions().mode() & 0o111,
+        0,
+        "the tool should be executable"
+    );
+    let run = Command::new(&tool).output().expect("tool should run");
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "mytool-1.0\n");
+
+    // And the PATH export landed in the rc file via the env-file grammar.
+    let profile = fs::read_to_string(home.join(".profile")).unwrap();
+    assert!(
+        profile.contains("mytool/bin"),
+        "the PATH export should have been appended: {profile}"
+    );
+
+    fs::remove_dir_all(&base).unwrap();
 }

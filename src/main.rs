@@ -17,7 +17,8 @@ mod prompt;
 mod state;
 
 use config::{CliOverrides, Config, NetworkPolicy, Verb};
-use policy::Verdict;
+use exec::Out;
+use policy::{Flow, Verdict};
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -156,63 +157,156 @@ fn usage_error(message: &str) -> ExitCode {
     ExitCode::FAILURE
 }
 
-/// How deep `Verdict::Group`/`Verdict::If` (a brace group, a call into a
-/// previously defined function, or an `if`'s condition/branches) may
-/// nest before `run`/`report` give up instead of recursing further. Real
-/// installers nest a handful of levels deep at most; this exists to turn
-/// a script that tries to blow the stack (e.g. `f() { f; }; f`, a
-/// self-recursive function with no base case, or `while true` if that
-/// were implemented) into a clean refusal instead of a crash.
+/// How deep nested statement lists (a brace group, a function call, a
+/// loop body, an `if`'s condition/branches, a command substitution) may
+/// nest before `run`/`report` give up instead of recursing further.
+/// Real installers nest a handful of levels deep at most; this exists
+/// to turn a script that tries to blow the stack (e.g. `f() { f; }; f`,
+/// a self-recursive function with no base case) into a clean refusal
+/// instead of a crash.
 const MAX_GROUP_DEPTH: usize = 200;
+
+/// How many times a single `while`/`until` loop may iterate before iish
+/// refuses to keep going: installers' loops walk argument lists and
+/// retry counters, so a loop that reaches this bound is either runaway
+/// (`while true; do :; done`) or something iish shouldn't be babysitting.
+const MAX_LOOP_ITERATIONS: usize = 10_000;
+
+/// Why execution stopped early: the whole run is over (a refusal, a
+/// failure, or the script's own `exit`), or a control-flow builtin is
+/// unwinding to its boundary — `return` to the innermost function call,
+/// `break`/`continue` to the right enclosing loop. The runner functions
+/// propagate these up; `Verdict::Call` and the loop runners intercept
+/// what belongs to them.
+enum Abort {
+    Exit(ExitCode),
+    Return(i32),
+    Break(u32),
+    Continue(u32),
+}
+
+fn fail() -> Abort {
+    Abort::Exit(ExitCode::FAILURE)
+}
+
+/// Runs `$(command)` substitutions for word expansion (parser.rs's
+/// `Substituter`): parse the inner text and run it through the very
+/// same policy/prompt/execute loop as the enclosing script, with the
+/// script's stdout captured — the capture becomes the substitution's
+/// value. The inner statements run in condition mode: a non-zero exit
+/// is recorded in `$?` (as bash does for a substitution) rather than
+/// aborting the run, but a refusal or declined prompt still is fatal.
+struct LiveSubstituter<'a> {
+    ask: prompt::AskMode,
+    config: &'a Config,
+    depth: usize,
+}
+
+impl parser::Substituter for LiveSubstituter<'_> {
+    fn substitute(
+        &mut self,
+        session: &mut state::Session,
+        command: &str,
+    ) -> Result<String, String> {
+        let program = parser::parse(command)
+            .map_err(|e| format!("could not parse command substitution `$({command})`: {e}"))?;
+        let items = policy::items(&program);
+        let mut buf = Vec::new();
+        let result = run_items_inner(
+            &items,
+            self.ask,
+            self.config,
+            session,
+            self.depth + 1,
+            true,
+            &mut Out::capture(&mut buf),
+        );
+        match result {
+            Ok(status) => session.set_last_status(if status { 0 } else { 1 }),
+            // The script's own `exit N` inside a substitution ends just
+            // the substitution, like bash's subshell semantics; its
+            // status lands in `$?`.
+            Err(Abort::Exit(_)) if command_called_exit(&items) => session.set_last_status(1),
+            Err(_) => {
+                return Err(format!(
+                    "command substitution `$({command})` was refused or failed; \
+                     iish's reason is above"
+                ))
+            }
+        }
+        String::from_utf8(buf)
+            .map_err(|_| format!("command substitution `$({command})` produced non-UTF-8 output"))
+    }
+}
+
+/// Whether a substitution's statement list is literally a bare
+/// `exit`/`exit N` — the only `Abort::Exit` a substitution absorbs
+/// (bash subshell semantics). Any other Exit reaching the substituter
+/// is a refusal or failure and stays fatal.
+fn command_called_exit(items: &[parser::ast::CompoundListItem]) -> bool {
+    items.iter().all(|item| {
+        let pipeline = &item.0.first;
+        item.0.additional.is_empty()
+            && pipeline.seq.len() == 1
+            && matches!(
+                &pipeline.seq[0],
+                parser::ast::Command::Simple(sc)
+                    if sc.word_or_name.as_ref().map(|w| w.value.as_str()) == Some("exit")
+            )
+    })
+}
 
 /// Execute the script statement by statement (interleaved model, see
 /// PLAN.md): evaluate against the live ledger and configuration,
 /// confirm any ask, run the compiled action natively, and abort on the
-/// first refusal or failure. A `Verdict::Group` (brace group or
-/// function call) recurses into its own statement list against the
-/// same live session, rather than compiling to a single `Action`.
+/// first refusal or failure.
 fn run(items: &[parser::ast::CompoundListItem], ask: prompt::AskMode, config: &Config) -> ExitCode {
     let mut session = state::Session::new();
-    match run_items(items, ask, config, &mut session, 0) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(code) => code,
+    match run_items_inner(
+        items,
+        ask,
+        config,
+        &mut session,
+        0,
+        false,
+        &mut Out::inherit(),
+    ) {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(Abort::Exit(code)) => code,
+        Err(Abort::Return(_)) => {
+            eprintln!("iish: `return` reached the top level with no function call to return from; aborting.");
+            ExitCode::FAILURE
+        }
+        Err(Abort::Break(_)) | Err(Abort::Continue(_)) => {
+            eprintln!(
+                "iish: `break`/`continue` reached the top level with no loop to leave; aborting."
+            );
+            ExitCode::FAILURE
+        }
     }
 }
 
-/// `Ok(())` once every statement in `items` ran; `Err(code)` the moment
-/// one is refused, declined, or fails — the caller (possibly a
-/// recursive call for an enclosing group) must stop at exactly that
-/// point too, so no later statement runs after an abort.
-fn run_items(
-    items: &[parser::ast::CompoundListItem],
-    ask: prompt::AskMode,
-    config: &Config,
-    session: &mut state::Session,
-    depth: usize,
-) -> Result<(), ExitCode> {
-    run_items_inner(items, ask, config, session, depth, false).map(|_| ())
-}
-
-/// Evaluate `items` as an `if`/`while`/`until` condition: like
-/// `run_items`, except a `Subprocess`/`Test` statement that "fails" is
-/// recorded as `false` (returned once it's the last statement) instead
-/// of aborting the whole run — exactly the exemption bash itself grants
-/// the condition part of a compound command from its usual (here,
-/// always-on) errexit posture. A `Deny`, a declined prompt, or a genuine
-/// execution error (as opposed to an ordinary non-zero exit) still
-/// aborts unconditionally: iish's "if we don't understand it, refuse"
-/// posture applies inside a condition exactly as it does everywhere else.
+/// Evaluate `items` as an `if`/`while`/`until` condition: like the
+/// plain walk, except a `Subprocess`/`Test`/... statement that "fails"
+/// is recorded as `false` (returned once it's the last statement)
+/// instead of aborting the whole run — exactly the exemption bash
+/// itself grants the condition part of a compound command from its
+/// usual (here, always-on) errexit posture. A `Deny`, a declined
+/// prompt, or a genuine execution error still aborts unconditionally:
+/// iish's "if we don't understand it, refuse" posture applies inside a
+/// condition exactly as it does everywhere else.
 fn run_condition(
     items: &[parser::ast::CompoundListItem],
     ask: prompt::AskMode,
     config: &Config,
     session: &mut state::Session,
     depth: usize,
-) -> Result<bool, ExitCode> {
-    run_items_inner(items, ask, config, session, depth, true)
+    out: &mut Out,
+) -> Result<bool, Abort> {
+    run_items_inner(items, ask, config, session, depth, true, out)
 }
 
-/// Shared implementation behind `run_items` and `run_condition`: walks
+/// Shared implementation behind the plain and condition walks: runs
 /// `items` in order, returning the exit status of the last one (`true`
 /// if `items` is empty, matching a no-op condition). `in_condition`
 /// controls only whether a statement's own non-zero/false status aborts
@@ -224,17 +318,25 @@ fn run_items_inner(
     session: &mut state::Session,
     depth: usize,
     in_condition: bool,
-) -> Result<bool, ExitCode> {
+    out: &mut Out,
+) -> Result<bool, Abort> {
     if depth > MAX_GROUP_DEPTH {
         eprintln!(
             "iish: nested groups/function calls are more than {MAX_GROUP_DEPTH} deep; aborting."
         );
-        return Err(ExitCode::FAILURE);
+        return Err(fail());
     }
 
     let mut status = true;
     for item in items {
-        let statement = policy::evaluate_item(item, session, config);
+        let statement = {
+            let mut subst = LiveSubstituter { ask, config, depth };
+            let mut ctx = parser::ExpandCtx {
+                session,
+                subst: &mut subst,
+            };
+            policy::evaluate_item(item, &mut ctx, config)
+        };
         status = run_statement(
             statement.verdict,
             &statement.raw,
@@ -243,6 +345,7 @@ fn run_items_inner(
             session,
             depth,
             in_condition,
+            out,
         )?;
     }
 
@@ -255,6 +358,7 @@ fn run_items_inner(
 /// chain is evaluated and run exactly like a top-level statement, just
 /// checked against the chain's running status instead of always running
 /// unconditionally.
+#[allow(clippy::too_many_arguments)]
 fn run_statement(
     verdict: Verdict,
     raw: &str,
@@ -263,16 +367,38 @@ fn run_statement(
     session: &mut state::Session,
     depth: usize,
     in_condition: bool,
-) -> Result<bool, ExitCode> {
-    match verdict {
+    out: &mut Out,
+) -> Result<bool, Abort> {
+    let status = match verdict {
         Verdict::Deny { reason } => {
             eprintln!("iish: refusing `{raw}`: {reason}");
             eprintln!("iish: aborting; no later statement was run.");
-            Err(ExitCode::FAILURE)
+            return Err(fail());
         }
         Verdict::Group { statements } => {
             eprintln!("iish> {raw}");
-            run_items_inner(&statements, ask, config, session, depth + 1, in_condition)
+            run_items_inner(
+                &statements,
+                ask,
+                config,
+                session,
+                depth + 1,
+                in_condition,
+                out,
+            )?
+        }
+        Verdict::Call { name, args, body } => {
+            eprintln!("iish> {raw}");
+            // The frame makes `args` the body's `$1`/`$@`/`$#`, scopes
+            // its `local`s, and bounds its `return`. Popped on every
+            // way out, including an abort passing through.
+            session.push_frame(name, args);
+            let result = run_items_inner(&body, ask, config, session, depth + 1, in_condition, out);
+            session.pop_frame();
+            match result {
+                Err(Abort::Return(n)) => n == 0,
+                other => other?,
+            }
         }
         Verdict::If {
             condition,
@@ -288,8 +414,34 @@ fn run_statement(
                 config,
                 session,
                 depth + 1,
+                out,
             )?;
-            Ok(true)
+            true
+        }
+        Verdict::For {
+            variable,
+            values,
+            body,
+        } => {
+            eprintln!("iish> {raw}");
+            run_for(
+                &variable,
+                values.as_deref(),
+                &body,
+                ask,
+                config,
+                session,
+                depth,
+                out,
+            )?
+        }
+        Verdict::While {
+            condition,
+            body,
+            until,
+        } => {
+            eprintln!("iish> {raw}");
+            run_while(&condition, &body, until, ask, config, session, depth, out)?
         }
         Verdict::AndOrList { first, rest } => run_and_or_list(
             &first,
@@ -300,27 +452,301 @@ fn run_statement(
             session,
             depth,
             in_condition,
-        ),
+            out,
+        )?,
+        // `! pipeline`: run for status, report the negation. Never
+        // trips the abort-on-failure posture — bash exempts `!`
+        // pipelines from errexit entirely, negated result included.
+        Verdict::Not { pipeline } => {
+            !run_pipeline_for_status(&pipeline, ask, config, session, depth, out)?
+        }
+        Verdict::Pipe { stages } => {
+            eprintln!("iish> {raw}");
+            let status = run_pipe(&stages, raw, ask, config, session, depth, out)?;
+            if !status && !in_condition {
+                eprintln!("iish: `{raw}` exited with a non-zero status; aborting.");
+                return Err(fail());
+            }
+            status
+        }
+        Verdict::ControlFlow(flow) => {
+            eprintln!("iish> {raw}");
+            return Err(match flow {
+                Flow::Return(n) => Abort::Return(n),
+                Flow::Exit(n) => Abort::Exit(ExitCode::from(n)),
+                Flow::Break(n) => Abort::Break(n),
+                Flow::Continue(n) => Abort::Continue(n),
+            });
+        }
         Verdict::Prompt { reason, action } => {
             let action = match prompt::confirm(ask, raw, &reason) {
                 Ok(true) => action,
                 Ok(false) => {
                     eprintln!("iish: `{raw}` declined ({reason}); aborting.");
-                    return Err(ExitCode::FAILURE);
+                    return Err(fail());
                 }
                 Err(e) => {
                     eprintln!("iish: cannot confirm `{raw}`: {e}");
-                    return Err(ExitCode::FAILURE);
+                    return Err(fail());
                 }
             };
             eprintln!("iish> {raw}");
-            execute_statement(&action, session, in_condition, raw)
+            execute_statement(&action, session, in_condition, raw, out)?
         }
         Verdict::Allow { action, .. } => {
             eprintln!("iish> {raw}");
-            execute_statement(&action, session, in_condition, raw)
+            execute_statement(&action, session, in_condition, raw, out)?
+        }
+    };
+    // `$?` tracks every statement as it completes, at whatever nesting
+    // level, matching bash's continuously-updated view.
+    session.set_last_status(if status { 0 } else { 1 });
+    Ok(status)
+}
+
+/// `for NAME in words...`: expand the word list (field-wise: `"$@"` and
+/// unquoted `$VAR` splitting behave — see parser.rs's `word_fields`),
+/// then run the body once per field with NAME assigned. `break` and
+/// `continue` unwind to here; `break 2`/`continue 2` pass through to
+/// the next enclosing loop with the count decremented.
+#[allow(clippy::too_many_arguments)]
+fn run_for(
+    variable: &str,
+    values: Option<&[parser::ast::Word]>,
+    body: &[parser::ast::CompoundListItem],
+    ask: prompt::AskMode,
+    config: &Config,
+    session: &mut state::Session,
+    depth: usize,
+    out: &mut Out,
+) -> Result<bool, Abort> {
+    let fields = match values {
+        // `for NAME; do` iterates the positional parameters.
+        None => session.positional().to_vec(),
+        Some(words) => {
+            let mut fields = Vec::new();
+            for word in words {
+                let expanded = {
+                    let mut subst = LiveSubstituter { ask, config, depth };
+                    let mut ctx = parser::ExpandCtx {
+                        session,
+                        subst: &mut subst,
+                    };
+                    parser::word_fields(word, &mut ctx)
+                };
+                match expanded {
+                    Ok(mut f) => fields.append(&mut f),
+                    Err(reason) => {
+                        eprintln!("iish: refusing `for {variable} in ...`: {reason}");
+                        eprintln!("iish: aborting; no later statement was run.");
+                        return Err(fail());
+                    }
+                }
+            }
+            fields
+        }
+    };
+
+    let mut status = true;
+    for field in fields {
+        session.set_variable(variable, field);
+        match run_items_inner(body, ask, config, session, depth + 1, false, out) {
+            Ok(s) => status = s,
+            Err(Abort::Break(n)) => {
+                if n > 1 {
+                    return Err(Abort::Break(n - 1));
+                }
+                break;
+            }
+            Err(Abort::Continue(n)) => {
+                if n > 1 {
+                    return Err(Abort::Continue(n - 1));
+                }
+                status = true;
+            }
+            Err(other) => return Err(other),
         }
     }
+    Ok(status)
+}
+
+/// One pipeline stage, resolved and confirmed: either a compiled
+/// action, or a function call / brace group whose statements run with
+/// the stage's captured stdout (`nvm_install_dir | sed ...`). A
+/// statements stage doesn't consume the carried stdin — no native
+/// statement reads stdin — matching how such stages are actually used
+/// (as producers).
+enum PipeStage {
+    Action(exec::Action),
+    Statements {
+        frame: Option<(String, Vec<String>)>,
+        body: Vec<parser::ast::CompoundListItem>,
+    },
+}
+
+/// `first | second | ...`: run the stages sequentially, buffering each
+/// stage's captured stdout as the next stage's stdin (see
+/// `Verdict::Pipe` for why sequential-with-buffering). Each stage is
+/// evaluated against the live session at its turn and must resolve to
+/// a plain action — a compound command as a pipeline stage would need
+/// subshell semantics iish doesn't have. The pipeline's status is the
+/// last stage's; whether a false status aborts is the caller's call
+/// (`run_statement`), same as any other statement.
+#[allow(clippy::too_many_arguments)]
+fn run_pipe(
+    stages: &[parser::ast::Command],
+    raw: &str,
+    ask: prompt::AskMode,
+    config: &Config,
+    session: &mut state::Session,
+    depth: usize,
+    out: &mut Out,
+) -> Result<bool, Abort> {
+    let mut carried: Option<Vec<u8>> = None;
+    let mut status = true;
+    let last = stages.len() - 1;
+    for (i, stage) in stages.iter().enumerate() {
+        let statement = {
+            let mut subst = LiveSubstituter { ask, config, depth };
+            let mut ctx = parser::ExpandCtx {
+                session,
+                subst: &mut subst,
+            };
+            policy::evaluate_pipe_stage(stage, &mut ctx, config)
+        };
+        let stage = match statement.verdict {
+            Verdict::Allow { action, .. } => PipeStage::Action(action),
+            Verdict::Prompt { reason, action } => {
+                match prompt::confirm(ask, &statement.raw, &reason) {
+                    Ok(true) => PipeStage::Action(action),
+                    Ok(false) => {
+                        eprintln!("iish: `{}` declined ({reason}); aborting.", statement.raw);
+                        return Err(fail());
+                    }
+                    Err(e) => {
+                        eprintln!("iish: cannot confirm `{}`: {e}", statement.raw);
+                        return Err(fail());
+                    }
+                }
+            }
+            Verdict::Deny { reason } => {
+                eprintln!("iish: refusing `{}`: {reason}", statement.raw);
+                eprintln!("iish: aborting; no later statement was run.");
+                return Err(fail());
+            }
+            Verdict::Call { name, args, body } => PipeStage::Statements {
+                frame: Some((name, args)),
+                body,
+            },
+            Verdict::Group { statements } => PipeStage::Statements {
+                frame: None,
+                body: statements,
+            },
+            _ => {
+                eprintln!(
+                    "iish: refusing `{}`: this construct is not implemented as a pipeline \
+                     stage",
+                    statement.raw
+                );
+                eprintln!("iish: aborting; no later statement was run.");
+                return Err(fail());
+            }
+        };
+
+        // The last stage writes to the pipeline's own destination;
+        // earlier stages are captured for the next stage's stdin.
+        let mut buf = Vec::new();
+        let stdin = carried.take();
+        status = if i == last {
+            run_pipe_stage(stage, stdin, raw, ask, config, session, depth, out)?
+        } else {
+            let mut capture = Out::capture(&mut buf);
+            let s = run_pipe_stage(stage, stdin, raw, ask, config, session, depth, &mut capture)?;
+            carried = Some(buf);
+            s
+        };
+    }
+    Ok(status)
+}
+
+/// Run one resolved pipeline stage against `stage_out` (see `run_pipe`).
+#[allow(clippy::too_many_arguments)]
+fn run_pipe_stage(
+    stage: PipeStage,
+    stdin: Option<Vec<u8>>,
+    raw: &str,
+    ask: prompt::AskMode,
+    config: &Config,
+    session: &mut state::Session,
+    depth: usize,
+    stage_out: &mut Out,
+) -> Result<bool, Abort> {
+    match stage {
+        PipeStage::Action(action) => {
+            match exec::execute_piped(&action, session, stdin, stage_out) {
+                Ok(s) => Ok(s),
+                Err(e) => {
+                    eprintln!("iish: `{raw}` failed: {e}");
+                    Err(fail())
+                }
+            }
+        }
+        PipeStage::Statements { frame, body } => {
+            let framed = frame.is_some();
+            if let Some((name, args)) = frame {
+                session.push_frame(name, args);
+            }
+            let result = run_items_inner(&body, ask, config, session, depth + 1, true, stage_out);
+            if framed {
+                session.pop_frame();
+            }
+            match result {
+                Err(Abort::Return(n)) => Ok(n == 0),
+                other => other,
+            }
+        }
+    }
+}
+
+/// `while`/`until cond; do body; done`, with the same condition
+/// exemption `if` gets and a hard iteration ceiling (see
+/// `MAX_LOOP_ITERATIONS`).
+#[allow(clippy::too_many_arguments)]
+fn run_while(
+    condition: &[parser::ast::CompoundListItem],
+    body: &[parser::ast::CompoundListItem],
+    until: bool,
+    ask: prompt::AskMode,
+    config: &Config,
+    session: &mut state::Session,
+    depth: usize,
+    out: &mut Out,
+) -> Result<bool, Abort> {
+    let mut status = true;
+    for _ in 0..MAX_LOOP_ITERATIONS {
+        let cond = run_condition(condition, ask, config, session, depth + 1, out)?;
+        if cond == until {
+            return Ok(status);
+        }
+        match run_items_inner(body, ask, config, session, depth + 1, false, out) {
+            Ok(s) => status = s,
+            Err(Abort::Break(n)) => {
+                if n > 1 {
+                    return Err(Abort::Break(n - 1));
+                }
+                return Ok(status);
+            }
+            Err(Abort::Continue(n)) => {
+                if n > 1 {
+                    return Err(Abort::Continue(n - 1));
+                }
+                status = true;
+            }
+            Err(other) => return Err(other),
+        }
+    }
+    eprintln!("iish: loop exceeded {MAX_LOOP_ITERATIONS} iterations without finishing; aborting.");
+    Err(fail())
 }
 
 /// `first && second || third ...`: run `first`, then walk `rest` left to
@@ -349,8 +775,9 @@ fn run_and_or_list(
     session: &mut state::Session,
     depth: usize,
     in_condition: bool,
-) -> Result<bool, ExitCode> {
-    let mut status = run_pipeline_for_status(first, ask, config, session, depth)?;
+    out: &mut Out,
+) -> Result<bool, Abort> {
+    let mut status = run_pipeline_for_status(first, ask, config, session, depth, out)?;
     // Overwritten on every iteration, so after the loop this reflects
     // only the last entry's outcome — exactly the "was the last pipeline
     // in the whole chain the one that ran" question above. `rest` is
@@ -364,27 +791,35 @@ fn run_and_or_list(
         };
         last_entry_ran = should_run;
         if should_run {
-            status = run_pipeline_for_status(next, ask, config, session, depth)?;
+            status = run_pipeline_for_status(next, ask, config, session, depth, out)?;
         }
     }
 
     if last_entry_ran && !status && !in_condition {
         eprintln!("iish: `{raw}` exited with a non-zero status; aborting.");
-        return Err(ExitCode::FAILURE);
+        return Err(fail());
     }
     Ok(status)
 }
 
-/// Evaluate and run one pipeline from inside a `&&`/`||` chain, always in
-/// status-returning mode (see `run_and_or_list`).
+/// Evaluate and run one pipeline from inside a `&&`/`||` chain or a `!`
+/// negation, always in status-returning mode (see `run_and_or_list`).
 fn run_pipeline_for_status(
     pipeline: &parser::ast::Pipeline,
     ask: prompt::AskMode,
     config: &Config,
     session: &mut state::Session,
     depth: usize,
-) -> Result<bool, ExitCode> {
-    let statement = policy::evaluate_pipeline_item(pipeline, session, config);
+    out: &mut Out,
+) -> Result<bool, Abort> {
+    let statement = {
+        let mut subst = LiveSubstituter { ask, config, depth };
+        let mut ctx = parser::ExpandCtx {
+            session,
+            subst: &mut subst,
+        };
+        policy::evaluate_pipeline_item(pipeline, &mut ctx, config)
+    };
     run_statement(
         statement.verdict,
         &statement.raw,
@@ -393,6 +828,7 @@ fn run_pipeline_for_status(
         session,
         depth,
         true,
+        out,
     )
 }
 
@@ -406,17 +842,18 @@ fn execute_statement(
     session: &mut state::Session,
     in_condition: bool,
     raw: &str,
-) -> Result<bool, ExitCode> {
+    out: &mut Out,
+) -> Result<bool, Abort> {
     let result = if in_condition {
-        exec::execute_returning_status(action, session)
+        exec::execute_returning_status(action, session, out)
     } else {
-        exec::execute(action, session).map(|()| true)
+        exec::execute(action, session, out).map(|()| true)
     };
     match result {
         Ok(status) => Ok(status),
         Err(e) => {
             eprintln!("iish: `{raw}` failed: {e}");
-            Err(ExitCode::FAILURE)
+            Err(fail())
         }
     }
 }
@@ -428,6 +865,7 @@ fn execute_statement(
 /// `elses` is the AST's own flat list of `elif`/`else` clauses; each
 /// `elif`'s condition is checked in turn, and the first clause with no
 /// condition at all (a plain `else`) always matches.
+#[allow(clippy::too_many_arguments)]
 fn run_if(
     condition: &[parser::ast::CompoundListItem],
     then_branch: &[parser::ast::CompoundListItem],
@@ -436,16 +874,17 @@ fn run_if(
     config: &Config,
     session: &mut state::Session,
     depth: usize,
-) -> Result<(), ExitCode> {
+    out: &mut Out,
+) -> Result<(), Abort> {
     if depth > MAX_GROUP_DEPTH {
         eprintln!(
             "iish: nested groups/function calls are more than {MAX_GROUP_DEPTH} deep; aborting."
         );
-        return Err(ExitCode::FAILURE);
+        return Err(fail());
     }
 
-    if run_condition(condition, ask, config, session, depth)? {
-        return run_items_inner(then_branch, ask, config, session, depth, false).map(|_| ());
+    if run_condition(condition, ask, config, session, depth, out)? {
+        return run_items_inner(then_branch, ask, config, session, depth, false, out).map(|_| ());
     }
 
     let Some(clauses) = elses else {
@@ -454,19 +893,33 @@ fn run_if(
     for clause in clauses {
         match &clause.condition {
             Some(elif_condition) => {
-                if run_condition(&elif_condition.0, ask, config, session, depth)? {
-                    return run_items_inner(&clause.body.0, ask, config, session, depth, false)
-                        .map(|_| ());
+                if run_condition(&elif_condition.0, ask, config, session, depth, out)? {
+                    return run_items_inner(
+                        &clause.body.0,
+                        ask,
+                        config,
+                        session,
+                        depth,
+                        false,
+                        out,
+                    )
+                    .map(|_| ());
                 }
             }
             None => {
-                return run_items_inner(&clause.body.0, ask, config, session, depth, false)
+                return run_items_inner(&clause.body.0, ask, config, session, depth, false, out)
                     .map(|_| ())
             }
         }
     }
     Ok(())
 }
+
+/// The reason `--dry-run` hands to expansion when a word needs a
+/// `$(command)` resolved: dry-run executes nothing, so the value is
+/// unknowable and the statement is reported as refused.
+const DRY_RUN_SUBSTITUTION: &str =
+    "command substitution is not resolved in --dry-run; run for real to expand it";
 
 /// `--dry-run`: print every statement's verdict without executing.
 /// Creations (and function definitions) are simulated in the ledger so
@@ -509,16 +962,23 @@ fn report_items(
     let indent = "  ".repeat(depth);
 
     for item in items {
-        let statement = policy::evaluate_item(item, session, config);
+        let statement = {
+            let mut subst = parser::RefuseSubstituter(DRY_RUN_SUBSTITUTION);
+            let mut ctx = parser::ExpandCtx {
+                session,
+                subst: &mut subst,
+            };
+            policy::evaluate_item(item, &mut ctx, config)
+        };
         report_verdict(statement, &indent, config, session, depth, denied, asks);
     }
 }
 
 /// Report one already-evaluated verdict, recursing into nested statement
-/// lists (a brace group/function call/matched `case` arm's `Group`, an
-/// `if`'s condition and branches, or a `&&`/`||` chain's pipelines) at
-/// one deeper indent. Shared by `report_items`'s per-statement loop and
-/// `report_and_or_list`'s per-pipeline walk.
+/// lists (a brace group/function call/matched `case` arm, an `if`'s
+/// condition and branches, a loop's condition and body, or a `&&`/`||`
+/// chain's pipelines) at one deeper indent. Shared by `report_items`'s
+/// per-statement loop and `report_and_or_list`'s per-pipeline walk.
 fn report_verdict(
     statement: policy::Statement,
     indent: &str,
@@ -549,6 +1009,14 @@ fn report_verdict(
             println!("{indent}  [GROUP ] {}", statement.raw);
             report_items(&statements, config, session, depth + 1, denied, asks);
         }
+        Verdict::Call { name, args, body } => {
+            // Simulate the call frame so the body's `$1`/`$@`/`local`
+            // are judged as a live run would.
+            println!("{indent}  [CALL  ] {}", statement.raw);
+            session.push_frame(name, args);
+            report_items(&body, config, session, depth + 1, denied, asks);
+            session.pop_frame();
+        }
         Verdict::If {
             condition,
             then_branch,
@@ -576,6 +1044,47 @@ fn report_verdict(
                 report_items(&clause.body.0, config, session, depth + 1, denied, asks);
             }
         }
+        Verdict::For {
+            variable,
+            values,
+            body,
+        } => {
+            // How many times (and with what values) the body runs is a
+            // runtime question; report it once, with the loop variable
+            // bound to the first statically-expandable value (or empty)
+            // so the body's own expansions can be judged.
+            println!("{indent}  [FOR   ] {}", statement.raw);
+            let first_value = values
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .find_map(|word| {
+                    let mut subst = parser::RefuseSubstituter(DRY_RUN_SUBSTITUTION);
+                    let mut ctx = parser::ExpandCtx {
+                        session,
+                        subst: &mut subst,
+                    };
+                    parser::word_fields(word, &mut ctx)
+                        .ok()
+                        .and_then(|fields| fields.into_iter().next())
+                })
+                .unwrap_or_default();
+            session.set_variable(variable, first_value);
+            println!("{indent}           body (reported once):");
+            report_items(&body, config, session, depth + 1, denied, asks);
+        }
+        Verdict::While {
+            condition,
+            body,
+            until,
+        } => {
+            let label = if until { "[UNTIL ]" } else { "[WHILE ]" };
+            println!("{indent}  {label} {}", statement.raw);
+            println!("{indent}           condition:");
+            report_items(&condition, config, session, depth + 1, denied, asks);
+            println!("{indent}           body (reported once):");
+            report_items(&body, config, session, depth + 1, denied, asks);
+        }
         Verdict::AndOrList { first, rest } => {
             // Same posture as `If`: whether a later pipeline in the
             // chain would actually run depends on the real exit status
@@ -594,6 +1103,36 @@ fn report_verdict(
                 report_pipeline(pipeline, indent, config, session, depth, denied, asks);
             }
         }
+        Verdict::Not { pipeline } => {
+            println!("{indent}  [NOT   ] {}", statement.raw);
+            report_pipeline(*pipeline, indent, config, session, depth, denied, asks);
+        }
+        Verdict::Pipe { stages } => {
+            println!("{indent}  [PIPE  ] {}", statement.raw);
+            for stage in stages {
+                let stage_statement = {
+                    let mut subst = parser::RefuseSubstituter(DRY_RUN_SUBSTITUTION);
+                    let mut ctx = parser::ExpandCtx {
+                        session,
+                        subst: &mut subst,
+                    };
+                    policy::evaluate_pipe_stage(&stage, &mut ctx, config)
+                };
+                report_verdict(
+                    stage_statement,
+                    indent,
+                    config,
+                    session,
+                    depth,
+                    denied,
+                    asks,
+                );
+            }
+        }
+        Verdict::ControlFlow(_) => {
+            println!("{indent}  [ALLOW ] {}", statement.raw);
+            println!("{indent}           control flow only; runs nothing itself");
+        }
     }
 }
 
@@ -608,6 +1147,13 @@ fn report_pipeline(
     denied: &mut usize,
     asks: &mut usize,
 ) {
-    let statement = policy::evaluate_pipeline_item(&pipeline, session, config);
+    let statement = {
+        let mut subst = parser::RefuseSubstituter(DRY_RUN_SUBSTITUTION);
+        let mut ctx = parser::ExpandCtx {
+            session,
+            subst: &mut subst,
+        };
+        policy::evaluate_pipeline_item(&pipeline, &mut ctx, config)
+    };
     report_verdict(statement, indent, config, session, depth, denied, asks);
 }

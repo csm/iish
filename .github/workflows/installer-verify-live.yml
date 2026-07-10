@@ -1,0 +1,29 @@
+name: Installer verify (live)
+
+# The live-install job: unlike the hermetic installer-verify workflow
+# (which runs everything with `docker run --network none`), this one
+# reaches the real internet to install a curated, trustworthy, entirely
+# user-space installer end to end and verify the program it produces
+# actually runs. It is deliberately NOT a PR gate -- it depends on live
+# upstreams (GitHub releases and their API rate limits), so it runs on a
+# schedule and on demand, where an upstream hiccup can't block anyone's
+# merge. When it's green, a real installer really installed under iish.
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    # Weekly, Mondays at 07:00 UTC.
+    - cron: "0 7 * * 1"
+
+jobs:
+  live:
+    name: live end-to-end install
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check Docker
+        run: docker version
+
+      - name: Run scripts/verify-installers.sh --live
+        run: scripts/verify-installers.sh --live --verbose

