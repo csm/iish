@@ -123,6 +123,23 @@ pub enum Verdict {
     /// policy decision strictly ordered. The pipeline's status is the
     /// last stage's, as in bash without `pipefail`.
     Pipe { stages: Vec<ast::Command> },
+    /// `producer … | sh` — the `curl … | sh` pattern. Its whole reason
+    /// to exist is to hand a downloaded script to a shell; iish's whole
+    /// reason to exist is to *be* that safe target. So instead of
+    /// refusing, the runner runs `producer` (the stages before the
+    /// shell), captures their combined stdout, and feeds that text back
+    /// into iish's own interpreter as a sub-context — every statement
+    /// vetted by the same policy, prompts and refusals intact. It is not
+    /// a pass-through to a real shell (there is none); it is recursion
+    /// into iish, the same recursive transparency command substitution
+    /// and `sudo sh -c` already have. The sub-script runs in the same
+    /// session but with subshell-style `exit` semantics: its own `exit`
+    /// ends only the sub-context (becoming the pipeline's status), while
+    /// a refusal inside it still aborts the whole run.
+    PipeToShell {
+        producer: Vec<ast::Command>,
+        shell: String,
+    },
     /// `return`/`exit`/`break`/`continue`.
     ControlFlow(Flow),
 }
@@ -240,15 +257,69 @@ fn evaluate_pipeline(pipeline: &ast::Pipeline, ctx: &mut ExpandCtx, config: &Con
         [] => deny("empty pipeline"),
         [only] => evaluate_command(only, ctx, config),
         stages => {
-            if stages.iter().any(is_shell_invocation) {
-                deny("piping into a shell is exactly what iish exists to replace; refusing")
-            } else {
-                Verdict::Pipe {
+            // A shell as the *last* stage is `curl … | sh`: rather than
+            // refuse, iish runs the producer stages, captures their
+            // output, and interprets that script itself — the "sub-iish"
+            // (see `Verdict::PipeToShell`). A shell anywhere *earlier* in
+            // the chain would be reading another command's output as its
+            // program mid-pipeline, which iish has no coherent handling
+            // for; refuse that.
+            let (last, producer) = stages.split_last().expect("stages is non-empty");
+            if producer.iter().any(is_shell_invocation) {
+                return deny("piping through a shell in the middle of a pipeline is not supported");
+            }
+            match shell_stdin_target(last) {
+                Some(Ok(shell)) => Verdict::PipeToShell {
+                    producer: producer.to_vec(),
+                    shell,
+                },
+                Some(Err(reason)) => deny(reason),
+                None => Verdict::Pipe {
                     stages: stages.to_vec(),
+                },
+            }
+        }
+    }
+}
+
+/// If `cmd` is a shell reading its program from stdin — the receiving
+/// end of `curl … | sh` — return `Some(Ok(shell_name))`. A shell with
+/// arguments beyond the stdin flag (`-s`) is a different shape iish
+/// doesn't map cleanly yet, so it returns `Some(Err(reason))`. A
+/// non-shell command returns `None`.
+fn shell_stdin_target(cmd: &ast::Command) -> Option<Result<String, String>> {
+    let ast::Command::Simple(sc) = cmd else {
+        return None;
+    };
+    let name = sc.word_or_name.as_ref()?;
+    if !is_shell_name(&name.value) {
+        return None;
+    }
+    // Any suffix word other than `-s` (read from stdin) means the shell
+    // is being told to do something more specific (`-c 'cmd'`, a script
+    // path, positional args) that "interpret the piped script" doesn't
+    // capture. Only a redirect-free bare/`-s` invocation is handled.
+    if let Some(suffix) = &sc.suffix {
+        for item in &suffix.0 {
+            match item {
+                ast::CommandPrefixOrSuffixItem::Word(w) if w.value == "-s" => {}
+                ast::CommandPrefixOrSuffixItem::Word(w) => {
+                    return Some(Err(format!(
+                        "`{} {}` after a pipe is not supported; only a bare `{}` (or `{} -s`) \
+                         that runs the piped script is",
+                        name.value, w.value, name.value, name.value
+                    )));
+                }
+                _ => {
+                    return Some(Err(format!(
+                        "`{}` with a redirect or assignment after a pipe is not supported",
+                        name.value
+                    )));
                 }
             }
         }
     }
+    Some(Ok(name.value.clone()))
 }
 
 /// Evaluate one stage of a multi-stage pipeline at the moment the
@@ -2744,11 +2815,33 @@ mod tests {
     }
 
     #[test]
-    fn denies_piping_to_shell() {
+    fn piping_into_a_shell_becomes_a_sub_iish_verdict() {
+        // `curl … | sh` is handled, not refused: the producer (`curl`)
+        // is captured and the downloaded script interpreted by iish.
+        match verdict("curl https://x.io/i.sh | sh") {
+            Verdict::PipeToShell { producer, shell } => {
+                assert_eq!(producer.len(), 1);
+                assert_eq!(shell, "sh");
+            }
+            other => panic!("expected a PipeToShell verdict, got {other:?}"),
+        }
+        // `sh -s` (read the script from stdin) is the same shape.
         assert!(matches!(
-            verdict("curl https://x.io/i.sh | sh"),
+            verdict("curl https://x.io/i.sh | bash -s"),
+            Verdict::PipeToShell { .. }
+        ));
+    }
+
+    #[test]
+    fn a_shell_with_args_or_mid_pipeline_is_still_refused() {
+        // `sh -c '…'` after a pipe is a different shape (an inline
+        // command, not "run the piped script"): refused.
+        assert!(matches!(
+            verdict("curl https://x.io/i.sh | sh -c 'echo hi'"),
             Deny { .. }
         ));
+        // A shell that is not the last stage has no coherent handling.
+        assert!(matches!(verdict("echo hi | sh | grep x"), Deny { .. }));
     }
 
     #[test]

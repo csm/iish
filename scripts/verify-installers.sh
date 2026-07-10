@@ -258,13 +258,15 @@ fi
 #     past this point;
 #   * an interactive prompt -- starship reads a y/n confirmation from
 #     /dev/tty, which an unattended container does not have;
-#   * `curl ... | sh` -- atuin's real installer is a tiny bootstrap that
-#     pipes a second stage straight into a shell, the exact anti-pattern
-#     iish exists to refuse; it can never proceed under iish, by design;
 #   * a still-unimplemented shell construct -- nvm parallelizes its
 #     downloads with background jobs (`&`), which iish doesn't implement
 #     yet, and deno bails out itself when neither `unzip` nor `7z` is on
 #     the slim image.
+#
+# (atuin's `curl ... | sh` bootstrap is no longer a special case: iish
+# runs the curl, captures the piped second-stage script, and interprets
+# it itself -- "sub-iish" -- so atuin stops at the same network boundary
+# as the rest.)
 #
 # So for each we pin *where* it stops as a regression guard: if the
 # reason changes without this file being updated, either iish regressed
@@ -324,10 +326,13 @@ set_corpus_expectation() {
             ;;
         atuin)
             # atuin's real one-liner installer is `curl ... | sh`: it
-            # downloads a second-stage script and pipes it straight into
-            # a shell. iish refuses that categorically (its whole reason
-            # to exist), so atuin can never proceed under iish by design.
-            expected_reason="piping into a shell is exactly what iish exists to replace"
+            # fetches a second-stage script and pipes it into a shell.
+            # iish no longer refuses that -- it runs the curl, captures
+            # the script, and interprets the second stage itself
+            # ("sub-iish", recursively transparent). So atuin now stops
+            # at the same network boundary as the others: the fetch of
+            # its own second stage, which --network none blocks.
+            expected_reason="atuin-installer.sh"
             verify_cmd=(atuin --version)
             ;;
         deno)

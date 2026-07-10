@@ -1013,11 +1013,15 @@ fn pipeline_with_a_function_stage_works() {
 }
 
 #[test]
-fn piping_into_a_shell_is_still_refused() {
+fn piping_a_dangerous_command_into_a_shell_is_vetted_and_refused() {
+    // `… | sh` is no longer a blanket refusal: iish captures what the
+    // producer emitted and interprets it (sub-iish). Here that captured
+    // text is `rm -rf /`, which iish refuses just as it would inline --
+    // so the run still fails, now for the right, specific reason.
     let out = iish("echo 'rm -rf /' | sh\n", &["--yes"]);
     assert!(!out.status.success());
     assert!(
-        stderr(&out).contains("piping into a shell"),
+        stderr(&out).contains("refusing") && stderr(&out).contains("rm -rf /"),
         "stderr: {}",
         stderr(&out)
     );
@@ -1220,4 +1224,76 @@ echo done
     );
 
     fs::remove_dir_all(&base).unwrap();
+}
+
+// ---------------------------------------------------------------------
+// `curl … | sh` as a sub-context ("sub-iish"): instead of refusing the
+// pipe-into-a-shell pattern, iish runs the producer, captures the
+// downloaded script, and interprets it itself under the same policy --
+// recursively transparent, the way command substitution already is.
+// ---------------------------------------------------------------------
+#[test]
+fn curl_pipe_sh_interprets_the_downloaded_second_stage() {
+    let home = scratch("subiish-home");
+    fs::create_dir_all(&home).unwrap();
+    // The second stage does real (allowed) work under $HOME.
+    let stage2 = b"#!/bin/sh\nmkdir -p \"$HOME/installed-by-substage\"\necho stage2-ran\n";
+    let url = serve(stage2, 1);
+
+    let out = iish_with_home(
+        &format!("echo before\ncurl -fsSL {url} | sh\necho after\n"),
+        &["--yes"],
+        &home,
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    // The producer ran, the second stage was interpreted by iish, and
+    // the whole outer script continued afterward.
+    assert_eq!(stdout(&out), "before\nstage2-ran\nafter\n");
+    assert!(
+        home.join("installed-by-substage").is_dir(),
+        "the second stage's side effects should have been applied"
+    );
+    fs::remove_dir_all(&home).unwrap();
+}
+
+#[test]
+fn curl_pipe_sh_still_vets_the_second_stage_and_refuses_danger() {
+    let home = scratch("subiish-danger-home");
+    fs::create_dir_all(&home).unwrap();
+    // A second stage that tries to delete something this run never
+    // created: the sub-context must refuse it exactly as a top-level
+    // statement would, aborting the run.
+    let evil = b"#!/bin/sh\nrm -rf /etc/hostname\n";
+    let url = serve(evil, 1);
+
+    let out = iish_with_home(&format!("curl -fsSL {url} | sh\n"), &["--yes"], &home);
+    assert!(
+        !out.status.success(),
+        "a dangerous second stage must abort the run"
+    );
+    assert!(
+        stderr(&out).contains("refusing"),
+        "stderr should show the refusal: {}",
+        stderr(&out)
+    );
+    // Whatever came before is fine; the point is the rm was refused.
+    assert!(
+        std::path::Path::new("/etc/hostname").exists(),
+        "the refused rm must not have run"
+    );
+    fs::remove_dir_all(&home).unwrap();
+}
+
+#[test]
+fn sh_dash_c_after_a_pipe_is_not_treated_as_sub_iish() {
+    // Only a stdin-reading shell (`curl | sh`) maps to "interpret the
+    // piped script". `| sh -c '…'` is a different shape and stays refused.
+    let url = serve(b"echo x\n", 1);
+    let out = iish(&format!("curl -fsSL {url} | sh -c 'echo hi'\n"), &["--yes"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("not supported"),
+        "stderr: {}",
+        stderr(&out)
+    );
 }
