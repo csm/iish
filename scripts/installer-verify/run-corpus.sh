@@ -21,6 +21,16 @@ shift
 script="$1"
 shift
 
+# Provisioning for the live-install job: some installers require their
+# target bin directory to already exist (starship's `check_bin_dir`
+# refuses to create it). Creating it up front is exactly the
+# unattended-provisioning step a real automated install would do, and
+# it's a no-op for the offline corpus (the env var is unset there).
+if [ -n "${IISH_PREMAKE_DIR:-}" ]; then
+    # shellcheck disable=SC2086  # deliberate word-splitting of the dir list
+    mkdir -p ${IISH_PREMAKE_DIR}
+fi
+
 # Extra iish flags (e.g. --subprocess=allow for the live-install job) come
 # in via the environment so the positional contract stays unchanged.
 # shellcheck disable=SC2086  # deliberate word-splitting of the flag list

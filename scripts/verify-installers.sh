@@ -147,24 +147,31 @@ trap cleanup EXIT
 # unattended-provisioning posture: approve the tar/grep/... an installer
 # shells out to), still never handing anything to a shell.
 # ---------------------------------------------------------------------
-live_names="zoxide starship"
+# starship first: it downloads a release *asset* from GitHub (not the
+# rate-limited API), so it's the most reliable end-to-end proof.
+# zoxide runs last (and hits api.github.com, which shared CI runners can
+# rate-limit) so its transcript is what a failing tail shows.
+live_names="starship zoxide"
 
 set_live_expectation() {
     # Per-installer: the docker env that makes it non-interactive and
-    # user-space, and the command that proves the install worked.
+    # user-space, and the command that proves the install worked. Every
+    # one gets ~/.local/bin pre-created (IISH_PREMAKE_DIR) -- ordinary
+    # provisioning; starship in particular refuses to create it itself.
     verify_cmd=()
     live_env=(-e "HOME=/home/tester"
         -e "PATH=/home/tester/.local/bin:/usr/local/bin:/usr/bin:/bin"
+        -e "IISH_PREMAKE_DIR=/home/tester/.local/bin"
         -e "IISH_EXTRA_FLAGS=--subprocess=allow")
     case "$1" in
-        zoxide)
-            # Installs to ~/.local/bin by default, no prompt.
-            verify_cmd=(zoxide --version)
-            ;;
         starship)
             # FORCE skips its y/n prompt; BIN_DIR makes it user-space.
             live_env+=(-e "FORCE=1" -e "BIN_DIR=/home/tester/.local/bin")
             verify_cmd=(starship --version)
+            ;;
+        zoxide)
+            # Installs to ~/.local/bin by default, no prompt.
+            verify_cmd=(zoxide --version)
             ;;
         *)
             echo "verify-installers: no live expectation for '$1'" >&2
