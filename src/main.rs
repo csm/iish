@@ -27,6 +27,7 @@ const USAGE: &str = "usage: iish [options] [script.sh]
        curl -fsSL https://example.com/install.sh | iish
 
   --dry-run          report what every statement would do; execute nothing
+  --analyze          scan every control-flow branch and summarize required capabilities
   --yes              answer yes to every confirmation prompt
   --no               answer no to every confirmation prompt (asks become fatal)
   --allow NAME       always allow this command (subprocess tier)
@@ -40,6 +41,7 @@ const USAGE: &str = "usage: iish [options] [script.sh]
 
 fn main() -> ExitCode {
     let mut dry_run = false;
+    let mut analyze = false;
     let mut ask = prompt::AskMode::Tty;
     let mut path: Option<String> = None;
     let mut config_path: Option<String> = None;
@@ -50,6 +52,10 @@ fn main() -> ExitCode {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--dry-run" => dry_run = true,
+            "--analyze" => {
+                dry_run = true;
+                analyze = true;
+            }
             "--yes" => ask = prompt::AskMode::AssumeYes,
             "--no" => ask = prompt::AskMode::AssumeNo,
             "--no-config" => no_config = true,
@@ -146,7 +152,7 @@ fn main() -> ExitCode {
     }
 
     if dry_run {
-        report(&items, &config)
+        report(&items, &config, analyze)
     } else {
         run(&items, ask, &config)
     }
@@ -1062,17 +1068,90 @@ fn run_if(
 const DRY_RUN_SUBSTITUTION: &str =
     "command substitution is not resolved in --dry-run; run for real to expand it";
 
+/// Reconstruct a compound condition for a branch report. Keeping the shell
+/// spelling is intentional: it is the most useful form for a human or coding
+/// agent deciding whether an OS-, architecture-, or environment-specific path
+/// is in scope.
+fn condition_text(items: &[parser::ast::CompoundListItem]) -> String {
+    items
+        .iter()
+        .map(|item| item.0.to_string())
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Best-effort platform labeling for conventional installer guards. This is
+/// only an annotation; all branches are still analyzed, so an unfamiliar
+/// spelling can never make analysis silently skip required behavior.
+fn platform_annotation(guard: &str) -> &'static str {
+    let guard = guard.to_ascii_lowercase();
+    let windows = ["windows", "mingw", "msys", "cygwin", "win32"]
+        .iter()
+        .any(|token| guard.contains(token));
+    let macos = ["darwin", "macos", "mac os", "osx"]
+        .iter()
+        .any(|token| guard.contains(token));
+    let linux = guard.contains("linux");
+    match (windows, macos, linux) {
+        (true, false, false) => " [platform: Windows]",
+        (false, true, false) => " [platform: macOS]",
+        (false, false, true) => " [platform: Linux]",
+        (false, false, false) => "",
+        _ => " [platform: multiple OS values]",
+    }
+}
+
+/// Name the concrete capability/tool boundary represented by an evaluated
+/// action. These stable labels make `--analyze` output suitable as a feature
+/// checklist without exposing Rust implementation details.
+fn action_requirement(action: &exec::Action) -> String {
+    use exec::Action;
+    match action {
+        Action::Noop | Action::Test { .. } => "builtin.control/test (native)".into(),
+        Action::Print { .. } => "output.write (native)".into(),
+        Action::MkDir { .. } => "filesystem.mkdir (native)".into(),
+        Action::Touch { .. } => "filesystem.touch (native)".into(),
+        Action::Remove { .. } => "filesystem.remove (native, ledger-restricted)".into(),
+        Action::Chmod { .. } => "filesystem.chmod (native, ledger-restricted)".into(),
+        Action::Fetch { .. } => "network.http_get (native)".into(),
+        Action::AppendFile { .. } => {
+            "filesystem.append_env_file (native, restricted grammar)".into()
+        }
+        Action::Sha256Sum { .. } | Action::Sha256Check { .. } => "crypto.sha256 (native)".into(),
+        Action::Subprocess { name, .. } => format!("process.exec({name}) (generic subprocess)"),
+        Action::DefineFunction { .. } => "shell.function_definition (native)".into(),
+        Action::Copy { .. } => "filesystem.copy (native)".into(),
+        Action::Assign { .. } | Action::DeclareLocal { .. } | Action::Unset { .. } => {
+            "shell.variables (native)".into()
+        }
+        Action::Shift { .. } => "shell.positional_parameters (native)".into(),
+        Action::SetNounset { .. } => "shell.option.nounset (native)".into(),
+        Action::ProbeRead { .. } => "terminal.probe (native)".into(),
+        Action::ChangeDir { .. } => "filesystem.chdir (native)".into(),
+        Action::ReadLine { .. } => "terminal.read_line (native)".into(),
+        Action::CommandLookup { .. } => "process.command_lookup (native)".into(),
+    }
+}
+
 /// `--dry-run`: print every statement's verdict without executing.
 /// Creations (and function definitions) are simulated in the ledger so
 /// that later statements — including ones nested in a brace group or a
 /// function call reached below — are judged as they would be in a live
 /// run.
-fn report(items: &[parser::ast::CompoundListItem], config: &Config) -> ExitCode {
+fn report(items: &[parser::ast::CompoundListItem], config: &Config, analyze: bool) -> ExitCode {
     let mut session = state::Session::new();
     let mut denied = 0usize;
     let mut asks = 0usize;
 
-    println!("iish plan ({} top-level statement(s)):", items.len());
+    if analyze {
+        println!(
+            "iish capability analysis ({} top-level statement(s)):",
+            items.len()
+        );
+        println!("  All branches are scanned statically; no commands are executed.");
+    } else {
+        println!("iish plan ({} top-level statement(s)):", items.len());
+    }
     report_items(items, config, &mut session, 0, &mut denied, &mut asks);
 
     if denied > 0 {
@@ -1131,20 +1210,27 @@ fn report_verdict(
 ) {
     match statement.verdict {
         Verdict::Allow { reason, action } => {
+            let requirement = action_requirement(&action);
             exec::record_would_create(&action, session);
             println!("{indent}  [ALLOW ] {}", statement.raw);
             println!("{indent}           {reason}");
+            println!("{indent}           requires: {requirement}");
         }
         Verdict::Prompt { reason, action } => {
             *asks += 1;
+            let requirement = action_requirement(&action);
             exec::record_would_create(&action, session);
             println!("{indent}  [PROMPT] {}", statement.raw);
             println!("{indent}           {reason}");
+            println!(
+                "{indent}           requires: {requirement}; supported with confirmation/config"
+            );
         }
         Verdict::Deny { reason } => {
             *denied += 1;
             println!("{indent}  [DENY  ] {}", statement.raw);
             println!("{indent}           {reason}");
+            println!("{indent}           requires: missing iish language/tool support");
         }
         Verdict::Group { statements } => {
             println!("{indent}  [GROUP ] {}", statement.raw);
@@ -1169,18 +1255,26 @@ fn report_verdict(
             // reports the condition and *every* branch rather than
             // picking one; PLAN.md's "best-effort static report".
             println!("{indent}  [IF    ] {}", statement.raw);
-            println!("{indent}           condition:");
+            let guard = condition_text(&condition);
+            println!(
+                "{indent}           condition: {guard}{}",
+                platform_annotation(&guard)
+            );
             report_items(&condition, config, session, depth + 1, denied, asks);
-            println!("{indent}           then:");
+            println!("{indent}           then (when condition succeeds):");
             report_items(&then_branch, config, session, depth + 1, denied, asks);
             for clause in elses.iter().flatten() {
                 match &clause.condition {
                     Some(elif_condition) => {
-                        println!("{indent}           elif condition:");
+                        let guard = condition_text(&elif_condition.0);
+                        println!(
+                            "{indent}           elif condition: {guard}{}",
+                            platform_annotation(&guard)
+                        );
                         report_items(&elif_condition.0, config, session, depth + 1, denied, asks);
-                        println!("{indent}           elif then:");
+                        println!("{indent}           elif then (when preceding guards fail and this succeeds):");
                     }
-                    None => println!("{indent}           else:"),
+                    None => println!("{indent}           else (when all preceding guards fail):"),
                 }
                 report_items(&clause.body.0, config, session, depth + 1, denied, asks);
             }
@@ -1221,7 +1315,11 @@ fn report_verdict(
         } => {
             let label = if until { "[UNTIL ]" } else { "[WHILE ]" };
             println!("{indent}  {label} {}", statement.raw);
-            println!("{indent}           condition:");
+            let guard = condition_text(&condition);
+            println!(
+                "{indent}           condition: {guard}{}",
+                platform_annotation(&guard)
+            );
             report_items(&condition, config, session, depth + 1, denied, asks);
             println!("{indent}           body (reported once):");
             report_items(&body, config, session, depth + 1, denied, asks);
