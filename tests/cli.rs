@@ -340,6 +340,37 @@ fn dry_run_reports_but_executes_nothing() {
 }
 
 #[test]
+fn analyze_walks_os_branches_and_reports_capability_support() {
+    let out = iish(
+        concat!(
+            "if test \"$OS\" = MINGW64_NT; then powershell install.ps1; ",
+            "elif test \"$OS\" = Linux; then mkdir /tmp/iish-analysis-test; ",
+            "else eval bad; fi\n",
+        ),
+        &["--analyze"],
+    );
+    assert!(
+        !out.status.success(),
+        "analysis should fail when a branch is denied"
+    );
+    let report = stdout(&out);
+    assert!(report.contains("platform: Windows"), "report: {report}");
+    assert!(report.contains("platform: Linux"), "report: {report}");
+    assert!(
+        report.contains("process.exec(powershell)"),
+        "report: {report}"
+    );
+    assert!(
+        report.contains("filesystem.mkdir (native)"),
+        "report: {report}"
+    );
+    assert!(
+        report.contains("missing iish language/tool support"),
+        "report: {report}"
+    );
+}
+
+#[test]
 fn chmod_of_created_file_works_and_foreign_is_refused() {
     use std::os::unix::fs::PermissionsExt;
     let base = scratch("chmod");
