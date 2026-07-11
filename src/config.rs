@@ -73,6 +73,7 @@ impl<'de> Deserialize<'de> for NetworkPolicy {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub subprocess: Verb,
+    pub self_call: Verb,
     pub overwrite: Verb,
     pub env_file_append: Verb,
     pub run_created: Verb,
@@ -88,6 +89,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             subprocess: Verb::Ask,
+            self_call: Verb::Allow,
             overwrite: Verb::Ask,
             env_file_append: Verb::Ask,
             run_created: Verb::Ask,
@@ -104,6 +106,7 @@ impl Default for Config {
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 struct FileDefaults {
     subprocess: Option<Verb>,
+    self_call: Option<Verb>,
     overwrite: Option<Verb>,
     env_file_append: Option<Verb>,
     run_created: Option<Verb>,
@@ -125,6 +128,7 @@ struct File {
 #[derive(Debug, Default)]
 pub struct CliOverrides {
     pub subprocess: Option<Verb>,
+    pub self_call: Option<Verb>,
     pub overwrite: Option<Verb>,
     pub network: Option<NetworkPolicy>,
     pub commands: HashMap<String, Verb>,
@@ -165,6 +169,9 @@ impl Config {
         if let Some(v) = d.subprocess {
             self.subprocess = v;
         }
+        if let Some(v) = d.self_call {
+            self.self_call = v;
+        }
         if let Some(v) = d.overwrite {
             self.overwrite = v;
         }
@@ -187,6 +194,9 @@ impl Config {
     fn merge_cli(&mut self, cli: CliOverrides) {
         if let Some(v) = cli.subprocess {
             self.subprocess = v;
+        }
+        if let Some(v) = cli.self_call {
+            self.self_call = v;
         }
         if let Some(v) = cli.overwrite {
             self.overwrite = v;
@@ -222,6 +232,7 @@ mod tests {
     fn defaults_match_plan() {
         let c = Config::default();
         assert_eq!(c.subprocess, Verb::Ask);
+        assert_eq!(c.self_call, Verb::Allow);
         assert_eq!(c.overwrite, Verb::Ask);
         assert_eq!(c.network, NetworkPolicy::GetOnly);
         assert!(c.commands.is_empty());
@@ -250,13 +261,18 @@ mod tests {
 
     #[test]
     fn cli_overrides_win_over_file() {
-        let path = scratch_file("cli-wins", "[defaults]\nsubprocess = \"deny\"\n");
+        let path = scratch_file(
+            "cli-wins",
+            "[defaults]\nsubprocess = \"deny\"\nself-call = \"deny\"\n",
+        );
         let cli = CliOverrides {
             subprocess: Some(Verb::Allow),
+            self_call: Some(Verb::Ask),
             ..CliOverrides::default()
         };
         let config = Config::load(Some(&path), cli).unwrap();
         assert_eq!(config.subprocess, Verb::Allow);
+        assert_eq!(config.self_call, Verb::Ask);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

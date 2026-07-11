@@ -263,7 +263,17 @@ pub fn execute(action: &Action, session: &mut Session, out: &mut Out) -> Result<
         } => paths
             .iter()
             .try_for_each(|path| remove(path, *recursive, *force, session)),
-        Action::Chmod { mode, paths } => paths.iter().try_for_each(|path| chmod(path, *mode)),
+        Action::Chmod { mode, paths } => {
+            for path in paths {
+                chmod(path, *mode)?;
+                if matches!(mode, Mode::AddBits(bits) if bits & 0o111 != 0)
+                    || matches!(mode, Mode::Octal(bits) if bits & 0o111 != 0)
+                {
+                    session.record_executable(path);
+                }
+            }
+            Ok(())
+        }
         Action::Fetch { url, output } => fetch(url, output, session, out),
         Action::AppendFile { path, text } => append_file(path, text, session),
         Action::Sha256Sum { paths } => paths.iter().try_for_each(|path| print_sha256(path, out)),
@@ -434,6 +444,15 @@ pub fn record_would_create(action: &Action, session: &mut Session) {
             for path in paths {
                 if !path.exists() {
                     session.record_created(path);
+                }
+            }
+        }
+        Action::Chmod { mode, paths } => {
+            if matches!(mode, Mode::AddBits(bits) if bits & 0o111 != 0)
+                || matches!(mode, Mode::Octal(bits) if bits & 0o111 != 0)
+            {
+                for path in paths {
+                    session.record_executable(path);
                 }
             }
         }

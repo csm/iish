@@ -109,6 +109,7 @@ Layered policy, later layers win:
 ```toml
 [defaults]
 subprocess = "ask"        # unlisted external commands: allow|ask|deny
+self-call = "allow"       # calling a binary installed by this run
 overwrite = "ask"         # writing over pre-existing files
 env-file-append = "ask"   # rc/profile appends (restricted grammar)
 run-created = "ask"       # executing files the script created
@@ -121,7 +122,7 @@ systemctl = "deny"
 uname = "allow"
 ```
 
-`subprocess`, `overwrite`, `network`, `run-created`, `env-file-append`,
+`subprocess`, `self-call`, `overwrite`, `network`, `run-created`, `env-file-append`,
 and `[commands]` are live: they change what policy.rs's evaluator does
 today, including a **subprocess tier** for any external binary iish has
 no native implementation for (`tar`, `apt-get`, `sudo <cmd>`
@@ -135,7 +136,7 @@ file round-trips) but isn't consulted until the sudo broker (milestone
 4b) exists.
 
 CLI: `iish --allow sudo --deny curl --subprocess=deny --overwrite=allow
---network=deny --config path.toml --no-config --dry-run …`, plus
+--self-call=ask --network=deny --config path.toml --no-config --dry-run …`, plus
 `--yes`/`--no` to resolve every `ask` non-interactively.
 
 ## Open questions

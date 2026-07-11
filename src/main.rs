@@ -33,6 +33,7 @@ const USAGE: &str = "usage: iish [options] [script.sh]
   --allow NAME       always allow this command (subprocess tier)
   --deny NAME        always deny this command
   --subprocess=VERB  default for commands with no native support: allow|ask|deny
+  --self-call=VERB   policy for calling a binary installed by this run: allow|ask|deny
   --overwrite=VERB   default for overwriting pre-existing files: allow|ask|deny
   --network=POLICY   get-only|deny
   --config PATH      use this config file instead of ~/.config/iish/config.toml
@@ -78,6 +79,10 @@ fn main() -> ExitCode {
             a if a.starts_with("--subprocess=") => match Verb::parse(&a["--subprocess=".len()..]) {
                 Ok(v) => cli.subprocess = Some(v),
                 Err(e) => return usage_error(&format!("--subprocess: {e}")),
+            },
+            a if a.starts_with("--self-call=") => match Verb::parse(&a["--self-call=".len()..]) {
+                Ok(v) => cli.self_call = Some(v),
+                Err(e) => return usage_error(&format!("--self-call: {e}")),
             },
             a if a.starts_with("--overwrite=") => match Verb::parse(&a["--overwrite=".len()..]) {
                 Ok(v) => cli.overwrite = Some(v),

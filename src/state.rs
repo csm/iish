@@ -39,6 +39,8 @@ pub struct ScopeSnapshot {
 pub struct Session {
     /// Paths (files and directories) created by this run.
     created: HashSet<PathBuf>,
+    /// Created paths known to have been made executable during this run.
+    executable: HashSet<PathBuf>,
     /// Functions defined by this run so far, by name, keyed to the
     /// brace-group body that a call should run (see policy.rs's
     /// `Verdict::Group`).
@@ -105,6 +107,14 @@ impl Session {
         normalize(path)
             .ancestors()
             .any(|p| self.created.contains(p))
+    }
+
+    pub fn record_executable(&mut self, path: impl AsRef<Path>) {
+        self.executable.insert(normalize(path.as_ref()));
+    }
+
+    pub fn is_recorded_executable(&self, path: &Path) -> bool {
+        self.executable.contains(&normalize(path))
     }
 
     /// Record a function definition (`name() { ... }`), overwriting any

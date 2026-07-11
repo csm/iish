@@ -1208,17 +1208,32 @@ fn evaluate_subprocess(
         stdout: redirects.stdout,
         stderr: redirects.stderr,
     };
+    let created_path = runs_a_created_path(name, ctx);
+    let self_call = created_path && calls_installed_binary(name, ctx);
     let verb = config.command_override(name).unwrap_or_else(|| {
-        if runs_a_created_path(name, ctx) {
+        if self_call {
+            config.self_call
+        } else if created_path {
             config.run_created
         } else {
             config.subprocess
         }
     });
     match verb {
+        Verb::Deny if self_call => deny(format!(
+            "calling installed binary `{name}` is denied by the self-call policy"
+        )),
         Verb::Deny => deny(format!("`{name}` is not on the installer allowlist")),
+        Verb::Ask if self_call => prompt(
+            format!("run the installed binary directly: `{name}`?"),
+            action,
+        ),
         Verb::Ask => prompt(
             format!("`{name}` is not natively implemented; run the literal command directly?"),
+            action,
+        ),
+        Verb::Allow if self_call => allow(
+            format!("calls the installed binary `{name}` per the self-call policy"),
             action,
         ),
         Verb::Allow => allow(
@@ -1233,6 +1248,24 @@ fn evaluate_subprocess(
 /// install downloaded and is now executing.
 fn runs_a_created_path(name: &str, ctx: &ExpandCtx) -> bool {
     name.contains('/') && ctx.session.owns(&state::normalize(Path::new(name)))
+}
+
+/// Installed tools are created paths that are executable either on disk
+/// or because an earlier simulated `chmod +x` made them so in dry-run.
+fn calls_installed_binary(name: &str, ctx: &ExpandCtx) -> bool {
+    let path = state::normalize(Path::new(name));
+    if ctx.session.is_recorded_executable(&path) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        return std::fs::metadata(path)
+            .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false);
+    }
+    #[cfg(not(unix))]
+    path.is_file()
 }
 
 /// rc/profile files iish will append to, matching PLAN.md's "Append to
@@ -2705,11 +2738,27 @@ mod tests {
     }
 
     #[test]
-    fn run_created_policy_governs_executing_a_downloaded_path() {
+    fn self_call_policy_governs_executing_an_installed_path() {
         let mut session = Session::new();
         session.record_created("/tmp/iish-nonexistent-stage2");
+        session.record_executable("/tmp/iish-nonexistent-stage2/install.sh");
         let config = Config {
-            run_created: Verb::Allow,
+            self_call: Verb::Deny,
+            ..Config::default()
+        };
+        assert!(matches!(
+            verdict_with_config(
+                "/tmp/iish-nonexistent-stage2/install.sh --now",
+                &mut session,
+                &config
+            ),
+            Deny { .. }
+        ));
+
+        let config = Config {
+            self_call: Verb::Allow,
+            subprocess: Verb::Deny,
+            run_created: Verb::Deny,
             ..Config::default()
         };
         assert!(matches!(
