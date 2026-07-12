@@ -107,6 +107,15 @@ pub enum Action {
     Print { text: String, dest: StdoutDest },
     /// `mkdir`: every path in `paths` was verified not to exist yet.
     MkDir { paths: Vec<PathBuf>, parents: bool },
+    /// `mktemp [-d]`: create a uniquely-named private file (0600) or
+    /// directory (0700) from `template` (its trailing `X` run replaced),
+    /// record it in the ledger, and print the resulting path to stdout —
+    /// which is how `$(mktemp -d)` hands it back to the script.
+    MkTemp {
+        template: PathBuf,
+        dir: bool,
+        dest: StdoutDest,
+    },
     /// `touch`: create each path if absent (recording ownership) or
     /// bump its mtime if present. Vetted by policy.rs's `evaluate_touch`.
     Touch { paths: Vec<PathBuf> },
@@ -124,9 +133,15 @@ pub enum Action {
     /// rc/profile file (milestone 6's env-file append grammar, vetted by
     /// policy.rs before this action is ever built).
     AppendFile { path: PathBuf, text: String },
-    /// `sha256sum FILE...`: print `<hex>  <path>` for each, restricted to
-    /// paths this run created.
-    Sha256Sum { paths: Vec<PathBuf> },
+    /// `echo`/`printf`/`cat << EOF ... > file`: write already-rendered
+    /// text to `path` (PLAN's write/create row — a new path is fine,
+    /// overwriting was vetted by policy.rs against the ledger and the
+    /// `overwrite` verb before this action was built).
+    WriteFile { path: PathBuf, text: String },
+    /// `sha256sum FILE...`: print `<hex>  <path>` for each (`<hex> *<path>`
+    /// with `-b`, GNU's binary-mode marker), restricted to paths this run
+    /// created.
+    Sha256Sum { paths: Vec<PathBuf>, binary: bool },
     /// `sha256sum -c FILE`: verify each `<hex>  <path>` entry (parsed
     /// from a checksums file this run created) against the file on disk.
     Sha256Check { entries: Vec<(String, PathBuf)> },
@@ -186,10 +201,11 @@ pub enum Action {
     ProbeRead { path: PathBuf },
     /// `cd dir`: change iish's own working directory.
     ChangeDir { path: PathBuf },
-    /// `read [-r] NAME < /dev/tty`: read one line from the named device
-    /// into a shell variable. Fails (like bash's `read`) when the
-    /// device can't be opened or is at EOF.
-    ReadLine { name: String, path: PathBuf },
+    /// `read [-r] NAME < /dev/tty` (or `<< EOF`): read one line — from
+    /// the named device, or from a here-document body already captured
+    /// at parse time — into a shell variable. Fails (like bash's
+    /// `read`) when the device can't be opened or the source is at EOF.
+    ReadLine { name: String, source: ReadSource },
     /// `command -v NAME` / `type NAME`: resolve what NAME would run —
     /// a function defined this run, an iish builtin, or a `$PATH`
     /// binary — printing per `style` and succeeding only if found. Pure
@@ -199,6 +215,14 @@ pub enum Action {
         style: LookupStyle,
         dest: StdoutDest,
     },
+}
+
+/// Where a `read` takes its line from: a device named by a `<` redirect
+/// (`/dev/tty`), or the literal body of a here-document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadSource {
+    Device(PathBuf),
+    Literal(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,6 +251,7 @@ pub const NATIVE_COMMAND_NAMES: &[&str] = &[
     "echo",
     "printf",
     "mkdir",
+    "mktemp",
     "touch",
     "rm",
     "chmod",
@@ -255,6 +280,11 @@ pub fn execute(action: &Action, session: &mut Session, out: &mut Out) -> Result<
         Action::MkDir { paths, parents } => paths
             .iter()
             .try_for_each(|path| mkdir(path, *parents, session)),
+        Action::MkTemp {
+            template,
+            dir,
+            dest,
+        } => mktemp(template, *dir, *dest, session, out),
         Action::Touch { paths } => paths.iter().try_for_each(|path| touch(path, session)),
         Action::Remove {
             paths,
@@ -276,7 +306,10 @@ pub fn execute(action: &Action, session: &mut Session, out: &mut Out) -> Result<
         }
         Action::Fetch { url, output } => fetch(url, output, session, out),
         Action::AppendFile { path, text } => append_file(path, text, session),
-        Action::Sha256Sum { paths } => paths.iter().try_for_each(|path| print_sha256(path, out)),
+        Action::WriteFile { path, text } => write_file(path, text, session),
+        Action::Sha256Sum { paths, binary } => paths
+            .iter()
+            .try_for_each(|path| print_sha256(path, *binary, out)),
         Action::Sha256Check { entries } => verify_sha256(entries, out),
         Action::Subprocess {
             name,
@@ -325,14 +358,18 @@ pub fn execute(action: &Action, session: &mut Session, out: &mut Out) -> Result<
         Action::ChangeDir { path } => {
             std::env::set_current_dir(path).map_err(|e| format!("cd: `{}`: {e}", path.display()))
         }
-        Action::ReadLine { name, path } => {
-            if read_line_into(name, path, session)? {
+        Action::ReadLine { name, source } => {
+            if read_line_into(name, source, session)? {
                 Ok(())
             } else {
-                Err(format!(
-                    "read: could not read a line from `{}`",
-                    path.display()
-                ))
+                Err(match source {
+                    ReadSource::Device(path) => {
+                        format!("read: could not read a line from `{}`", path.display())
+                    }
+                    ReadSource::Literal(_) => {
+                        "read: could not read a line; the here-document is exhausted".to_string()
+                    }
+                })
             }
         }
         Action::Unset { names, functions } => {
@@ -380,26 +417,37 @@ pub fn execute_returning_status(
             command_lookup(name, *style, *dest, session, out)
         }
         Action::ProbeRead { path } => Ok(fs::File::open(path).is_ok()),
-        Action::ReadLine { name, path } => read_line_into(name, path, session),
+        Action::ReadLine { name, source } => read_line_into(name, source, session),
         other => execute(other, session, out).map(|()| true),
     }
 }
 
-/// Read one line from `path` into the shell variable `name`. `Ok(false)`
-/// — bash `read`'s non-zero status — when the device can't be opened or
-/// gives EOF before any bytes.
-fn read_line_into(name: &str, path: &Path, session: &mut Session) -> Result<bool, String> {
+/// Read one line from `source` into the shell variable `name`.
+/// `Ok(false)` — bash `read`'s non-zero status — when the device can't
+/// be opened or the source gives EOF before any bytes.
+fn read_line_into(name: &str, source: &ReadSource, session: &mut Session) -> Result<bool, String> {
     use std::io::BufRead;
-    let Ok(file) = fs::File::open(path) else {
-        return Ok(false);
+    let mut line = match source {
+        ReadSource::Device(path) => {
+            let Ok(file) = fs::File::open(path) else {
+                return Ok(false);
+            };
+            let mut line = String::new();
+            let bytes = std::io::BufReader::new(file)
+                .read_line(&mut line)
+                .map_err(|e| format!("read: `{}`: {e}", path.display()))?;
+            if bytes == 0 {
+                return Ok(false);
+            }
+            line
+        }
+        ReadSource::Literal(text) => {
+            if text.is_empty() {
+                return Ok(false);
+            }
+            text.split_inclusive('\n').next().unwrap_or("").to_string()
+        }
     };
-    let mut line = String::new();
-    let bytes = std::io::BufReader::new(file)
-        .read_line(&mut line)
-        .map_err(|e| format!("read: `{}`: {e}", path.display()))?;
-    if bytes == 0 {
-        return Ok(false);
-    }
     if line.ends_with('\n') {
         line.pop();
     }
@@ -461,6 +509,7 @@ pub fn record_would_create(action: &Action, session: &mut Session) {
             ..
         } => session.record_created(path),
         Action::AppendFile { path, .. } => session.record_created(path),
+        Action::WriteFile { path, .. } => session.record_created(path),
         Action::DefineFunction { name, body } => {
             session.define_function(name.clone(), body.clone())
         }
@@ -627,6 +676,87 @@ fn mkdir(path: &Path, parents: bool, session: &mut Session) -> Result<(), String
     result.map_err(|e| format!("mkdir: `{}`: {e}", path.display()))?;
     session.record_created(topmost);
     Ok(())
+}
+
+/// `mktemp [-d]`: replace the template's trailing `X` run with random
+/// alphanumerics and create the result exclusively — a name collision
+/// (or a raced creation by someone else) just moves on to the next
+/// candidate, so a hostile pre-creation can never hand the script a
+/// path it doesn't own. Prints the created path, exactly like the real
+/// tool, so `$(mktemp -d)` captures it.
+fn mktemp(
+    template: &Path,
+    dir: bool,
+    dest: StdoutDest,
+    session: &mut Session,
+    out: &mut Out,
+) -> Result<(), String> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
+    let file_name = template
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| format!("mktemp: bad template `{}`", template.display()))?;
+    let xs = file_name.chars().rev().take_while(|c| *c == 'X').count();
+    let stem = &file_name[..file_name.len() - xs];
+    let parent = template.parent().unwrap_or(Path::new("."));
+
+    for attempt in 0..100 {
+        let path = parent.join(format!("{stem}{}", random_alnum(xs, attempt)));
+        assert_no_symlink_escape(&path, false).map_err(|e| format!("mktemp: {e}"))?;
+        let created = if dir {
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(0o700);
+            match builder.create(&path) {
+                Ok(()) => true,
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => false,
+                Err(e) => return Err(format!("mktemp: `{}`: {e}", path.display())),
+            }
+        } else {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+            {
+                Ok(_) => true,
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => false,
+                Err(e) => return Err(format!("mktemp: `{}`: {e}", path.display())),
+            }
+        };
+        if created {
+            session.record_created(&path);
+            return print_text(&format!("{}\n", path.display()), dest, out);
+        }
+    }
+    Err(format!(
+        "mktemp: could not create a unique path from `{}`",
+        template.display()
+    ))
+}
+
+/// `len` random alphanumeric characters from the standard library's
+/// per-instance-keyed SipHash state — not cryptographic, but the
+/// exclusive-create loop above never trusts the name to be secret,
+/// only unpredictable enough to terminate quickly.
+fn random_alnum(len: usize, attempt: u64) -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    const ALNUM: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let mut chars = String::with_capacity(len);
+    let mut bits = 0u64;
+    for i in 0..len {
+        // 10 draws of 62 fit comfortably in 64 bits of entropy;
+        // reseed past that.
+        if i % 10 == 0 {
+            let mut hasher = RandomState::new().build_hasher();
+            hasher.write_u64(attempt.wrapping_mul(31).wrapping_add(i as u64));
+            bits = hasher.finish();
+        }
+        chars.push(ALNUM[(bits % 62) as usize] as char);
+        bits /= 62;
+    }
+    chars
 }
 
 /// `touch`: create `path` empty if it doesn't exist (recording
@@ -832,6 +962,20 @@ fn append_file(path: &Path, text: &str, session: &mut Session) -> Result<(), Str
     Ok(())
 }
 
+/// Write already-vetted text to `path` (policy.rs applied the ledger
+/// and `overwrite` rules), creating or truncating it. Only a new file
+/// enters the ledger; a pre-existing one the user let us overwrite is
+/// still theirs (matching `fetch` and `cp`).
+fn write_file(path: &Path, text: &str, session: &mut Session) -> Result<(), String> {
+    assert_no_symlink_escape(path, false).map_err(|e| format!("write: {e}"))?;
+    let existed = path.exists();
+    fs::write(path, text).map_err(|e| format!("write: `{}`: {e}", path.display()))?;
+    if !existed {
+        session.record_created(path);
+    }
+    Ok(())
+}
+
 fn sha256_hex(path: &Path) -> Result<String, String> {
     assert_no_symlink_escape(path, false).map_err(|e| format!("sha256sum: {e}"))?;
     let mut file =
@@ -846,9 +990,10 @@ fn sha256_hex(path: &Path) -> Result<String, String> {
         .collect())
 }
 
-fn print_sha256(path: &Path, out: &mut Out) -> Result<(), String> {
+fn print_sha256(path: &Path, binary: bool, out: &mut Out) -> Result<(), String> {
     let hex = sha256_hex(path)?;
-    writeln!(out, "{hex}  {}", path.display())
+    let marker = if binary { "*" } else { " " };
+    writeln!(out, "{hex} {marker}{}", path.display())
         .map_err(|e| format!("sha256sum: writing to stdout: {e}"))
 }
 
@@ -1501,7 +1646,14 @@ mod tests {
         let mut session = Session::new();
         session.record_created(&link);
 
-        let err = run(&Action::Sha256Sum { paths: vec![link] }, &mut session).unwrap_err();
+        let err = run(
+            &Action::Sha256Sum {
+                paths: vec![link],
+                binary: false,
+            },
+            &mut session,
+        )
+        .unwrap_err();
         assert!(err.contains("symlink"), "{err}");
         fs::remove_dir_all(&base).unwrap();
     }

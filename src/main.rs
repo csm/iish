@@ -390,18 +390,52 @@ fn run_statement(
                 out,
             )?
         }
-        Verdict::Call { name, args, body } => {
+        Verdict::Call {
+            name,
+            args,
+            body,
+            stdin_doc,
+            capture,
+        } => {
             eprintln!("iish> {raw}");
             // The frame makes `args` the body's `$1`/`$@`/`$#`, scopes
             // its `local`s, and bounds its `return`. Popped on every
-            // way out, including an abort passing through.
+            // way out, including an abort passing through. A redirect
+            // on the call applies for the body's duration: a
+            // here-document becomes the frame's stdin, and `capture`
+            // buffers the body's stdout to write to its vetted file
+            // once the call succeeds.
             session.push_frame(name, args);
-            let result = run_items_inner(&body, ask, config, session, depth + 1, in_condition, out);
+            if let Some(text) = stdin_doc {
+                session.set_frame_stdin(text);
+            }
+            let mut captured = Vec::new();
+            let result = match &capture {
+                None => run_items_inner(&body, ask, config, session, depth + 1, in_condition, out),
+                Some(_) => {
+                    let mut capture_out = exec::Out::capture(&mut captured);
+                    run_items_inner(
+                        &body,
+                        ask,
+                        config,
+                        session,
+                        depth + 1,
+                        in_condition,
+                        &mut capture_out,
+                    )
+                }
+            };
             session.pop_frame();
-            match result {
+            let status = match result {
                 Err(Abort::Return(n)) => n == 0,
                 other => other?,
+            };
+            if status {
+                if let Some(capture) = capture {
+                    complete_call_capture(capture, captured, raw, ask, config, session, out)?;
+                }
             }
+            status
         }
         Verdict::If {
             condition,
@@ -656,10 +690,24 @@ fn run_pipe(
                 eprintln!("iish: aborting; no later statement was run.");
                 return Err(fail());
             }
-            Verdict::Call { name, args, body } => PipeStage::Statements {
+            Verdict::Call {
+                name,
+                args,
+                body,
+                stdin_doc: None,
+                capture: None,
+            } => PipeStage::Statements {
                 frame: Some((name, args)),
                 body,
             },
+            Verdict::Call { .. } => {
+                eprintln!(
+                    "iish: refusing `{}`: a function call carrying its own redirect is not \
+                     implemented as a pipeline stage",
+                    statement.raw
+                );
+                return Err(fail());
+            }
             Verdict::Group { statements } => PipeStage::Statements {
                 frame: None,
                 body: statements,
@@ -989,6 +1037,61 @@ fn run_pipeline_for_status(
 /// `Err` — including a non-zero subprocess exit or false test — aborts);
 /// inside one, a non-zero/false result is reported back instead of
 /// aborting, per `run_condition`'s doc comment.
+/// Finish a captured function call (`fn ... > file` / `fn ... >>
+/// rcfile`): write the body's buffered stdout to its vetted target.
+/// The `>` path was vetted when the call was evaluated; the rc-file
+/// append's restricted grammar — and its `ask` confirmation — run
+/// here, on the text that now finally exists.
+fn complete_call_capture(
+    capture: policy::CallCapture,
+    captured: Vec<u8>,
+    raw: &str,
+    ask: prompt::AskMode,
+    config: &Config,
+    session: &mut state::Session,
+    out: &mut Out,
+) -> Result<(), Abort> {
+    let text = match String::from_utf8(captured) {
+        Ok(text) => text,
+        Err(_) => {
+            eprintln!("iish: `{raw}`: the call produced non-text output; refusing to write it");
+            return Err(fail());
+        }
+    };
+    let action = match capture {
+        policy::CallCapture::WriteFile { path } => exec::Action::WriteFile { path, text },
+        policy::CallCapture::AppendEnvFile { path } => {
+            if let Err(reason) = policy::check_env_file_grammar(&text, session) {
+                eprintln!(
+                    "iish: refusing `{raw}`: append to `{}` refused: {reason}",
+                    path.display()
+                );
+                eprintln!("iish: aborting; no later statement was run.");
+                return Err(fail());
+            }
+            if config.env_file_append == Verb::Ask {
+                let reason = format!(
+                    "append the call's output to `{}` (matches the restricted env-file grammar)",
+                    path.display()
+                );
+                match prompt::confirm(ask, raw, &reason) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        eprintln!("iish: `{raw}` declined ({reason}); aborting.");
+                        return Err(fail());
+                    }
+                    Err(e) => {
+                        eprintln!("iish: cannot confirm `{raw}`: {e}");
+                        return Err(fail());
+                    }
+                }
+            }
+            exec::Action::AppendFile { path, text }
+        }
+    };
+    execute_statement(&action, session, false, raw, out).map(|_| ())
+}
+
 fn execute_statement(
     action: &exec::Action,
     session: &mut state::Session,
@@ -1115,6 +1218,7 @@ fn action_requirement(action: &exec::Action) -> String {
         Action::Noop | Action::Test { .. } => "builtin.control/test (native)".into(),
         Action::Print { .. } => "output.write (native)".into(),
         Action::MkDir { .. } => "filesystem.mkdir (native)".into(),
+        Action::MkTemp { .. } => "filesystem.mktemp (native)".into(),
         Action::Touch { .. } => "filesystem.touch (native)".into(),
         Action::Remove { .. } => "filesystem.remove (native, ledger-restricted)".into(),
         Action::Chmod { .. } => "filesystem.chmod (native, ledger-restricted)".into(),
@@ -1122,6 +1226,7 @@ fn action_requirement(action: &exec::Action) -> String {
         Action::AppendFile { .. } => {
             "filesystem.append_env_file (native, restricted grammar)".into()
         }
+        Action::WriteFile { .. } => "filesystem.write_file (native, create-only)".into(),
         Action::Sha256Sum { .. } | Action::Sha256Check { .. } => "crypto.sha256 (native)".into(),
         Action::Subprocess { name, .. } => format!("process.exec({name}) (generic subprocess)"),
         Action::DefineFunction { .. } => "shell.function_definition (native)".into(),
@@ -1241,13 +1346,38 @@ fn report_verdict(
             println!("{indent}  [GROUP ] {}", statement.raw);
             report_items(&statements, config, session, depth + 1, denied, asks);
         }
-        Verdict::Call { name, args, body } => {
+        Verdict::Call {
+            name,
+            args,
+            body,
+            stdin_doc,
+            capture,
+        } => {
             // Simulate the call frame so the body's `$1`/`$@`/`local`
-            // are judged as a live run would.
+            // are judged as a live run would — including a here-doc fed
+            // to the call becoming the frame's stdin, and a captured
+            // output file entering the ledger for later statements to
+            // be judged against.
             println!("{indent}  [CALL  ] {}", statement.raw);
             session.push_frame(name, args);
+            if let Some(text) = stdin_doc {
+                session.set_frame_stdin(text);
+            }
             report_items(&body, config, session, depth + 1, denied, asks);
             session.pop_frame();
+            match capture {
+                Some(policy::CallCapture::WriteFile { path }) => session.record_created(&path),
+                Some(policy::CallCapture::AppendEnvFile { path }) => {
+                    println!(
+                        "{indent}           the call's output is appended to `{}` if it \
+                         matches the restricted env-file grammar (checked when the text \
+                         exists)",
+                        path.display()
+                    );
+                    session.record_created(&path);
+                }
+                None => {}
+            }
         }
         Verdict::If {
             condition,

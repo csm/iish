@@ -18,6 +18,11 @@ struct Frame {
     function_name: String,
     positional: Vec<String>,
     locals: HashMap<String, String>,
+    /// The remaining body of a here-document fed to this call
+    /// (`fn args <<EOF`): the call's stdin, consumed line by line by
+    /// `read` or wholesale by a bare `cat`. Inner calls inherit the
+    /// nearest enclosing document, as a child would inherit the fd.
+    stdin_doc: Option<String>,
 }
 
 /// The isolatable part of a [`Session`] — everything a subshell may
@@ -198,7 +203,60 @@ impl Session {
             function_name: function_name.into(),
             positional: args,
             locals: HashMap::new(),
+            stdin_doc: None,
         });
+    }
+
+    /// Attach a here-document as the innermost call's stdin
+    /// (`fn args <<EOF`). Panics without a frame — the runner only
+    /// calls this immediately after `push_frame`.
+    pub fn set_frame_stdin(&mut self, text: String) {
+        self.frames
+            .last_mut()
+            .expect("set_frame_stdin requires a frame")
+            .stdin_doc = Some(text);
+    }
+
+    /// Whether some enclosing call was fed a here-document as stdin.
+    /// True even once it's fully consumed: the document *is* the call's
+    /// stdin, so a second reader sees its EOF — it must not fall back
+    /// to iish's real stdin (the script itself).
+    pub fn frame_stdin_available(&self) -> bool {
+        self.frames.iter().any(|f| f.stdin_doc.is_some())
+    }
+
+    /// Consume the rest of the nearest enclosing call's here-document
+    /// stdin (a bare `cat` inside the call).
+    pub fn take_frame_stdin(&mut self) -> Option<String> {
+        let doc = self
+            .frames
+            .iter_mut()
+            .rev()
+            .find_map(|f| f.stdin_doc.as_mut())?;
+        Some(std::mem::take(doc))
+    }
+
+    /// Consume one line (returned without its newline) of the nearest
+    /// enclosing call's here-document stdin — `read` inside the call.
+    /// `None` at end of document, matching read's EOF failure.
+    pub fn take_frame_stdin_line(&mut self) -> Option<String> {
+        let doc = self
+            .frames
+            .iter_mut()
+            .rev()
+            .find_map(|f| f.stdin_doc.as_mut())?;
+        if doc.is_empty() {
+            return None;
+        }
+        let line = match doc.find('\n') {
+            Some(end) => {
+                let line = doc[..end].to_string();
+                *doc = doc[end + 1..].to_string();
+                line
+            }
+            None => std::mem::take(doc),
+        };
+        Some(line)
     }
 
     /// Leave the innermost function call, dropping its locals and

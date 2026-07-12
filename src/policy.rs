@@ -12,8 +12,8 @@
 //! enforces it instead.
 
 use crate::config::{Config, NetworkPolicy, Verb};
-use crate::exec::{Action, FetchOutput, LookupStyle, Mode, StderrDest, StdoutDest};
-use crate::parser::{ast, case_pattern_word, glob_match, literal_word, word_fields, ExpandCtx};
+use crate::exec::{Action, FetchOutput, LookupStyle, Mode, ReadSource, StderrDest, StdoutDest};
+use crate::parser::{self, ast, case_pattern_word, glob_match, literal_word, word_fields, ExpandCtx};
 use crate::state;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -32,6 +32,21 @@ pub enum Flow {
     Break(u32),
     /// `continue [n]`: next iteration of the `n`th enclosing loop.
     Continue(u32),
+}
+
+/// Where a function call's captured stdout goes once the body finishes
+/// (`fn args > file` / `fn args >> rcfile` — cargo-dist's `ensure cat
+/// <<EOF > env-script` wrapper). The target path is vetted when the
+/// call is evaluated; for an rc-file append the restricted grammar and
+/// the `env-file-append` verb are applied to the captured text at
+/// completion, when it finally exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallCapture {
+    /// `> file`: pre-vetted as new or run-owned; written on completion.
+    WriteFile { path: PathBuf },
+    /// `>> rcfile`: a recognized rc/profile file; grammar-checked (and
+    /// confirmed, under the default `ask`) on completion.
+    AppendEnvFile { path: PathBuf },
 }
 
 /// Not `PartialEq`/`Eq`: several variants carry `brush_parser::ast`
@@ -59,11 +74,17 @@ pub enum Verdict {
     /// A call to a function defined earlier in the run: like `Group`,
     /// but the runner brackets the body in a call frame so `args`
     /// become the body's `$1`/`$@`/`$#`, `local` declarations scope to
-    /// the call, and `return` unwinds to exactly here.
+    /// the call, and `return` unwinds to exactly here. A redirect on
+    /// the call applies for the body's duration, as in bash:
+    /// `stdin_doc` (a here-document fed to the call) becomes the
+    /// frame's consumable stdin, and `capture` routes the body's whole
+    /// stdout into a vetted file once the call completes.
     Call {
         name: String,
         args: Vec<String>,
         body: Vec<ast::CompoundListItem>,
+        stdin_doc: Option<String>,
+        capture: Option<CallCapture>,
     },
     /// `if`/`elif`/`else`/`fi`: unlike `Group`, which branch (if any)
     /// runs depends on the actual exit status of `condition` — which may
@@ -602,7 +623,10 @@ struct Redirects {
 fn is_ignorable_compound_redirect(r: &ast::IoRedirect, ctx: &mut ExpandCtx) -> bool {
     let mut scratch = Redirects::default();
     let mut append: Option<&ast::Word> = None;
-    note_redirect(r, &mut append, &mut scratch, ctx) && append.is_none()
+    let mut write: Option<&ast::Word> = None;
+    note_redirect(r, &mut append, &mut write, &mut scratch, ctx)
+        && append.is_none()
+        && write.is_none()
 }
 
 fn evaluate_simple_command(
@@ -641,13 +665,15 @@ fn evaluate_simple_command(
     // once the command name is known.
     let mut assignment_args: Vec<(String, String)> = Vec::new();
     // The redirect shapes iish understands: a single `>>` onto a plain
-    // filename (the env-file append grammar), `> /dev/null` and
-    // `2> /dev/null` (discarding writes nothing anywhere, so there is
-    // no path or content to vet), `2>&1` (stderr follows stdout), and
-    // `>&2` (stdout joins iish's own stderr). Anything else (other fds,
-    // `<`, `>`/`2>` onto a real file, heredocs, process substitution as
-    // a redirect target, ...) is denied below.
+    // filename (the env-file append grammar), a single `>` onto a plain
+    // filename (a create-only file write, vetted below), `> /dev/null`
+    // and `2> /dev/null` (discarding writes nothing anywhere, so there
+    // is no path or content to vet), `2>&1` (stderr follows stdout),
+    // and `>&2` (stdout joins iish's own stderr). Anything else (other
+    // fds, `<` onto a real file, `2>` onto a real file, process
+    // substitution as a redirect target, ...) is denied below.
     let mut append_target: Option<&ast::Word> = None;
+    let mut write_target: Option<&ast::Word> = None;
     let mut heredoc: Option<&ast::IoHereDocument> = None;
     let mut redirects = Redirects::default();
     let mut unsupported_redirect = false;
@@ -671,7 +697,8 @@ fn evaluate_simple_command(
                     heredoc = Some(doc);
                 }
                 ast::CommandPrefixOrSuffixItem::IoRedirect(r) => {
-                    if !note_redirect(r, &mut append_target, &mut redirects, ctx) {
+                    if !note_redirect(r, &mut append_target, &mut write_target, &mut redirects, ctx)
+                    {
                         unsupported_redirect = true;
                     }
                 }
@@ -709,41 +736,126 @@ fn evaluate_simple_command(
 
     if unsupported_redirect {
         return deny(
-            "redirection is only implemented for a single `>>` onto a plain filename \
-             (see the env-file append grammar), `> /dev/null`, `2> /dev/null`, `2>&1`, \
-             and `>&2`",
+            "redirection is only implemented for a single `>>`/`>` onto a plain filename \
+             (see the env-file append grammar and the create-only write rule), \
+             `> /dev/null`, `2> /dev/null`, `2>&1`, and `>&2`",
+        );
+    }
+    if append_target.is_some() && write_target.is_some() {
+        return deny("a statement carrying both `>>` and `>` is not implemented");
+    }
+    if write_target.is_some() && redirects.stdout != StdoutDest::Inherit {
+        return deny("a statement carrying both `>` onto a file and another stdout redirect is not implemented");
+    }
+
+    // A redirect on a *function call* applies for the body's duration,
+    // as in bash: a here-document becomes the call's stdin (cargo-dist's
+    // `ensure cat <<EOF > script` wrapper), `>`/`>>` route the body's
+    // whole stdout into a vetted file once the call completes.
+    if (heredoc.is_some() || append_target.is_some() || write_target.is_some())
+        && ctx.session.lookup_function(&name).is_some()
+    {
+        return evaluate_call_with_redirects(
+            &name,
+            &args,
+            heredoc,
+            append_target,
+            write_target,
+            ctx,
+            config,
         );
     }
 
     if let Some(doc) = heredoc {
-        // The one here-document idiom installers actually use: `cat <<
-        // EOF` printing a banner/usage block. `cat` copying its stdin
+        // The here-document idioms installers actually use: `cat <<
+        // EOF` printing a banner/usage block (`cat` copying its stdin
         // to stdout *is* printing the body, so it compiles to the same
-        // native Print as `echo` — no subprocess, no prompt.
+        // native Print as `echo` — no subprocess, no prompt), `cat <<
+        // EOF > file` writing the body to a file (cargo-dist's env
+        // script), and `read VAR << EOF` binding the first body line
+        // to a variable (cargo-dist's install receipt).
+        if name == "read" && append_target.is_none() && write_target.is_none() {
+            return evaluate_read_heredoc(&args, doc, ctx);
+        }
         if name != "cat" || !args.is_empty() || append_target.is_some() {
             return deny(
-                "here-documents are only implemented for a bare `cat << EOF` printing a banner",
+                "here-documents are only implemented for `cat << EOF` (printed, or written \
+                 to a file with `>`) and `read VAR << EOF`",
             );
         }
-        return evaluate_cat_heredoc(doc, redirects.stdout);
+        return evaluate_cat_heredoc(doc, write_target, redirects.stdout, ctx, config);
     }
 
-    match append_target {
-        None => evaluate_argv(&name, &args, redirects, ctx, config, false),
-        Some(target) if matches!(name.as_str(), "echo" | "printf") => {
+    match (append_target, write_target) {
+        (None, None) => evaluate_argv(&name, &args, redirects, ctx, config, false),
+        (Some(target), None) if matches!(name.as_str(), "echo" | "printf") => {
             evaluate_env_file_append(&name, &args, target, ctx, config)
         }
-        Some(_) => deny(format!(
-            "redirecting `{name}`'s output is not implemented yet"
+        (None, Some(target)) if matches!(name.as_str(), "echo" | "printf") => {
+            match render_output(&name, &args) {
+                Ok(text) => evaluate_write_file(text, target, ctx, config),
+                Err(reason) => deny(reason),
+            }
+        }
+        _ => deny(format!(
+            "redirecting `{name}`'s output to a file is not implemented yet"
         )),
     }
 }
 
-/// `cat << EOF ... EOF`: print the body. A `<<-` strips leading tabs,
-/// as in a real shell. A body that would need expansion (`$VAR` or a
-/// backquote under an unquoted delimiter) is refused rather than
-/// printed wrong — installers' banners are plain text.
-fn evaluate_cat_heredoc(doc: &ast::IoHereDocument, dest: StdoutDest) -> Verdict {
+/// `cat << EOF ... EOF`: print the body, or with `> file` write it
+/// there. A `<<-` strips leading tabs, as in a real shell. An unquoted
+/// delimiter expands the body (`$VAR`, `${...}`, with `\$` escaping)
+/// exactly as bash would; a quoted one keeps it verbatim.
+fn evaluate_cat_heredoc(
+    doc: &ast::IoHereDocument,
+    write_target: Option<&ast::Word>,
+    dest: StdoutDest,
+    ctx: &mut ExpandCtx,
+    config: &Config,
+) -> Verdict {
+    let text = match heredoc_body(doc, ctx) {
+        Ok(text) => text,
+        Err(reason) => return deny(reason),
+    };
+    match write_target {
+        None => allow(
+            "prints the here-document body only",
+            Action::Print { text, dest },
+        ),
+        Some(target) => evaluate_write_file(text, target, ctx, config),
+    }
+}
+
+/// `read [-r] NAME << EOF`: bind the body's first line to NAME — how
+/// cargo-dist installers load their install-receipt template. Reading
+/// from a fixed body has no tty involved; it's pure variable binding.
+fn evaluate_read_heredoc(
+    args: &[String],
+    doc: &ast::IoHereDocument,
+    ctx: &mut ExpandCtx,
+) -> Verdict {
+    let name = match read_variable_name(args) {
+        Ok(name) => name,
+        Err(reason) => return deny(reason),
+    };
+    let text = match heredoc_body(doc, ctx) {
+        Ok(text) => text,
+        Err(reason) => return deny(reason),
+    };
+    allow(
+        format!("binds the here-document's first line to `{name}`; nothing else"),
+        Action::ReadLine {
+            name,
+            source: ReadSource::Literal(text),
+        },
+    )
+}
+
+/// A here-document's effective body: `<<-`'s leading tabs stripped, and
+/// — when the delimiter was unquoted — `$`/backtick expansion performed
+/// per bash's here-document rules (see `parser::expand_heredoc_body`).
+fn heredoc_body(doc: &ast::IoHereDocument, ctx: &mut ExpandCtx) -> Result<String, String> {
     let mut text = doc.doc.value.clone();
     if doc.remove_tabs {
         text = text
@@ -751,13 +863,158 @@ fn evaluate_cat_heredoc(doc: &ast::IoHereDocument, dest: StdoutDest) -> Verdict 
             .map(|line| line.trim_start_matches('\t'))
             .collect();
     }
-    if doc.requires_expansion && text.contains(['$', '`']) {
-        return deny("a here-document containing expansions is not implemented yet");
+    if doc.requires_expansion {
+        text = parser::expand_heredoc_body(&text, ctx)?;
     }
-    allow(
-        "prints the here-document body only",
-        Action::Print { text, dest },
-    )
+    Ok(text)
+}
+
+/// `echo`/`printf`/`cat << EOF` with `>` onto a plain filename: PLAN's
+/// write/create row. A brand-new path is allowed, a path this run
+/// created may be rewritten, and a pre-existing foreign path is
+/// governed by `overwrite` — the same ladder as `curl -o`/`cp`.
+/// Recognized rc/profile files are refused outright: `>` *replaces*
+/// the user's file, which no legitimate installer does (they append,
+/// through the restricted `>>` grammar).
+fn evaluate_write_file(
+    text: String,
+    target: &ast::Word,
+    ctx: &mut ExpandCtx,
+    config: &Config,
+) -> Verdict {
+    let path_str = match literal_word(target, ctx) {
+        Ok(s) => s,
+        Err(reason) => return deny(reason),
+    };
+    let path = state::normalize(Path::new(&path_str));
+    if is_recognized_env_file(&path) {
+        return deny(format!(
+            "`> {}` would replace a shell rc/profile file; only `>>` appends matching the \
+             restricted env-file grammar are supported",
+            path.display()
+        ));
+    }
+    let action = Action::WriteFile {
+        path: path.clone(),
+        text,
+    };
+    if !path.exists() {
+        allow(
+            format!("writes the rendered text to new file `{}`", path.display()),
+            action,
+        )
+    } else if ctx.session.owns(&path) {
+        allow(
+            format!("rewrites `{}`, a file this run created", path.display()),
+            action,
+        )
+    } else {
+        match config.overwrite {
+            Verb::Ask => prompt(
+                format!("`> {}` would overwrite a pre-existing file", path.display()),
+                action,
+            ),
+            Verb::Allow => allow(
+                format!(
+                    "overwrites pre-existing `{}` (allowed by configuration)",
+                    path.display()
+                ),
+                action,
+            ),
+            Verb::Deny => deny(format!(
+                "`> {}` would overwrite a pre-existing file; overwriting is disabled by \
+                 configuration",
+                path.display()
+            )),
+        }
+    }
+}
+
+/// A function call carrying a here-document or a `>`/`>>` file
+/// redirect: compile to a `Verdict::Call` whose `stdin_doc`/`capture`
+/// the runner applies for the body's duration (bash's semantics for a
+/// redirected function call). The output path is vetted here, before
+/// anything runs: `>` must name a brand-new or run-owned non-rc file;
+/// `>>` must name a recognized rc/profile file (its restricted grammar
+/// is applied to the captured text when the call completes — the only
+/// moment that text exists).
+#[allow(clippy::too_many_arguments)]
+fn evaluate_call_with_redirects(
+    name: &str,
+    args: &[String],
+    heredoc: Option<&ast::IoHereDocument>,
+    append_target: Option<&ast::Word>,
+    write_target: Option<&ast::Word>,
+    ctx: &mut ExpandCtx,
+    config: &Config,
+) -> Verdict {
+    let stdin_doc = match heredoc {
+        Some(doc) => match heredoc_body(doc, ctx) {
+            Ok(text) => Some(text),
+            Err(reason) => return deny(reason),
+        },
+        None => None,
+    };
+    let capture = if let Some(target) = write_target {
+        let path_str = match literal_word(target, ctx) {
+            Ok(s) => s,
+            Err(reason) => return deny(reason),
+        };
+        let path = state::normalize(Path::new(&path_str));
+        if is_recognized_env_file(&path) {
+            return deny(format!(
+                "`> {}` would replace a shell rc/profile file; only `>>` appends matching \
+                 the restricted env-file grammar are supported",
+                path.display()
+            ));
+        }
+        if path.exists() && !ctx.session.owns(&path) {
+            // A pre-existing foreign target would need the `overwrite`
+            // prompt, and a `Call` verdict has no moment to ask at.
+            return deny(format!(
+                "`> {}` through a function call would overwrite a pre-existing file this \
+                 run didn't create; not implemented",
+                path.display()
+            ));
+        }
+        Some(CallCapture::WriteFile { path })
+    } else if let Some(target) = append_target {
+        let path_str = match literal_word(target, ctx) {
+            Ok(s) => s,
+            Err(reason) => return deny(reason),
+        };
+        let path = state::normalize(Path::new(&path_str));
+        if !is_recognized_env_file(&path) {
+            return deny(format!(
+                "`{}` is not a recognized shell rc/profile file in $HOME; env-file appends \
+                 are restricted to {} (and fish's config.fish/conf.d)",
+                path.display(),
+                ENV_FILE_NAMES.join(", ")
+            ));
+        }
+        if config.env_file_append == Verb::Deny {
+            return deny(format!(
+                "appending to `{}` is disabled by configuration",
+                path.display()
+            ));
+        }
+        Some(CallCapture::AppendEnvFile { path })
+    } else {
+        None
+    };
+    let body = ctx
+        .session
+        .lookup_function(name)
+        .expect("caller checked the function exists")
+        .0
+        .clone();
+    Verdict::Call {
+        name: name.to_string(),
+        args: args.to_vec(),
+        body,
+        stdin_doc,
+        capture,
+    }
 }
 
 /// Record one redirect into `append_target`/`redirects` if it's a shape
@@ -770,6 +1027,7 @@ fn evaluate_cat_heredoc(doc: &ast::IoHereDocument, dest: StdoutDest) -> Verdict 
 fn note_redirect<'a>(
     r: &'a ast::IoRedirect,
     append_target: &mut Option<&'a ast::Word>,
+    write_target: &mut Option<&'a ast::Word>,
     redirects: &mut Redirects,
     ctx: &mut ExpandCtx,
 ) -> bool {
@@ -788,6 +1046,14 @@ fn note_redirect<'a>(
             if redirects.stdout == StdoutDest::Inherit && target_is_dev_null(target, ctx) =>
         {
             redirects.stdout = StdoutDest::Null;
+            true
+        }
+        // `> file` (not /dev/null — the arm above claimed that): a
+        // create-only file write, vetted by `evaluate_write_file`.
+        IoRedirect::File(None | Some(1), Kind::Write, Target::Filename(target))
+            if redirects.stdout == StdoutDest::Inherit && write_target.is_none() =>
+        {
+            *write_target = Some(target);
             true
         }
         IoRedirect::File(Some(2), Kind::Write, Target::Filename(target))
@@ -855,6 +1121,8 @@ fn evaluate_argv(
                 name: name.to_string(),
                 args: args.to_vec(),
                 body: body.0.clone(),
+                stdin_doc: None,
+                capture: None,
             };
         }
     }
@@ -898,7 +1166,22 @@ fn evaluate_argv(
         ),
         "echo" => evaluate_echo(args, redirects.stdout),
         "printf" => evaluate_printf(args, redirects.stdout),
+        // A bare `cat` inside a function call that was fed a
+        // here-document (`ensure cat <<EOF > file` — the body's `"$@"`
+        // runs `cat`): copying that stdin to stdout is a native print
+        // of the remaining document, not a subprocess.
+        "cat" if args.is_empty() && ctx.session.frame_stdin_available() => {
+            let text = ctx.session.take_frame_stdin().unwrap_or_default();
+            allow(
+                "prints the call's here-document stdin only",
+                Action::Print {
+                    text,
+                    dest: redirects.stdout,
+                },
+            )
+        }
         "mkdir" => evaluate_mkdir(args),
+        "mktemp" => evaluate_mktemp(args, redirects.stdout, ctx),
         "touch" => evaluate_touch(args, ctx, config),
         "rm" => evaluate_rm(args, ctx),
         "chmod" => evaluate_chmod(args, ctx),
@@ -911,7 +1194,7 @@ fn evaluate_argv(
         "[" => evaluate_bracket(args),
         "local" => evaluate_local(args, ctx),
         "cd" => evaluate_cd(args),
-        "read" => evaluate_read(args, &redirects),
+        "read" => evaluate_read(args, &redirects, ctx),
         "shift" => evaluate_shift(args),
         "unset" => evaluate_unset(args),
         "command" => evaluate_command_builtin(args, redirects, ctx, config),
@@ -1011,33 +1294,60 @@ fn evaluate_cd(args: &[String]) -> Verdict {
 /// script itself occupies stdin. Only the explicit `< /dev/tty` (or
 /// `< /dev/null`, which reads EOF and fails like bash's would) shape
 /// is implemented: a bare `read` would consume the script's own stdin.
-fn evaluate_read(args: &[String], redirects: &Redirects) -> Verdict {
+fn evaluate_read(args: &[String], redirects: &Redirects, ctx: &mut ExpandCtx) -> Verdict {
+    let name = match read_variable_name(args) {
+        Ok(name) => name,
+        Err(reason) => return deny(reason),
+    };
     let Some(path) = &redirects.stdin_probe else {
+        // Inside a function call fed a here-document, a bare `read`
+        // consumes that document's next line (bash's inherited stdin).
+        // Anywhere else, it would consume the script's own stdin.
+        if ctx.session.frame_stdin_available() {
+            let line = ctx.session.take_frame_stdin_line();
+            return allow(
+                format!("binds the call's here-document next line to `{name}`; nothing else"),
+                Action::ReadLine {
+                    name,
+                    source: ReadSource::Literal(match line {
+                        Some(line) => format!("{line}\n"),
+                        None => String::new(),
+                    }),
+                },
+            );
+        }
         return deny(
             "`read` without an explicit `< /dev/tty` redirect would consume the script's \
              own stdin; not implemented",
         );
     };
+    allow(
+        format!("reads one line from `{path}` into `{name}`; nothing else"),
+        Action::ReadLine {
+            name,
+            source: ReadSource::Device(PathBuf::from(path)),
+        },
+    )
+}
+
+/// The single variable name a `read [-r] NAME` binds, or why the
+/// argument list isn't that shape.
+fn read_variable_name(args: &[String]) -> Result<String, String> {
     let mut names = Vec::new();
     for arg in args {
         match arg.as_str() {
             // Without -r, backslash processing applies — iish reads the
             // raw line either way, which for a y/n answer is identical.
             "-r" => {}
-            a if a.starts_with('-') => return deny(format!("read option `{a}` is not supported")),
+            a if a.starts_with('-') => return Err(format!("read option `{a}` is not supported")),
             a => names.push(a.to_string()),
         }
     }
-    let [name] = names.as_slice() else {
-        return deny("`read` with other than exactly one variable name is not supported");
-    };
-    allow(
-        format!("reads one line from `{path}` into `{name}`; nothing else"),
-        Action::ReadLine {
-            name: name.clone(),
-            path: PathBuf::from(path),
-        },
-    )
+    let mut names = names.into_iter();
+    match (names.next(), names.next()) {
+        (Some(name), None) => Ok(name),
+        _ => Err("`read` with other than exactly one variable name is not supported".into()),
+    }
 }
 
 /// `shift [n]`.
@@ -1283,16 +1593,23 @@ const ENV_FILE_NAMES: &[&str] = &[
 ];
 
 fn is_recognized_env_file(path: &Path) -> bool {
+    let Ok(home) = std::env::var("HOME") else {
+        return false;
+    };
+    let home = Path::new(&home);
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
     };
-    if !ENV_FILE_NAMES.contains(&name) {
-        return false;
+    if ENV_FILE_NAMES.contains(&name) && path.parent() == Some(home) {
+        return true;
     }
-    match std::env::var("HOME") {
-        Ok(home) => path.parent() == Some(Path::new(&home)),
-        Err(_) => false,
-    }
+    // Fish keeps its startup files under ~/.config/fish rather than in
+    // $HOME: config.fish itself, and any *.fish dropped into conf.d
+    // (sourced automatically — cargo-dist installs its PATH hook as
+    // one). Same restricted grammar applies.
+    let fish = home.join(".config/fish");
+    (name == "config.fish" && path.parent() == Some(fish.as_path()))
+        || (name.ends_with(".fish") && path.parent() == Some(fish.join("conf.d").as_path()))
 }
 
 /// `echo`/`printf ... >> rcfile`: appends are allowed only onto a
@@ -1320,12 +1637,12 @@ fn evaluate_env_file_append(
     if !is_recognized_env_file(&path) {
         return deny(format!(
             "`{}` is not a recognized shell rc/profile file in $HOME; env-file appends are \
-             restricted to {}",
+             restricted to {} (and fish's config.fish/conf.d)",
             path.display(),
             ENV_FILE_NAMES.join(", ")
         ));
     }
-    if let Err(reason) = check_env_file_grammar(&text, ctx) {
+    if let Err(reason) = check_env_file_grammar(&text, ctx.session) {
         return deny(format!("append to `{}` refused: {reason}", path.display()));
     }
 
@@ -1359,8 +1676,9 @@ fn evaluate_env_file_append(
 /// a `PATH=...` assignment, or `source`/`.` of a single path this script
 /// already created — PLAN.md's restricted append grammar. Anything else
 /// (conditionals, command substitution, arbitrary commands, ...) is
-/// refused.
-fn check_env_file_grammar(text: &str, ctx: &ExpandCtx) -> Result<(), String> {
+/// refused. Also called by the runner at a captured function call's
+/// completion (`fn ... >> rcfile`), the first moment that text exists.
+pub fn check_env_file_grammar(text: &str, session: &state::Session) -> Result<(), String> {
     for line in text.lines() {
         let line = line.trim();
         if is_export_assignment(line) || line.starts_with("PATH=") {
@@ -1393,14 +1711,35 @@ fn check_env_file_grammar(text: &str, ctx: &ExpandCtx) -> Result<(), String> {
             .or_else(|| line.strip_prefix(". "))
         {
             let target = rest.trim();
-            if target.is_empty() || target.contains(char::is_whitespace) {
+            let unquoted = unquote_sourced_path(target);
+            // A quoted path is one word to the sourcing shell however
+            // many spaces it holds; an unquoted one must be a single
+            // token or the extra words would run as arguments.
+            if unquoted.is_none() && (target.is_empty() || target.contains(char::is_whitespace)) {
                 return Err(format!(
                     "`{line}` is not a plain `source`/`.` of a single path"
                 ));
             }
-            let path = state::normalize(Path::new(target));
-            if !ctx.session.owns(&path) {
-                return Err(format!("`{target}` was not created by this script"));
+            let target_text = unquoted.unwrap_or(target);
+            // The sourcing shell would expand these when it reads the
+            // file; a sourced *command* is exactly the injection this
+            // grammar exists to prevent.
+            if target_text.contains(['`', ';', '&', '|', '<', '>', '(', ')', '\'', '"'])
+                || target_text.contains("$(")
+            {
+                return Err(format!(
+                    "`{line}` carries a shell metacharacter in the sourced path; refused"
+                ));
+            }
+            let Some(resolved) = resolve_home_prefix(target_text) else {
+                return Err(format!(
+                    "`{target_text}` expands a variable other than a leading `$HOME`; its \
+                     source-time value cannot be checked"
+                ));
+            };
+            let path = state::normalize(Path::new(&resolved));
+            if !session.owns(&path) {
+                return Err(format!("`{target_text}` was not created by this script"));
             }
             continue;
         }
@@ -1410,6 +1749,48 @@ fn check_env_file_grammar(text: &str, ctx: &ExpandCtx) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// The inside of a sourced path that is one fully-quoted word (`.
+/// "$HOME/env"` — how cargo-dist writes its rc line), or `None` if the
+/// target isn't a single surrounding-quoted token. Only a whole-token
+/// quote pair counts: `"/x" && evil` keeps its interior and falls to the
+/// caller's single-word check.
+fn unquote_sourced_path(target: &str) -> Option<&str> {
+    for quote in ['"', '\''] {
+        if let Some(inner) = target
+            .strip_prefix(quote)
+            .and_then(|rest| rest.strip_suffix(quote))
+        {
+            if !inner.is_empty() && !inner.contains(quote) {
+                return Some(inner);
+            }
+        }
+    }
+    None
+}
+
+/// Resolve a leading `$HOME/`/`${HOME}/` (or `~/`) in a sourced path to
+/// the real home directory — installers write the rc line with a
+/// literal `$HOME` so it survives a moved home — or `None` when the
+/// path carries any other `$` expansion, whose source-time value iish
+/// cannot know.
+fn resolve_home_prefix(target: &str) -> Option<String> {
+    let after_home = target
+        .strip_prefix("$HOME/")
+        .or_else(|| target.strip_prefix("${HOME}/"))
+        .or_else(|| target.strip_prefix("~/"));
+    let (head, rest) = match after_home {
+        Some(rest) => (std::env::var("HOME").ok()?, rest),
+        None => (String::new(), target),
+    };
+    if rest.contains('$') {
+        return None;
+    }
+    Some(format!(
+        "{head}{}{rest}",
+        if head.is_empty() { "" } else { "/" }
+    ))
 }
 
 fn is_export_assignment(line: &str) -> bool {
@@ -1434,10 +1815,16 @@ fn is_export_assignment(line: &str) -> bool {
 /// files on the system.
 fn evaluate_sha256sum(args: &[String], ctx: &ExpandCtx) -> Verdict {
     let mut check = false;
+    let mut binary = false;
     let mut paths: Vec<&str> = Vec::new();
     for arg in args {
         match arg.as_str() {
             "-c" | "--check" => check = true,
+            // `-b` only changes the output marker (`*` instead of a
+            // second space); the digest is byte-for-byte identical on
+            // every platform iish runs on. `-t` is the default mode.
+            "-b" | "--binary" => binary = true,
+            "-t" | "--text" => binary = false,
             a if a.starts_with('-') => {
                 return deny(format!("sha256sum option `{a}` is not supported"))
             }
@@ -1448,11 +1835,11 @@ fn evaluate_sha256sum(args: &[String], ctx: &ExpandCtx) -> Verdict {
     if check {
         evaluate_sha256_check(&paths, ctx)
     } else {
-        evaluate_sha256_compute(&paths, ctx)
+        evaluate_sha256_compute(&paths, binary, ctx)
     }
 }
 
-fn evaluate_sha256_compute(paths: &[&str], ctx: &ExpandCtx) -> Verdict {
+fn evaluate_sha256_compute(paths: &[&str], binary: bool, ctx: &ExpandCtx) -> Verdict {
     if paths.is_empty() {
         return deny("sha256sum with no file");
     }
@@ -1469,7 +1856,10 @@ fn evaluate_sha256_compute(paths: &[&str], ctx: &ExpandCtx) -> Verdict {
     }
     allow(
         "prints checksums only for paths this script created",
-        Action::Sha256Sum { paths: resolved },
+        Action::Sha256Sum {
+            paths: resolved,
+            binary,
+        },
     )
 }
 
@@ -1757,6 +2147,69 @@ fn evaluate_mkdir(args: &[String]) -> Verdict {
         Action::MkDir {
             paths: to_create,
             parents,
+        },
+    )
+}
+
+/// `mktemp [-d] [TEMPLATE]`: implemented natively so the temp path it
+/// creates is recorded in the ledger — installers `_dir=$(mktemp -d)`,
+/// download and unpack into it, then `rm -rf "$_dir"`, and a subprocess
+/// mktemp would leave that cleanup (and any `chmod`/run of what landed
+/// inside) refused as touching a path this run never created. The
+/// trailing `XXX...` run is replaced at execution time; the path is
+/// printed to stdout exactly like the real tool so `$(mktemp -d)`
+/// captures it.
+fn evaluate_mktemp(args: &[String], dest: StdoutDest, ctx: &ExpandCtx) -> Verdict {
+    let mut dir = false;
+    let mut templates: Vec<&str> = Vec::new();
+    for arg in args {
+        match arg.as_str() {
+            "-d" | "--directory" => dir = true,
+            a if a.starts_with('-') => {
+                return deny(format!("mktemp option `{a}` is not supported"))
+            }
+            a => templates.push(a),
+        }
+    }
+    let template = match templates.as_slice() {
+        [] => {
+            // The real tool's default: `$TMPDIR/tmp.XXXXXXXXXX`, falling
+            // back to /tmp. The script may have assigned TMPDIR as a
+            // plain shell variable, so the session is consulted first.
+            let tmpdir = ctx
+                .session
+                .get_variable("TMPDIR")
+                .map(str::to_string)
+                .or_else(|| std::env::var("TMPDIR").ok())
+                .filter(|d| !d.is_empty())
+                .unwrap_or_else(|| "/tmp".to_string());
+            state::normalize(&Path::new(&tmpdir).join("tmp.XXXXXXXXXX"))
+        }
+        [template] => {
+            let file_name = Path::new(template)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            let trailing_xs = file_name.chars().rev().take_while(|c| *c == 'X').count();
+            if trailing_xs < 3 {
+                return deny(format!(
+                    "mktemp template `{template}` must end in at least three X's"
+                ));
+            }
+            state::normalize(Path::new(template))
+        }
+        _ => return deny("mktemp with more than one template is not supported"),
+    };
+    allow(
+        if dir {
+            "creates a new private temporary directory, recorded in the ledger"
+        } else {
+            "creates a new private temporary file, recorded in the ledger"
+        },
+        Action::MkTemp {
+            template,
+            dir,
+            dest,
         },
     )
 }
@@ -3542,11 +3995,253 @@ mod tests {
     }
 
     #[test]
-    fn other_redirects_are_still_denied() {
+    fn env_file_append_allows_quoted_source_of_owned_file() {
+        // cargo-dist writes exactly this shape: `. "$HOME/.tool/env"`,
+        // quoted and with a literal $HOME for the sourcing shell to
+        // expand. Both must resolve before the ledger check.
+        let home = std::env::var("HOME").expect("HOME set in tests");
+        let mut session = Session::new();
+        session.record_created(format!("{home}/.tool-env-quoted/env"));
+        let rc = home_rc(".profile");
+        match verdict_with(
+            &format!(r#"echo '. "$HOME/.tool-env-quoted/env"' >> {rc}"#),
+            &mut session,
+        ) {
+            Prompt {
+                action: Action::AppendFile { text, .. },
+                ..
+            } => assert_eq!(text, ". \"$HOME/.tool-env-quoted/env\"\n"),
+            other => panic!("expected prompt/append, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn env_file_append_denies_quoted_source_of_unowned_file() {
+        let rc = home_rc(".profile");
         assert!(matches!(
-            verdict("echo hi > /tmp/iish-nonexistent"),
+            verdict(&format!(r#"echo '. "$HOME/.not-created/env"' >> {rc}"#)),
             Deny { .. }
         ));
+    }
+
+    #[test]
+    fn env_file_append_denies_source_with_non_home_variable() {
+        let mut session = Session::new();
+        session.record_created("/opt/tool/env.sh");
+        let rc = home_rc(".profile");
+        assert!(matches!(
+            verdict_with(
+                &format!(r#"echo '. "$EVIL/env.sh"' >> {rc}"#),
+                &mut session
+            ),
+            Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn env_file_append_denies_command_smuggled_after_quoted_source() {
+        let mut session = Session::new();
+        let home = std::env::var("HOME").expect("HOME set in tests");
+        session.record_created(format!("{home}/env"));
+        let rc = home_rc(".profile");
+        assert!(matches!(
+            verdict_with(
+                &format!(r#"echo '. "$HOME/env" && rm -rf /' >> {rc}"#),
+                &mut session
+            ),
+            Deny { .. }
+        ));
+        assert!(matches!(
+            verdict_with(
+                &format!(r#"echo '. "$(rm -rf /)"' >> {rc}"#),
+                &mut Session::new()
+            ),
+            Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn write_redirect_to_new_file_is_allowed() {
+        match verdict("echo '{\"receipt\":true}' > /tmp/iish-nonexistent-receipt.json") {
+            Allow {
+                action: Action::WriteFile { path, text },
+                ..
+            } => {
+                assert_eq!(path, PathBuf::from("/tmp/iish-nonexistent-receipt.json"));
+                assert_eq!(text, "{\"receipt\":true}\n");
+            }
+            other => panic!("expected allow/write, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_redirect_over_foreign_file_is_governed_by_overwrite() {
+        let dir = scratch_dir("write-overwrite");
+        let target = dir.join("preexisting.txt");
+        std::fs::write(&target, b"theirs").unwrap();
+        let line = format!("echo mine > {}", target.display());
+        assert!(matches!(verdict(&line), Prompt { .. }));
+        let deny_config = Config {
+            overwrite: Verb::Deny,
+            ..Config::default()
+        };
+        assert!(matches!(
+            verdict_with_config(&line, &mut Session::new(), &deny_config),
+            Deny { .. }
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn write_redirect_over_owned_file_is_allowed() {
+        let dir = scratch_dir("write-owned");
+        let target = dir.join("mine.txt");
+        std::fs::write(&target, b"first").unwrap();
+        let mut session = Session::new();
+        session.record_created(&target);
+        assert!(matches!(
+            verdict_with(&format!("echo second > {}", target.display()), &mut session),
+            Allow {
+                action: Action::WriteFile { .. },
+                ..
+            }
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn write_redirect_onto_an_rc_file_is_denied() {
+        // `>` replaces the file — the append grammar must not be
+        // bypassable by rewriting an rc file wholesale.
+        let rc = home_rc(".bashrc");
+        assert!(matches!(
+            verdict(&format!("echo 'export A=1' > {rc}")),
+            Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn write_redirect_of_a_subprocess_is_denied() {
+        assert!(matches!(
+            verdict("uname -a > /tmp/iish-nonexistent-uname.txt"),
+            Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn cat_heredoc_to_file_writes_the_expanded_body() {
+        let mut session = Session::new();
+        session.set_variable("_install_dir", "/opt/tool/bin");
+        match verdict_with(
+            "cat <<EOF > /tmp/iish-nonexistent-env.sh\nexport PATH=\"$_install_dir:\\$PATH\"\nEOF\n",
+            &mut session,
+        ) {
+            Allow {
+                action: Action::WriteFile { path, text },
+                ..
+            } => {
+                assert_eq!(path, PathBuf::from("/tmp/iish-nonexistent-env.sh"));
+                // `$_install_dir` expanded; `\$PATH` stayed literal for
+                // the shell that will source this file.
+                assert_eq!(text, "export PATH=\"/opt/tool/bin:$PATH\"\n");
+            }
+            other => panic!("expected allow/write, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cat_heredoc_banner_expands_variables() {
+        let mut session = Session::new();
+        session.set_variable("APP_NAME", "atuin");
+        match verdict_with("cat <<EOF\ninstalling $APP_NAME\nEOF\n", &mut session) {
+            Allow {
+                action: Action::Print { text, .. },
+                ..
+            } => assert_eq!(text, "installing atuin\n"),
+            other => panic!("expected allow/print, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cat_heredoc_quoted_delimiter_stays_verbatim() {
+        match verdict("cat <<'EOF'\nliteral $NOT_EXPANDED\nEOF\n") {
+            Allow {
+                action: Action::Print { text, .. },
+                ..
+            } => assert_eq!(text, "literal $NOT_EXPANDED\n"),
+            other => panic!("expected allow/print, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_from_heredoc_binds_the_first_line() {
+        match verdict("read -r RECEIPT <<EOR\n{\"v\":1}\nEOR\n") {
+            Allow {
+                action:
+                    Action::ReadLine {
+                        name,
+                        source: crate::exec::ReadSource::Literal(text),
+                    },
+                ..
+            } => {
+                assert_eq!(name, "RECEIPT");
+                assert_eq!(text, "{\"v\":1}\n");
+            }
+            other => panic!("expected allow/read, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mktemp_compiles_to_a_native_action() {
+        match verdict("mktemp -d") {
+            Allow {
+                action: Action::MkTemp { template, dir, .. },
+                ..
+            } => {
+                assert!(dir);
+                assert!(template.to_string_lossy().ends_with("tmp.XXXXXXXXXX"));
+            }
+            other => panic!("expected allow/mktemp, got {other:?}"),
+        }
+        match verdict("mktemp -d /tmp/iish-nonexistent-base/tmp.XXXXXXXXXX") {
+            Allow {
+                action: Action::MkTemp { template, dir, .. },
+                ..
+            } => {
+                assert!(dir);
+                assert_eq!(
+                    template,
+                    PathBuf::from("/tmp/iish-nonexistent-base/tmp.XXXXXXXXXX")
+                );
+            }
+            other => panic!("expected allow/mktemp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mktemp_requires_trailing_xs_in_a_template() {
+        assert!(matches!(verdict("mktemp /tmp/fixed-name"), Deny { .. }));
+        assert!(matches!(verdict("mktemp -p /tmp"), Deny { .. }));
+    }
+
+    #[test]
+    fn sha256sum_binary_flag_is_accepted() {
+        let mut session = Session::new();
+        session.record_created("/tmp/iish-nonexistent-dl/tool.tar.gz");
+        match verdict_with(
+            "sha256sum -b /tmp/iish-nonexistent-dl/tool.tar.gz",
+            &mut session,
+        ) {
+            Allow {
+                action: Action::Sha256Sum { binary, .. },
+                ..
+            } => assert!(binary),
+            other => panic!("expected allow/sha256sum, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn other_redirects_are_still_denied() {
         assert!(matches!(verdict("mkdir /tmp/a 2> /tmp/err"), Deny { .. }));
         assert!(matches!(verdict("uname -a 2> /tmp/err.log"), Deny { .. }));
         assert!(matches!(verdict("uname -a 2>> /dev/null"), Deny { .. }));
@@ -3627,7 +4322,7 @@ mod tests {
             &mut session,
         ) {
             Allow {
-                action: Action::Sha256Sum { paths },
+                action: Action::Sha256Sum { paths, .. },
                 ..
             } => assert_eq!(
                 paths,
@@ -3877,7 +4572,9 @@ mod tests {
         let mut session = Session::new();
         define_greet(&mut session);
         match verdict_with("greet one 'two words'", &mut session) {
-            Call { name, args, body } => {
+            Call {
+                name, args, body, ..
+            } => {
                 assert_eq!(name, "greet");
                 assert_eq!(args, vec!["one", "two words"]);
                 assert_eq!(body.len(), 2);
