@@ -1210,7 +1210,7 @@ fn evaluate_subprocess(
     };
     let created_path = runs_a_created_path(name, ctx);
     let self_call = created_path && calls_installed_binary(name, ctx);
-    let verb = config.command_override(name).unwrap_or_else(|| {
+    let verb = config.command_override(name).unwrap_or({
         if self_call {
             config.self_call
         } else if created_path {
@@ -1260,9 +1260,9 @@ fn calls_installed_binary(name: &str, ctx: &ExpandCtx) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        return std::fs::metadata(path)
+        std::fs::metadata(path)
             .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false);
+            .unwrap_or(false)
     }
     #[cfg(not(unix))]
     path.is_file()
