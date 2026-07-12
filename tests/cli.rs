@@ -83,6 +83,18 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
+/// A scratch path below the repository. Unlike `std::env::temp_dir()` on
+/// macOS, this path has no `/var` symlink component, which iish correctly
+/// refuses to traverse for mutating installer operations.
+fn workspace_scratch(name: &str) -> PathBuf {
+    let dir = std::env::current_dir()
+        .unwrap()
+        .join("target")
+        .join(format!("iish-cli-{name}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    dir
+}
+
 /// Serve `body` over HTTP for `hits` GET requests on an ephemeral local
 /// port, returning the URL to fetch.
 fn serve(body: &'static [u8], hits: usize) -> String {
@@ -337,6 +349,63 @@ fn dry_run_reports_but_executes_nothing() {
         report.contains("deletes only paths this script created"),
         "report: {report}"
     );
+}
+
+#[test]
+fn installed_binary_self_calls_default_to_allow_and_dry_run_only_reports_them() {
+    let base = workspace_scratch("self-call");
+    let bin = base.join("installed-tool");
+    let marker = base.join("called");
+    let payload = format!("#!/bin/sh\ntouch '{}'\n", marker.display());
+    let url = serve(Box::leak(payload.into_bytes().into_boxed_slice()), 2);
+    let script = format!(
+        "mkdir -p {}\ncurl -fsSL {} -o {}\nchmod +x {}\n{} setup\n",
+        base.display(),
+        url,
+        bin.display(),
+        bin.display(),
+        bin.display()
+    );
+
+    let dry = iish(&script, &["--dry-run"]);
+    assert!(dry.status.success(), "stderr: {}", stderr(&dry));
+    assert!(
+        stdout(&dry).contains(&format!("{} setup", bin.display())),
+        "dry run should print the self-call subcommand: {}",
+        stdout(&dry)
+    );
+    assert!(!marker.exists(), "dry run must not execute the self-call");
+
+    let real = iish(&script, &[]);
+    assert!(real.status.success(), "stderr: {}", stderr(&real));
+    assert!(marker.exists(), "real run should execute the self-call");
+
+    fs::remove_dir_all(&base).unwrap();
+}
+
+#[test]
+fn self_call_cli_can_deny_an_installed_binary() {
+    let base = workspace_scratch("self-call-deny");
+    let bin = base.join("installed-tool");
+    let payload = b"#!/bin/sh\nexit 0\n";
+    let url = serve(payload, 1);
+    let script = format!(
+        "mkdir -p {}\ncurl -fsSL {} -o {}\nchmod +x {}\n{} setup\n",
+        base.display(),
+        url,
+        bin.display(),
+        bin.display(),
+        bin.display()
+    );
+
+    let out = iish(&script, &["--self-call=deny"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("self-call policy"),
+        "{}",
+        stderr(&out)
+    );
+    fs::remove_dir_all(&base).unwrap();
 }
 
 #[test]
