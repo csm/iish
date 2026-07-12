@@ -1589,10 +1589,7 @@ fn sha256sum_binary_mode_prints_the_star_marker() {
     fs::create_dir_all(&base).unwrap();
     let file = base.join("payload.bin");
     let out = iish(
-        &format!(
-            "touch {0}\nsha256sum -b {0}\n",
-            file.display()
-        ),
+        &format!("touch {0}\nsha256sum -b {0}\n", file.display()),
         &[],
     );
     assert!(out.status.success(), "stderr: {}", stderr(&out));
@@ -1645,7 +1642,10 @@ fn cargo_dist_shaped_installer_runs_to_completion_and_installs_a_working_tool() 
     // `$_install_dir` expanded and `\$PATH` left literal.
     let env_script = fs::read_to_string(home.join(".tool/env")).unwrap();
     assert!(
-        env_script.contains(&format!("export PATH=\"{}/.tool/bin:$PATH\"", home.display())),
+        env_script.contains(&format!(
+            "export PATH=\"{}/.tool/bin:$PATH\"",
+            home.display()
+        )),
         "env script: {env_script}"
     );
 
@@ -1657,7 +1657,10 @@ fn cargo_dist_shaped_installer_runs_to_completion_and_installs_a_working_tool() 
 
     // The quoted source line was appended to the rc file.
     let profile = fs::read_to_string(home.join(".profile")).unwrap();
-    assert!(profile.contains(". \"$HOME/.tool/env\""), "profile: {profile}");
+    assert!(
+        profile.contains(". \"$HOME/.tool/env\""),
+        "profile: {profile}"
+    );
 
     // The mktemp staging dir was cleaned up: the ledger owned it, so
     // rm -rf was allowed. Nothing but .tool remains under home.

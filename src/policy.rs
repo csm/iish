@@ -13,7 +13,9 @@
 
 use crate::config::{Config, NetworkPolicy, Verb};
 use crate::exec::{Action, FetchOutput, LookupStyle, Mode, ReadSource, StderrDest, StdoutDest};
-use crate::parser::{self, ast, case_pattern_word, glob_match, literal_word, word_fields, ExpandCtx};
+use crate::parser::{
+    self, ast, case_pattern_word, glob_match, literal_word, word_fields, ExpandCtx,
+};
 use crate::state;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -697,8 +699,13 @@ fn evaluate_simple_command(
                     heredoc = Some(doc);
                 }
                 ast::CommandPrefixOrSuffixItem::IoRedirect(r) => {
-                    if !note_redirect(r, &mut append_target, &mut write_target, &mut redirects, ctx)
-                    {
+                    if !note_redirect(
+                        r,
+                        &mut append_target,
+                        &mut write_target,
+                        &mut redirects,
+                        ctx,
+                    ) {
                         unsupported_redirect = true;
                     }
                 }
@@ -4030,10 +4037,7 @@ mod tests {
         session.record_created("/opt/tool/env.sh");
         let rc = home_rc(".profile");
         assert!(matches!(
-            verdict_with(
-                &format!(r#"echo '. "$EVIL/env.sh"' >> {rc}"#),
-                &mut session
-            ),
+            verdict_with(&format!(r#"echo '. "$EVIL/env.sh"' >> {rc}"#), &mut session),
             Deny { .. }
         ));
     }
