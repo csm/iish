@@ -1454,3 +1454,259 @@ fn empty_leading_word_runs_the_following_command() {
     assert!(target.is_file(), "touch should have created the file");
     fs::remove_dir_all(&base).unwrap();
 }
+
+// ---------------------------------------------------------------------
+// The cargo-dist installer shapes (atuin's second stage): a here-doc
+// read into a variable (the install receipt), `>` create-only file
+// writes, a here-doc written to a file with expansion, native mktemp
+// feeding the ledger, and the quoted `. "$HOME/..."` rc-file append.
+// ---------------------------------------------------------------------
+
+#[test]
+fn read_from_a_heredoc_binds_the_first_line() {
+    let out = iish(
+        "read -r RECEIPT <<EORECEIPT\n{\"version\":\"1.0\"}\nEORECEIPT\necho \"got=$RECEIPT\"\n",
+        &[],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "got={\"version\":\"1.0\"}\n");
+}
+
+#[test]
+fn write_redirect_creates_a_new_file_and_owns_it() {
+    let base = workspace_scratch("write-create");
+    fs::create_dir_all(&base).unwrap();
+    let receipt = base.join("receipt.json");
+    // Written, rewritten (owned), then removed (owned) — the full
+    // ledger lifecycle of a `>`-created file.
+    let out = iish(
+        &format!(
+            "echo '{{\"v\":1}}' > {0}\necho '{{\"v\":2}}' > {0}\nrm {0}\necho done\n",
+            receipt.display()
+        ),
+        &[],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(!receipt.exists(), "the receipt should have been removed");
+    fs::remove_dir_all(&base).unwrap();
+}
+
+#[test]
+fn write_redirect_over_a_foreign_file_respects_no() {
+    let base = workspace_scratch("write-no-clobber");
+    fs::create_dir_all(&base).unwrap();
+    let target = base.join("theirs.txt");
+    fs::write(&target, b"precious").unwrap();
+    let out = iish(&format!("echo mine > {}\n", target.display()), &["--no"]);
+    assert!(!out.status.success());
+    assert_eq!(fs::read_to_string(&target).unwrap(), "precious");
+    fs::remove_dir_all(&base).unwrap();
+}
+
+#[test]
+fn cat_heredoc_writes_an_expanded_env_script() {
+    let base = workspace_scratch("heredoc-env-script");
+    fs::create_dir_all(&base).unwrap();
+    let env_script = base.join("env");
+    // cargo-dist's write_env_script_sh shape: `$_install_dir_expr`
+    // expands now, `\$PATH` stays for the sourcing shell.
+    let out = iish(
+        &format!(
+            "_dir=/opt/tool/bin\ncat <<EOF > {}\nexport PATH=\"$_dir:\\$PATH\"\nEOF\necho written\n",
+            env_script.display()
+        ),
+        &[],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(
+        fs::read_to_string(&env_script).unwrap(),
+        "export PATH=\"/opt/tool/bin:$PATH\"\n"
+    );
+    fs::remove_dir_all(&base).unwrap();
+}
+
+#[test]
+fn mktemp_dir_is_owned_so_cleanup_and_chmod_inside_work() {
+    let base = workspace_scratch("mktemp-owned");
+    fs::create_dir_all(&base).unwrap();
+    // The cargo-dist download dance: make a tempdir, put a file in it
+    // (a stand-in for the unpacked archive), chmod it, then rm -rf the
+    // whole tree — all of which needs the ledger to know mktemp made it.
+    let out = iish(
+        &format!(
+            concat!(
+                "_dir=$(mktemp -d {0}/tmp.XXXXXXXXXX)\n",
+                "touch \"$_dir/tool\"\n",
+                "chmod +x \"$_dir/tool\"\n",
+                "rm -rf \"$_dir\"\n",
+                "if [ ! -d \"$_dir\" ]; then echo cleaned; fi\n",
+            ),
+            base.display()
+        ),
+        &[],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "cleaned\n");
+    assert_eq!(
+        fs::read_dir(&base).unwrap().count(),
+        0,
+        "the tempdir should be gone"
+    );
+    fs::remove_dir_all(&base).unwrap();
+}
+
+#[test]
+fn quoted_home_source_line_appends_to_profile() {
+    let home = workspace_scratch("quoted-source-home");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(home.join(".profile"), b"# existing\n").unwrap();
+    // cargo-dist's add_install_dir_to_path: create the env script this
+    // run, then append `. "$HOME/.tool/env"` — quoted, with a literal
+    // $HOME — to the rc file.
+    let out = iish_with_home(
+        concat!(
+            "mkdir -p \"$HOME/.tool\"\n",
+            "cat <<EOF > \"$HOME/.tool/env\"\n",
+            "export PATH=\"\\$HOME/.tool/bin:\\$PATH\"\n",
+            "EOF\n",
+            "echo '. \"$HOME/.tool/env\"' >> \"$HOME/.profile\"\n",
+        ),
+        &["--yes"],
+        &home,
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let profile = fs::read_to_string(home.join(".profile")).unwrap();
+    assert!(
+        profile.contains(". \"$HOME/.tool/env\""),
+        "profile: {profile}"
+    );
+    fs::remove_dir_all(&home).unwrap();
+}
+
+#[test]
+fn sha256sum_binary_mode_prints_the_star_marker() {
+    let base = workspace_scratch("sha256-binary");
+    fs::create_dir_all(&base).unwrap();
+    let file = base.join("payload.bin");
+    let out = iish(
+        &format!("touch {0}\nsha256sum -b {0}\n", file.display()),
+        &[],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    // SHA-256 of the empty file, in GNU binary-mode format.
+    assert_eq!(
+        stdout(&out),
+        format!(
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 *{}\n",
+            file.display()
+        )
+    );
+    fs::remove_dir_all(&base).unwrap();
+}
+
+// ---------------------------------------------------------------------
+// The cargo-dist green path (atuin's second stage in miniature): every
+// shape items 1-6 added, working together to a completed, verified
+// install -- a function whose `cat <<EOF > file` call writes an env
+// script, a mktemp staging dir the ledger owns (so cleanup works), a
+// `>` receipt file, and the quoted `. "$HOME/..."` rc-file append.
+// This is the end state atuin's real installer reaches under iish.
+// ---------------------------------------------------------------------
+#[test]
+fn cargo_dist_shaped_installer_runs_to_completion_and_installs_a_working_tool() {
+    let base = scratch("cargo-dist-green");
+    let home = base.join("home");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(home.join(".profile"), b"# existing profile\n").unwrap();
+
+    let payload = b"#!/bin/sh\necho tool-2.0\n";
+    let url = serve(payload, 1);
+
+    // Mirrors cargo-dist: `write_env_script` writes the PATH shim via a
+    // here-doc redirected onto the function call (its `ensure cat <<EOF
+    // > file` shape), the download stages through a mktemp dir that
+    // later gets rm -rf'd, the binary is chmod'd, a receipt is written
+    // with `>`, and the rc file gets a quoted source line.
+    let script = SCRIPT_TEMPLATE.replace("__URL__", &url);
+
+    let out = iish_with_home(&script, &["--yes", "--allow", "mv"], &home);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+
+    // The tool is installed, executable, and runs.
+    let tool = home.join(".tool/bin/tool");
+    assert!(tool.is_file(), "the tool should be installed");
+    let run = Command::new(&tool).output().expect("tool should run");
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "tool-2.0\n");
+
+    // The env script was written by the redirected here-doc call, with
+    // `$_install_dir` expanded and `\$PATH` left literal.
+    let env_script = fs::read_to_string(home.join(".tool/env")).unwrap();
+    assert!(
+        env_script.contains(&format!(
+            "export PATH=\"{}/.tool/bin:$PATH\"",
+            home.display()
+        )),
+        "env script: {env_script}"
+    );
+
+    // The receipt was written by `>`.
+    assert_eq!(
+        fs::read_to_string(home.join(".tool/receipt.json")).unwrap(),
+        "{\"installed\":true}\n"
+    );
+
+    // The quoted source line was appended to the rc file.
+    let profile = fs::read_to_string(home.join(".profile")).unwrap();
+    assert!(
+        profile.contains(". \"$HOME/.tool/env\""),
+        "profile: {profile}"
+    );
+
+    // The mktemp staging dir was cleaned up: the ledger owned it, so
+    // rm -rf was allowed. Nothing but .tool remains under home.
+    let leftovers: Vec<_> = fs::read_dir(&home)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .filter(|n| n != ".tool" && n != ".profile")
+        .collect();
+    assert!(leftovers.is_empty(), "unexpected leftovers: {leftovers:?}");
+
+    fs::remove_dir_all(&base).unwrap();
+}
+
+const SCRIPT_TEMPLATE: &str = r####"
+set -u
+
+write_env_script() {
+    local _install_dir="$1"
+    local _script_path="$2"
+    cat <<ENVEOF > "$_script_path"
+#!/bin/sh
+case ":\${PATH}:" in
+    *:"$_install_dir":*) ;;
+    *) export PATH="$_install_dir:\$PATH" ;;
+esac
+ENVEOF
+}
+
+install() {
+    local _install_dir="$HOME/.tool/bin"
+    mkdir -p "$_install_dir"
+
+    local _dir
+    _dir="$(mktemp -d)"
+    curl -fsSL "__URL__" -o "$_dir/tool"
+    chmod +x "$_dir/tool"
+    mv "$_dir/tool" "$_install_dir/tool"
+    rm -rf "$_dir"
+
+    write_env_script "$_install_dir" "$HOME/.tool/env"
+
+    echo '{"installed":true}' > "$HOME/.tool/receipt.json"
+
+    echo '. "$HOME/.tool/env"' >> "$HOME/.profile"
+}
+
+install
+echo done
+"####;

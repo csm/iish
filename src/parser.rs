@@ -203,6 +203,112 @@ fn contains_glob_metachar(s: &str) -> bool {
     }
 }
 
+/// Expand a here-document body the way bash does when the delimiter is
+/// unquoted: `$VAR`/`${...}`/`$(...)`/backticks expand, a backslash
+/// escapes only `$`, `` ` ``, `\`, and a line-ending newline, and
+/// everything else — quotes very much included — is literal text. Each
+/// expansion token is rendered through [`literal_word`]'s machinery
+/// (so the session's variables, `set -u`, and the substitution
+/// callback all apply); anything it can't render fails the whole body
+/// rather than being guessed at.
+pub fn expand_heredoc_body(text: &str, ctx: &mut ExpandCtx) -> Result<String, String> {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(next) = rest.find(['\\', '$', '`']) {
+        out.push_str(&rest[..next]);
+        rest = &rest[next..];
+        let mut chars = rest.chars();
+        let c = chars.next().unwrap();
+        if c == '\\' {
+            match chars.next() {
+                Some(escaped @ ('$' | '`' | '\\')) => {
+                    out.push(escaped);
+                    rest = &rest[1 + escaped.len_utf8()..];
+                }
+                // Line continuation: both characters vanish.
+                Some('\n') => rest = &rest[2..],
+                // Any other backslash is literal in a here-document.
+                _ => {
+                    out.push('\\');
+                    rest = &rest[1..];
+                }
+            }
+            continue;
+        }
+        match heredoc_expansion_extent(rest)? {
+            Some(len) => {
+                out.push_str(&render_word_text(&rest[..len], ctx)?);
+                rest = &rest[len..];
+            }
+            None => {
+                out.push(c);
+                rest = &rest[c.len_utf8()..];
+            }
+        }
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// The byte length of the expansion token at the start of `s` (which
+/// begins with `$` or a backtick): `$NAME`, a special parameter,
+/// `${...}`, `$(...)`, or `` `...` ``. `Ok(None)` when the `$` isn't
+/// actually introducing an expansion (`$ `, a trailing `$`) and is
+/// literal; `Err` for an unterminated construct.
+fn heredoc_expansion_extent(s: &str) -> Result<Option<usize>, String> {
+    if let Some(body) = s.strip_prefix('`') {
+        // A backslash inside backticks can escape the closing backtick.
+        let mut skip = false;
+        for (i, c) in body.char_indices() {
+            if skip {
+                skip = false;
+            } else if c == '\\' {
+                skip = true;
+            } else if c == '`' {
+                return Ok(Some(1 + i + 1));
+            }
+        }
+        return Err("unterminated backquote substitution in a here-document".into());
+    }
+    let body = &s['$'.len_utf8()..];
+    if body.starts_with('{') || body.starts_with('(') {
+        let (open, close) = if body.starts_with('{') {
+            ('{', '}')
+        } else {
+            ('(', ')')
+        };
+        let mut depth = 0usize;
+        for (i, c) in body.char_indices() {
+            if c == open {
+                depth += 1;
+            } else if c == close {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok(Some(1 + i + 1));
+                }
+            }
+        }
+        return Err(format!(
+            "unterminated `${open}...{close}` in a here-document"
+        ));
+    }
+    // `$NAME` or a single-character special parameter.
+    let mut chars = body.chars();
+    match chars.next() {
+        Some(c) if c == '_' || c.is_ascii_alphabetic() => {
+            let name_len = body
+                .chars()
+                .take_while(|c| *c == '_' || c.is_ascii_alphanumeric())
+                .count();
+            Ok(Some(1 + name_len))
+        }
+        Some(c) if c.is_ascii_digit() || matches!(c, '?' | '#' | '@' | '*' | '!' | '$' | '-') => {
+            Ok(Some(2))
+        }
+        _ => Ok(None),
+    }
+}
+
 /// Run one `$(command)` substitution and apply bash's trailing-newline
 /// stripping to what it captured.
 fn run_substitution(command: &str, ctx: &mut ExpandCtx) -> Result<String, String> {
