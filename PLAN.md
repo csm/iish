@@ -196,8 +196,9 @@ src/
                natively with no side effects. The native builtins live
                here too — `local`, `shift`, `unset`, `command -v`/`type`,
                `cd`, `read`/`true` from `< /dev/tty`, `set -u` as a real
-               toggle — alongside `cat << EOF` here-doc banners and the
-               `> /dev/null`/`2>&1`/`>&2` redirect shapes. Shells and the
+               toggle — alongside `cat << EOF` here-doc banners,
+               `read -r NAME << EOF`, and the `> /dev/null`/`2>&1`/`>&2`
+               redirect shapes. Shells and the
                reopen-a-shell builtins (`eval`, `exec`, `source`) stay
                hard-denied. Anything still unimplemented (background jobs
                `&`, `VAR=value cmd` prefix assignment, most redirect
@@ -344,8 +345,9 @@ doubles as the integration-test corpus later.
    stdin), `! pipeline` negation, and the builtins installers reach for
    (`local`, `return`/`exit`/`shift`/`unset`, `command -v`/`type`,
    native `cd`, and `read`/`true` from `< /dev/tty`) are all implemented
-   now, along with here-documents (`cat << EOF` banners), `> /dev/null`/
-   `2>&1`/`>&2` redirects, and the `%b`/octal `printf` escapes. `set -u`
+   now, along with here-documents (`cat << EOF` banners and
+   `read -r NAME << EOF` input), `> /dev/null`/`2>&1`/`>&2` redirects,
+   and the `%b`/octal `printf` escapes. `set -u`
    is honored as a real toggle (unset expands to empty by default, bash's
    behavior, and is refused only after the script itself opts in).
    `curl … | sh` is handled as a sub-context ("sub-iish", see the Core

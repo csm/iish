@@ -1205,6 +1205,32 @@ fn cat_heredoc_prints_its_banner() {
 }
 
 #[test]
+fn read_heredoc_assigns_its_first_line() {
+    let out = iish(
+        concat!(
+            "read -r receipt <<EOF\n",
+            "  {\"version\":\"1.2.3\"}  \n",
+            "ignored second line\n",
+            "EOF\n",
+            "echo \"$receipt\"\n",
+        ),
+        &[],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "{\"version\":\"1.2.3\"}\n");
+}
+
+#[test]
+fn empty_read_heredoc_is_false_in_a_condition() {
+    let out = iish(
+        "if read -r value <<EOF\nEOF\nthen echo read-ok; else echo eof; fi\n",
+        &[],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "eof\n");
+}
+
+#[test]
 fn read_from_dev_null_fails_like_bash() {
     let out = iish(
         "if read -r answer < /dev/null; then echo read-ok; else echo no-input; fi\n",
